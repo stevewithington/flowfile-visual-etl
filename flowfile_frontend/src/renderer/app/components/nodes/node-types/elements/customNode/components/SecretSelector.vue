@@ -1,5 +1,3 @@
-// SecretSelector.vue - Component for selecting secrets in custom nodes
-
 <template>
   <div class="component-container">
     <label class="listbox-subtitle">
@@ -13,7 +11,7 @@
       clearable
       placeholder="Select a secret"
       style="width: 100%"
-      size="large"
+      size="small"
       :loading="loading"
       @update:model-value="$emit('update:modelValue', $event)"
     >
@@ -97,17 +95,17 @@ onMounted(() => {
 .listbox-subtitle {
   font-size: 0.875rem;
   font-weight: 500;
-  color: #374151;
+  color: var(--color-text-primary);
 }
 
 .required-indicator {
-  color: #ef4444;
+  color: var(--color-danger);
   margin-left: 0.25rem;
 }
 
 .field-description {
   font-size: 0.75rem;
-  color: #6b7280;
+  color: var(--color-text-secondary);
   margin: 0;
   margin-bottom: 0.25rem;
 }
@@ -119,23 +117,23 @@ onMounted(() => {
 }
 
 .secret-icon {
-  color: #6b7280;
+  color: var(--color-text-secondary);
   font-size: 0.75rem;
 }
 
 .no-secrets-hint {
   font-size: 0.75rem;
-  color: #6b7280;
+  color: var(--color-text-secondary);
   margin: 0.25rem 0 0 0;
 }
 
 .hint-link {
-  color: #3b82f6;
+  color: var(--color-accent-dark);
   cursor: pointer;
   text-decoration: underline;
 }
 
 .hint-link:hover {
-  color: #2563eb;
+  color: var(--color-accent-dark-hover);
 }
 </style>

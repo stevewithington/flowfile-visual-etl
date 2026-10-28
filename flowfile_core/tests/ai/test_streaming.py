@@ -163,7 +163,6 @@ async def test_sse_stream_emits_keepalive_when_provider_idle() -> None:
     assert keepalive_count >= 1, (
         "Expected at least one keepalive comment when the upstream is slow; " f"got {keepalive_count} in output {out!r}"
     )
-    # ...and the real chunk + done are still emitted in order.
     chunks = [line for line in out if line.startswith("event: chunk")]
     dones = [line for line in out if line.startswith("event: done")]
     assert len(chunks) == 1
@@ -211,7 +210,7 @@ async def test_sse_stream_emits_tool_call_with_id() -> None:
     assert "event: tool_call\n" in out[0]
 
 
-# ---------- 7. on_checkpoint hook (W42 seam) ----------
+# ---------- 7. on_checkpoint hook ----------
 
 
 @pytest.mark.asyncio
@@ -367,7 +366,7 @@ def test_make_streaming_response_headers() -> None:
 def test_lazy_litellm_import() -> None:
     """Importing ``flowfile_core.ai.streaming`` must not pull in litellm.
 
-    Mirrors W11/W15's lazy-import contract. Restore is unconditional (per
+    Mirrors the lazy-import contract of the other AI modules. Restore is unconditional (per
     the review note) so cross-test class identities stay consistent.
     """
     cleared: dict[str, Any] = {}

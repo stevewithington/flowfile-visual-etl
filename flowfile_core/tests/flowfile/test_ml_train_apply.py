@@ -10,14 +10,13 @@ from unittest.mock import patch
 
 import pytest
 
+from flowfile_core.auth.models import User
 from flowfile_core.flowfile.flow_data_engine.flow_file_column.main import FlowfileColumn
 from flowfile_core.flowfile.flow_graph import FlowGraph, add_connection
 from flowfile_core.flowfile.handler import FlowfileHandler
 from flowfile_core.schemas import input_schema, schemas
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_graph(
@@ -67,10 +66,8 @@ def _wire_ml_node(graph: FlowGraph, node_type: str, node_id: int, upstream_id: i
     add_connection(graph, connection)
 
 
-# ---------------------------------------------------------------------------
 # Schema-callback tests — these don't need a worker, just call the predicted
 # schema getter and inspect the result.
-# ---------------------------------------------------------------------------
 
 
 def test_train_model_schema_passes_through_input_schema():
@@ -204,10 +201,8 @@ def test_apply_model_schema_refreshes_when_output_column_changes():
     assert "renamed" in second and "pred" not in second
 
 
-# ---------------------------------------------------------------------------
 # _func validation tests — call the train function directly with mocks so we
 # don't actually round-trip through a worker.
-# ---------------------------------------------------------------------------
 
 
 def _run_train_func(graph: FlowGraph, settings: input_schema.NodeTrainModel):
@@ -215,7 +210,6 @@ def _run_train_func(graph: FlowGraph, settings: input_schema.NodeTrainModel):
     _wire_ml_node(graph, "train_model", node_id=settings.node_id, upstream_id=1)
     graph.add_train_model(settings)
     train_node = graph.get_node(settings.node_id)
-    # Calling get_resulting_data() triggers _func.
     return train_node.get_resulting_data()
 
 
@@ -225,7 +219,6 @@ def test_train_model_requires_path_when_unregistered_only_for_catalog_publish():
     graph._flow_settings.path = ""
     _seed_manual_input(graph, node_id=1)
 
-    # publish_to_catalog=True must surface the registration error.
     settings = input_schema.NodeTrainModel(
         flow_id=graph.flow_id,
         node_id=2,
@@ -319,7 +312,6 @@ def test_train_model_forwards_namespace_id_to_prepare_upload(monkeypatch):
     )
     graph.add_train_model(settings)
 
-    # The fetcher will explode (no worker), but we only care about prepare_upload's args.
     with patch(
         "flowfile_core.flowfile.flow_graph.MLTrainFetcher",
         side_effect=RuntimeError("expected"),
@@ -397,7 +389,6 @@ def test_apply_model_upstream_mode_reads_train_node_flow_path(tmp_path, monkeypa
     graph = _make_graph()
     _seed_manual_input(graph, node_id=1)
 
-    # Build a minimal train_model node in the graph.
     _wire_ml_node(graph, "train_model", node_id=10, upstream_id=1)
     train_settings = input_schema.NodeTrainModel(
         flow_id=graph.flow_id,
@@ -412,7 +403,6 @@ def test_apply_model_upstream_mode_reads_train_node_flow_path(tmp_path, monkeypa
     )
     graph.add_train_model(train_settings)
 
-    # Pretend the train node has already produced a model on disk.
     from flowfile_core.flowfile.flow_graph import ml_flow_model_path
 
     model_path = ml_flow_model_path(graph.flow_id, 10)
@@ -459,7 +449,6 @@ def test_apply_model_upstream_mode_reads_train_node_flow_path(tmp_path, monkeypa
     )
     graph.add_apply_model(apply_settings)
 
-    # _func should resolve the path and call our fake fetcher with it.
     graph.get_node(20).get_resulting_data()
     assert captured["model_path"] == str(model_path)
     assert captured["output_column"] == "pred"
@@ -489,8 +478,6 @@ def test_train_model_rolls_back_pending_artifact_on_worker_failure(monkeypatch):
     _seed_manual_input(graph, node_id=1)
     _wire_ml_node(graph, "train_model", node_id=2, upstream_id=1)
 
-    # Patch the FlowRegistration lookup so prepare_upload doesn't 404 and the
-    # storage backend so we don't actually touch the filesystem.
     from flowfile_core.artifacts import service as artifact_service_mod
     from flowfile_core.schemas.artifact_schema import PrepareUploadResponse
 
@@ -520,7 +507,6 @@ def test_train_model_rolls_back_pending_artifact_on_worker_failure(monkeypatch):
         _fake_delete_artifact,
     )
 
-    # Patch the fetcher so it raises instead of contacting a worker.
     with patch(
         "flowfile_core.flowfile.flow_graph.MLTrainFetcher",
         side_effect=RuntimeError("worker exploded"),
@@ -579,10 +565,8 @@ def test_apply_model_upstream_mode_requires_upstream_node_id():
         graph.get_node(2).get_resulting_data()
 
 
-# ---------------------------------------------------------------------------
 # Schema callback creates Float64 column even if the apply node has no
 # upstream yet (defensive sanity check).
-# ---------------------------------------------------------------------------
 
 
 def test_flowfile_column_float64_dtype_for_prediction():
@@ -591,9 +575,7 @@ def test_flowfile_column_float64_dtype_for_prediction():
     assert col.column_name == "predicted_value"
 
 
-# ---------------------------------------------------------------------------
 # Artifact tab — train_model surfaces in node Artifacts tab via artifact_context
-# ---------------------------------------------------------------------------
 
 
 def test_train_model_records_artifact_in_node_summary(monkeypatch):
@@ -614,7 +596,6 @@ def test_train_model_records_artifact_in_node_summary(monkeypatch):
             captured["staging_path"] = staging_path
 
         def get_result(self):
-            # Pretend the worker wrote a small model and report its size.
             from pathlib import Path
             Path(captured["staging_path"]).parent.mkdir(parents=True, exist_ok=True)
             Path(captured["staging_path"]).write_text('{"stub": true}')
@@ -636,7 +617,6 @@ def test_train_model_records_artifact_in_node_summary(monkeypatch):
     graph.add_train_model(settings)
     graph.get_node(2).get_resulting_data()
 
-    # Per-node summary used by the frontend Data | Artifacts tab.
     summaries = graph.artifact_context.get_node_summaries()
     assert "2" in summaries
     s = summaries["2"]
@@ -681,7 +661,6 @@ def test_train_model_artifact_replaces_on_rerun(monkeypatch):
         ),
     )
     graph.add_train_model(settings)
-    # Run twice — should still have exactly one entry.
     graph.get_node(2).get_resulting_data()
     graph.get_node(2).reset()
     graph.get_node(2).get_resulting_data()
@@ -690,9 +669,7 @@ def test_train_model_artifact_replaces_on_rerun(monkeypatch):
     assert summaries["2"]["published_count"] == 1
 
 
-# ---------------------------------------------------------------------------
 # Wait For node
-# ---------------------------------------------------------------------------
 
 
 def _wire_wait_for(graph: FlowGraph, *, node_id: int, left: int, right: int) -> None:
@@ -761,9 +738,9 @@ def test_wait_for_runs_after_dependency_and_passes_data_through():
     assert out.height == 2  # _seed_manual_input writes 2 rows
 
 
-# ---------------------------------------------------------------------------
 # /ml/upstream-train-models picker — strict DAG ancestor scope
-# ---------------------------------------------------------------------------
+
+_USER = User(id=1, username="local_user")
 
 
 def _patch_upstream_handler(monkeypatch, graph: FlowGraph) -> None:
@@ -771,8 +748,8 @@ def _patch_upstream_handler(monkeypatch, graph: FlowGraph) -> None:
     from flowfile_core.ml import routes as ml_routes
 
     class _StubHandler:
-        def get_flow(self, fid):
-            return graph if fid == graph.flow_id else None
+        def get_flow(self, fid, user_id=None):
+            return graph if fid == graph.flow_id and user_id == _USER.id else None
 
     monkeypatch.setattr(ml_routes, "flow_file_handler", _StubHandler())
 
@@ -800,7 +777,7 @@ def test_upstream_picker_returns_directly_connected_train_model(monkeypatch):
     _wire_ml_node(graph, "apply_model", node_id=3, upstream_id=2)
 
     _patch_upstream_handler(monkeypatch, graph)
-    result = list_upstream_train_models(graph.flow_id, 3)
+    result = list_upstream_train_models(graph.flow_id, 3, current_user=_USER)
     assert [r.node_id for r in result] == [2]
 
 
@@ -814,7 +791,7 @@ def test_upstream_picker_excludes_train_model_in_parallel_branch(monkeypatch):
     _wire_ml_node(graph, "apply_model", node_id=2, upstream_id=1)
 
     _patch_upstream_handler(monkeypatch, graph)
-    result = list_upstream_train_models(graph.flow_id, 2)
+    result = list_upstream_train_models(graph.flow_id, 2, current_user=_USER)
     assert result == []
 
 
@@ -828,7 +805,7 @@ def test_upstream_picker_finds_train_model_through_wait_for(monkeypatch):
     _wire_ml_node(graph, "apply_model", node_id=4, upstream_id=3)
 
     _patch_upstream_handler(monkeypatch, graph)
-    result = list_upstream_train_models(graph.flow_id, 4)
+    result = list_upstream_train_models(graph.flow_id, 4, current_user=_USER)
     assert [r.node_id for r in result] == [2]
 
 
@@ -840,7 +817,7 @@ def test_upstream_picker_returns_empty_when_no_train_models(monkeypatch):
     _wire_ml_node(graph, "apply_model", node_id=2, upstream_id=1)
 
     _patch_upstream_handler(monkeypatch, graph)
-    result = list_upstream_train_models(graph.flow_id, 2)
+    result = list_upstream_train_models(graph.flow_id, 2, current_user=_USER)
     assert result == []
 
 
@@ -855,5 +832,5 @@ def test_upstream_picker_returns_only_ancestor_train_model_among_many(monkeypatc
     _wire_ml_node(graph, "apply_model", node_id=3, upstream_id=2)
 
     _patch_upstream_handler(monkeypatch, graph)
-    result = list_upstream_train_models(graph.flow_id, 3)
+    result = list_upstream_train_models(graph.flow_id, 3, current_user=_USER)
     assert [r.node_id for r in result] == [2]

@@ -13,10 +13,11 @@ export interface PyodideConfig {
 
 /** Input data that can be passed programmatically to the editor */
 export interface InputDataItem {
-  /** The data content (CSV or JSON string) */
-  content: string
-  /** Data format (default: 'csv') */
-  format?: 'csv' | 'json'
+  /** The data content: CSV/JSON string, or binary bytes (Arrow IPC stream / Parquet file) */
+  content: string | Uint8Array
+  /** Data format (default: 'csv' for strings; binary defaults to a PAR1 sniff
+   * — pass 'arrow-ipc' or 'parquet' explicitly when you know it) */
+  format?: 'csv' | 'json' | 'arrow-ipc' | 'parquet'
   /** CSV delimiter (default: ',') */
   delimiter?: string
   /** Whether the CSV has headers (default: true) */
@@ -68,6 +69,13 @@ export interface FlowfileEditorProps {
   nodeCategories?: NodeCategoryConfig[]
   /** Whether the editor is read-only */
   readonly?: boolean
+  /**
+   * Offer the plain-Python teaching flavour (default: true). Adds a second mode
+   * to the Code panel that rewrites the flow with lists, dicts and for loops
+   * instead of Polars, plus a "How would I write this myself?" panel in node
+   * settings. Set false to hide both.
+   */
+  teachingMode?: boolean
   /** Height of the editor (default: '100%') */
   height?: string
   /** Width of the editor (default: '100%') */
@@ -102,10 +110,16 @@ export interface FlowfileEditorAPI {
   exportFlow: () => FlowfileData
   /** Import a flow from FlowfileData */
   importFlow: (data: FlowfileData) => boolean
-  /** Set input data for a named dataset (matched by node_reference) */
-  setInputData: (name: string, content: string) => void
+  /** Set input data for a named dataset (matched by node_reference). Binary
+   * content (Uint8Array) is treated as Arrow IPC / Parquet (pass format to be
+   * explicit). */
+  setInputData: (name: string, content: string | Uint8Array, format?: InputDataItem['format']) => void
   /** Get the result/preview for a specific node */
   getNodeResult: (nodeId: number) => NodeResult | undefined
+  /** Get a node's full result frame as Arrow IPC stream bytes (null when the
+   * node hasn't produced one). Zero CSV stringification — feed it straight to
+   * arrow-js / duckdb-wasm. */
+  getNodeResultArrow: (nodeId: number) => Promise<Uint8Array | null>
   /** Clear the entire flow */
   clearFlow: () => void
   /** Initialize Pyodide manually (when autoInit is false) */

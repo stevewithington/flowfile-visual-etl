@@ -10,7 +10,9 @@
       filterable
       :placeholder="schema.multiple ? 'Select columns...' : 'Select a column...'"
       style="width: 100%"
-      size="large"
+      size="small"
+      :loading="loading"
+      loading-text="Loading columns…"
       @update:model-value="$emit('update:modelValue', $event)"
     >
       <el-option
@@ -44,21 +46,32 @@ const props = defineProps({
     type: Array as PropType<FileColumn[]>,
     default: () => [],
   },
+  loading: {
+    type: Boolean,
+    default: false,
+  },
 });
 
 defineEmits(["update:modelValue"]);
 
 const filteredColumns = computed(() => {
-  // If data_types is "ALL" or not specified, return all columns
-  if (!props.schema.data_types || props.schema.data_types === "ALL") {
+  const dataTypes = props.schema.data_types;
+  if (!dataTypes || dataTypes === "ALL") {
     return props.incomingColumns;
   }
 
-  // Filter columns based on data types
-  if (Array.isArray(props.schema.data_types)) {
-    return props.incomingColumns.filter((column) => {
-      return props.schema.data_types.includes(column.data_type);
-    });
+  if (Array.isArray(dataTypes)) {
+    // A data_types entry is a specific polars type ("Int64") or a group ("Numeric"), so a column
+    // matches on its concrete dtype or its data_type_group. Parameterized dtypes arrive stringified
+    // with their inner type ("Array(Float32, shape=(384,))", "Datetime(time_unit='us')"), so they
+    // also match on the base token — mirroring get_readable_datatype_group() in core.
+    const baseType = (dtype: string) => (dtype ?? "").split("(")[0];
+    return props.incomingColumns.filter(
+      (column) =>
+        dataTypes.includes(column.data_type) ||
+        dataTypes.includes(baseType(column.data_type)) ||
+        dataTypes.includes(column.data_type_group),
+    );
   }
 
   return props.incomingColumns;

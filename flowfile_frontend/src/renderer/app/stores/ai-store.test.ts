@@ -1,6 +1,6 @@
-
 import { setActivePinia, createPinia } from "pinia";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { AiProvider } from "../views/AiSettingsView/aiProviderTypes";
 
 const mockSymbols = vi.hoisted(() => {
   class AiStreamHttpError extends Error {
@@ -27,7 +27,8 @@ const mockSymbols = vi.hoisted(() => {
     streamLineageQuestion: vi.fn(),
     streamRunFailureExplanation: vi.fn(),
     routeMessage: vi.fn(),
-    fetchAiProviders: vi.fn(async () => []),
+    fetchAiProviders: vi.fn(async (): Promise<AiProvider[]> => []),
+    generateFlow: vi.fn(),
     agentStoreStart: vi.fn(),
     agentStoreAbort: vi.fn(),
     flowStoreState: { flowId: 1 as number | null, vueFlowInstance: null as unknown },
@@ -44,6 +45,10 @@ const mockSymbols = vi.hoisted(() => {
     })),
     persistAiState: vi.fn(),
     clearPersistedAiState: vi.fn(),
+    // Device-wide settings bucket. `null` = never written (fresh install),
+    // which makes the store fall back to the legacy per-flow fields above.
+    loadPersistedAiSettings: vi.fn((): Record<string, unknown> | null => null),
+    persistAiSettings: vi.fn(),
   };
 });
 
@@ -67,7 +72,7 @@ vi.mock("../services/auth.service", () => {
   const stub = {
     getToken: vi.fn(async () => null),
     logout: vi.fn(),
-    isInElectronMode: () => false,
+    isInDesktopMode: () => false,
     setModeFromBackend: vi.fn(),
     initialize: vi.fn(async () => false),
     hasValidToken: () => false,
@@ -120,6 +125,33 @@ vi.mock("./ai-store-persistence", () => ({
   loadPersistedAiState: mockSymbols.loadPersistedAiState,
   persistAiState: mockSymbols.persistAiState,
   clearPersistedAiState: mockSymbols.clearPersistedAiState,
+  loadPersistedAiSettings: mockSymbols.loadPersistedAiSettings,
+  persistAiSettings: mockSymbols.persistAiSettings,
+}));
+
+// localModelApi imports config/constants, which reads ``window`` at module
+// load — mock it (like every other sibling) so the store imports cleanly in
+// the jsdom-free unit env. Default ``fetchLocalModelStatus`` → null so no
+// synthetic "local" provider is injected, preserving the BYOK-only
+// expectations in the loadProviders specs below.
+vi.mock("../views/AiSettingsView/localModelApi", () => ({
+  LOCAL_PROVIDER_ID: "local",
+  fetchLocalModelStatus: vi.fn(async () => null),
+  generateFlow: mockSymbols.generateFlow,
+  // The real guard: pure, and the code-mode failure specs rely on it.
+  isGenerateFlowFailure: (detail: unknown) =>
+    typeof detail === "object" &&
+    detail !== null &&
+    (detail as { kind?: unknown }).kind === "code" &&
+    typeof (detail as { message?: unknown }).message === "string",
+  selectLocalModel: vi.fn(),
+  streamLocalModelInstall: vi.fn(),
+}));
+
+// Simple-build applies via the diff client (acceptDiff); mock it so the store
+// imports cleanly without the fetch layer.
+vi.mock("../services/aiDiffClient", () => ({
+  acceptDiff: vi.fn(),
 }));
 
 import { useAiStore } from "./ai-store";
@@ -140,6 +172,9 @@ beforeEach(() => {
     selectedModel: null,
     autoPromote: null,
   }));
+  mockSymbols.loadPersistedAiSettings.mockReset();
+  mockSymbols.loadPersistedAiSettings.mockImplementation(() => null);
+  mockSymbols.persistAiSettings.mockReset();
 });
 
 afterEach(() => {
@@ -586,5 +621,480 @@ describe("useAiStore - mode default + autoPromote migration shim", () => {
     }));
     const store = useAiStore();
     expect(store.mode).toBe("auto");
+  });
+});
+
+describe("useAiStore - split model tiers (resolveSurface)", () => {
+  const _seed = (): ReturnType<typeof useAiStore> => {
+    const store = useAiStore();
+    store.providers = [
+      {
+        provider: "openrouter",
+        supportsTools: true,
+        supportsStreaming: true,
+        defaultModel: "qwen/qwen3-coder",
+        surfaces: { cron: "anthropic/claude-haiku-4.5" },
+        status: "configured",
+        credential: null,
+      },
+      {
+        provider: "local",
+        supportsTools: false,
+        supportsStreaming: true,
+        defaultModel: "qwen2.5-coder-3b",
+        surfaces: {},
+        status: "configured",
+        credential: null,
+      },
+    ];
+    store.setSelectedProvider("openrouter");
+    return store;
+  };
+
+  it("routes every surface to the main selection when split is off", () => {
+    const store = _seed();
+    store.setSelectedModel("anthropic/claude-opus-4.5");
+    expect(store.splitModels).toBe(false);
+    expect(store.resolveSurface("ghost_node")).toEqual({
+      provider: "openrouter",
+      model: "anthropic/claude-opus-4.5",
+    });
+    // cron is a simple surface but split is off → still the main selection.
+    expect(store.resolveSurface("cron")).toEqual({
+      provider: "openrouter",
+      model: "anthropic/claude-opus-4.5",
+    });
+  });
+
+  it("routes simple surfaces to the simple tier (own provider) when split is on", () => {
+    const store = _seed();
+    store.setSelectedModel("anthropic/claude-opus-4.5");
+    store.setSplitModels(true);
+    // Simple tier can be a different provider entirely (e.g. local).
+    store.setSimpleProvider("local");
+    expect(store.resolveSurface("cron")).toEqual({
+      provider: "local",
+      model: "qwen2.5-coder-3b",
+    });
+    expect(store.resolveSurface("settings_autocomplete").provider).toBe("local");
+    // Complex surfaces still use the main selection.
+    expect(store.resolveSurface("ghost_node")).toEqual({
+      provider: "openrouter",
+      model: "anthropic/claude-opus-4.5",
+    });
+  });
+
+  it("setSplitModels seeds the simple tier from the main selection", () => {
+    const store = _seed();
+    store.setSelectedModel("anthropic/claude-opus-4.5");
+    store.setSplitModels(true);
+    expect(store.simpleProvider).toBe("openrouter");
+    expect(store.simpleModel).toBe("anthropic/claude-opus-4.5");
+  });
+
+  it("setSimpleProvider defaults the simple model to that provider's default", () => {
+    const store = _seed();
+    store.setSplitModels(true);
+    store.setSimpleProvider("local");
+    expect(store.simpleModel).toBe("qwen2.5-coder-3b");
+  });
+
+  it("modelForSurface falls back to the surface preset, then provider default", () => {
+    const store = _seed();
+    store.setSelectedModel(null);
+    expect(store.modelForSurface("cron")).toBe("anthropic/claude-haiku-4.5");
+    expect(store.modelForSurface("mystery")).toBe("qwen/qwen3-coder");
+  });
+
+  it("modelForSurface returns null when no provider is selected", () => {
+    const store = useAiStore();
+    store.selectedProvider = null;
+    expect(store.modelForSurface("ghost_node")).toBeNull();
+  });
+
+  it("changing the complex provider leaves the independent simple tier intact", () => {
+    const store = _seed();
+    store.setSplitModels(true);
+    store.setSimpleProvider("local");
+    store.setSelectedProvider("openrouter");
+    // Simple tier is independent — not reset by a complex-provider change.
+    expect(store.simpleProvider).toBe("local");
+    expect(store.resolveSurface("cron").provider).toBe("local");
+  });
+
+  it("modelsForProvider unions the curated list with the default, deduped", () => {
+    const store = useAiStore();
+    store.providers = [
+      {
+        provider: "openrouter",
+        supportsTools: true,
+        supportsStreaming: true,
+        defaultModel: "qwen/qwen3-coder",
+        surfaces: {},
+        status: "configured",
+        credential: {
+          provider: "openrouter",
+          hasKey: true,
+          apiBase: null,
+          defaultModel: "anthropic/claude-sonnet-4.6",
+          models: ["moonshotai/kimi-k2:free", "anthropic/claude-sonnet-4.6"],
+          lastTestedAt: null,
+          lastTestStatus: null,
+          lastTestError: null,
+          createdAt: null,
+          updatedAt: null,
+        },
+      },
+    ];
+    expect(store.modelsForProvider("openrouter")).toEqual([
+      "moonshotai/kimi-k2:free",
+      "anthropic/claude-sonnet-4.6",
+    ]);
+    expect(store.modelsForProvider("missing")).toEqual([]);
+    expect(store.modelsForProvider(null)).toEqual([]);
+  });
+});
+
+describe("useAiStore - device-wide settings hydration", () => {
+  // Provider/model, the simple tier and the agent toggles are preferences,
+  // not conversation state: they hydrate from the settings bucket, fall
+  // back to the legacy per-flow fields exactly once (migration), and are
+  // written to the settings bucket — never the flow blob.
+  it("prefers the settings bucket over legacy per-flow fields", () => {
+    mockSymbols.loadPersistedAiState.mockImplementation(() => ({
+      messages: [],
+      selectedProvider: "anthropic",
+      selectedModel: "legacy-model",
+      autoPromote: null,
+      selectedAgentSurface: "agent_complex",
+      verifyPlanCompletion: false,
+    }));
+    mockSymbols.loadPersistedAiSettings.mockImplementation(() => ({
+      selectedProvider: "openai",
+      selectedModel: "gpt-5",
+      splitModels: true,
+      simpleProvider: "groq",
+      simpleModel: null,
+      selectedAgentSurface: "agent_staged",
+      verifyPlanCompletion: true,
+    }));
+    const store = useAiStore();
+    expect(store.selectedProvider).toBe("openai");
+    expect(store.selectedModel).toBe("gpt-5");
+    expect(store.splitModels).toBe(true);
+    expect(store.simpleProvider).toBe("groq");
+    expect(store.selectedAgentSurface).toBe("agent_staged");
+    expect(store.verifyPlanCompletion).toBe(true);
+    // Bucket already exists → no migration write.
+    expect(mockSymbols.persistAiSettings).not.toHaveBeenCalled();
+  });
+
+  it("migrates legacy per-flow settings into the bucket once when it is missing", () => {
+    mockSymbols.loadPersistedAiState.mockImplementation(() => ({
+      messages: [],
+      selectedProvider: "groq",
+      selectedModel: "llama",
+      autoPromote: null,
+      selectedAgentSurface: "agent_complex",
+      verifyPlanCompletion: true,
+    }));
+    const store = useAiStore();
+    expect(store.selectedProvider).toBe("groq");
+    expect(store.selectedModel).toBe("llama");
+    expect(store.selectedAgentSurface).toBe("agent_complex");
+    expect(store.verifyPlanCompletion).toBe(true);
+    expect(mockSymbols.persistAiSettings).toHaveBeenCalledTimes(1);
+    expect(mockSymbols.persistAiSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        selectedProvider: "groq",
+        selectedModel: "llama",
+        selectedAgentSurface: "agent_complex",
+        verifyPlanCompletion: true,
+      }),
+    );
+  });
+
+  it("uses the defaults without a migration write on a fresh install", () => {
+    const store = useAiStore();
+    expect(store.selectedProvider).toBeNull();
+    expect(store.selectedAgentSurface).toBe("agent_live");
+    expect(store.verifyPlanCompletion).toBe(false);
+    expect(mockSymbols.persistAiSettings).not.toHaveBeenCalled();
+  });
+
+  it("writes agent settings to the settings bucket, not the flow blob", async () => {
+    const store = useAiStore();
+    store.setSelectedAgentSurface("agent_staged");
+    store.setVerifyPlanCompletion(true);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(mockSymbols.persistAiSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ selectedAgentSurface: "agent_staged", verifyPlanCompletion: true }),
+    );
+    // Throttled flow-blob writes from earlier specs may still land during the
+    // wait; what matters is that no flow-blob write ever carries a setting.
+    for (const [state] of mockSymbols.persistAiState.mock.calls as [Record<string, unknown>][]) {
+      expect(Object.keys(state).sort()).toEqual(["agentModeAccepted", "messages"]);
+    }
+  });
+});
+
+describe("useAiStore - aiDisabled", () => {
+  it("flags aiDisabled when the providers endpoint answers the disabled contract", async () => {
+    mockSymbols.fetchAiProviders.mockRejectedValue(new mockSymbols.AiDisabledError());
+    const store = useAiStore();
+    await store.loadProviders();
+    expect(store.aiDisabled).toBe(true);
+    expect(store.providers).toEqual([]);
+
+    // An admin flips the flag back on → the next successful load clears it.
+    mockSymbols.fetchAiProviders.mockResolvedValue([]);
+    await store.loadProviders();
+    expect(store.aiDisabled).toBe(false);
+  });
+
+  it("leaves aiDisabled false on an ordinary network failure", async () => {
+    mockSymbols.fetchAiProviders.mockRejectedValue(new Error("boom"));
+    const store = useAiStore();
+    await store.loadProviders();
+    expect(store.aiDisabled).toBe(false);
+    expect(store.providersError).toBe("boom");
+  });
+});
+
+describe("useAiStore - loadProviders resets a saved model the provider no longer offers", () => {
+  const _openrouter = (models: string[] | null): AiProvider => ({
+    provider: "openrouter",
+    supportsTools: true,
+    supportsStreaming: true,
+    defaultModel: "qwen/qwen3.6-35b-a3b",
+    surfaces: {},
+    status: "configured" as const,
+    credential:
+      models === null
+        ? null
+        : {
+            provider: "openrouter",
+            hasKey: true,
+            apiBase: null,
+            defaultModel: null,
+            models,
+            lastTestedAt: null,
+            lastTestStatus: null,
+            lastTestError: null,
+            createdAt: null,
+            updatedAt: null,
+          },
+  });
+
+  it("replaces a stale class default saved by an older build with the current default", async () => {
+    mockSymbols.loadPersistedAiSettings.mockImplementation(() => ({
+      selectedProvider: "openrouter",
+      selectedModel: "meta-llama/llama-3.3-70b-instruct",
+      splitModels: true,
+      simpleProvider: "openrouter",
+      simpleModel: "qwen/qwen3-coder-30b-a3b-instruct",
+    }));
+    mockSymbols.fetchAiProviders.mockResolvedValue([_openrouter(null)]);
+    const store = useAiStore();
+    expect(store.selectedModel).toBe("meta-llama/llama-3.3-70b-instruct");
+    await store.loadProviders();
+    expect(store.selectedProvider).toBe("openrouter");
+    expect(store.selectedModel).toBe("qwen/qwen3.6-35b-a3b");
+    expect(store.simpleModel).toBe("qwen/qwen3.6-35b-a3b");
+  });
+
+  it("keeps a model the user picked from their curated list", async () => {
+    mockSymbols.loadPersistedAiSettings.mockImplementation(() => ({
+      selectedProvider: "openrouter",
+      selectedModel: "custom/model-x:free",
+      splitModels: false,
+      simpleProvider: null,
+      simpleModel: null,
+    }));
+    mockSymbols.fetchAiProviders.mockResolvedValue([_openrouter(["custom/model-x:free"])]);
+    const store = useAiStore();
+    await store.loadProviders();
+    expect(store.selectedModel).toBe("custom/model-x:free");
+  });
+
+  it("leaves the pick alone when the provider list cannot be loaded", async () => {
+    mockSymbols.loadPersistedAiSettings.mockImplementation(() => ({
+      selectedProvider: "openrouter",
+      selectedModel: "meta-llama/llama-3.3-70b-instruct",
+    }));
+    mockSymbols.fetchAiProviders.mockRejectedValue(new Error("boom"));
+    const store = useAiStore();
+    await store.loadProviders();
+    expect(store.selectedModel).toBe("meta-llama/llama-3.3-70b-instruct");
+  });
+});
+
+describe("useAiStore - Simple build answers instead of failing on a question", () => {
+  const _seed = (): ReturnType<typeof useAiStore> => {
+    const store = useAiStore();
+    store.providers = [
+      {
+        provider: "local",
+        supportsTools: false,
+        supportsStreaming: true,
+        defaultModel: "qwen3.5-4b",
+        surfaces: {},
+        status: "configured",
+        credential: null,
+      },
+    ];
+    store.setSelectedProvider("local");
+    return store;
+  };
+
+  it("shows the model's reply as the assistant message and stages nothing", async () => {
+    mockSymbols.generateFlow.mockResolvedValue({
+      diffId: null,
+      opCount: 0,
+      created: [],
+      warnings: [],
+      rationale: "Answered without building",
+      diffPayload: null,
+      answer: "I build flows from a description; ask about this one in Chat mode.",
+    });
+    const store = _seed();
+    await store.generateFlowFromComposer("What is this flow?");
+    const reply = store.messages[store.messages.length - 1];
+    expect(reply.role).toBe("assistant");
+    expect(reply.content).toBe(
+      "I build flows from a description; ask about this one in Chat mode.",
+    );
+    expect(reply.buildDiffId).toBeUndefined();
+    expect(reply.error).toBeUndefined();
+    expect(store.streamingState).toBe("idle");
+  });
+
+  it("still renders the Add-to-canvas result for a real build", async () => {
+    mockSymbols.generateFlow.mockResolvedValue({
+      diffId: "diff-1",
+      opCount: 3,
+      created: [],
+      warnings: [],
+      rationale: "Generated flow (simple mode)",
+      diffPayload: {},
+      answer: null,
+      code: null,
+    });
+    const store = _seed();
+    await store.generateFlowFromComposer("read orders.csv and keep paid orders");
+    const reply = store.messages[store.messages.length - 1];
+    expect(reply.buildDiffId).toBe("diff-1");
+    expect(reply.buildOpCount).toBe(3);
+    expect(reply.content).toContain("Built a flow with 3 node(s)");
+  });
+});
+
+describe("useAiStore - Simple build in code mode", () => {
+  const SCRIPT = 'import flowfile as ff\norders = ff.read_csv("orders.csv")';
+  const _seed = (): ReturnType<typeof useAiStore> => {
+    const store = useAiStore();
+    store.providers = [
+      {
+        provider: "local",
+        supportsTools: false,
+        supportsStreaming: true,
+        defaultModel: "qwen3.5-4b",
+        surfaces: {},
+        status: "configured",
+        credential: null,
+      },
+    ];
+    store.setSelectedProvider("local");
+    return store;
+  };
+
+  it("asks for code by default and keeps the script on the bubble", async () => {
+    mockSymbols.generateFlow.mockResolvedValue({
+      diffId: "diff-2",
+      opCount: 1,
+      created: [],
+      warnings: [],
+      rationale: "Generated flow (code mode)",
+      diffPayload: {},
+      answer: null,
+      code: SCRIPT,
+    });
+    const store = _seed();
+    expect(store.simpleBuildOutput).toBe("code");
+    await store.generateFlowFromComposer("read orders.csv");
+    expect(mockSymbols.generateFlow).toHaveBeenCalledWith(
+      1,
+      "read orders.csv",
+      "local",
+      "qwen3.5-4b",
+      "code",
+    );
+    const reply = store.messages[store.messages.length - 1];
+    expect(reply.buildDiffId).toBe("diff-2");
+    expect(reply.buildCode).toBe(SCRIPT);
+    expect(reply.buildCodeLine).toBeUndefined();
+  });
+
+  it("sends the JSON mode when the setting says so", async () => {
+    mockSymbols.generateFlow.mockResolvedValue({
+      diffId: "diff-3",
+      opCount: 1,
+      created: [],
+      warnings: [],
+      rationale: "Generated flow (simple mode)",
+      diffPayload: {},
+      answer: null,
+      code: null,
+    });
+    const store = _seed();
+    store.setSimpleBuildOutput("json");
+    await store.generateFlowFromComposer("read orders.csv");
+    expect(mockSymbols.generateFlow).toHaveBeenLastCalledWith(
+      1,
+      "read orders.csv",
+      "local",
+      "qwen3.5-4b",
+      "simple",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(mockSymbols.persistAiSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ simpleBuildOutput: "json" }),
+    );
+  });
+
+  it("shows the failing script and its line when the repair round also failed", async () => {
+    mockSymbols.generateFlow.mockRejectedValue({
+      response: {
+        status: 422,
+        data: {
+          detail: {
+            message: "`ff.read_json` is not a flowfile name",
+            line: 2,
+            kind: "code",
+            code: 'import flowfile as ff\norders = ff.read_json("orders.json")',
+          },
+        },
+      },
+    });
+    const store = _seed();
+    await store.generateFlowFromComposer("read orders.json");
+    const reply = store.messages[store.messages.length - 1];
+    expect(reply.error).toBe("line 2: `ff.read_json` is not a flowfile name");
+    expect(reply.content).toContain("Generation failed: line 2");
+    expect(reply.buildCode).toContain("ff.read_json");
+    expect(reply.buildCodeLine).toBe(2);
+    expect(reply.buildDiffId).toBeUndefined();
+    expect(store.streamingState).toBe("error");
+  });
+
+  it("keeps a plain string detail as the failure message", async () => {
+    mockSymbols.generateFlow.mockRejectedValue({
+      response: { status: 422, data: { detail: "Could not generate a flow: nothing parsed" } },
+    });
+    const store = _seed();
+    await store.generateFlowFromComposer("read orders.csv");
+    const reply = store.messages[store.messages.length - 1];
+    expect(reply.error).toBe("Could not generate a flow: nothing parsed");
+    expect(reply.buildCode).toBeUndefined();
   });
 });

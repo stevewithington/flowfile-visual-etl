@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Final
 
 from flowfile_core.ai.providers.base import ToolSpec
+from flowfile_core.configs.node_store.nodes import get_source_node_types_str
 
 JSON_SCHEMA_DIALECT: Final[str] = "https://json-schema.org/draft/2020-12/schema"
 
@@ -49,7 +50,8 @@ GRAPH_OPS_TOOLS: Final[list[ToolSpec]] = [
             "Connect two nodes via a directed edge. Mirrors POST /editor/connect_node/. "
             "input_class defaults to 'input-0' (main input); use 'input-1' / 'input-2' for "
             "join's left/right inputs. output_class defaults to 'output-0'; nodes with "
-            "split_mode (e.g. filter) have 'output-0' (pass) and 'output-1' (fail)."
+            "split_mode (e.g. filter) have 'output-0' (pass) and 'output-1' (fail), and a "
+            "gate with else_output has 'output-0' (then) and 'output-1' (else)."
         ),
         long_description=(
             "Wire one node's output to another node's input. Use after every "
@@ -58,9 +60,14 @@ GRAPH_OPS_TOOLS: Final[list[ToolSpec]] = [
             "('output-0') — the defaults match. Reach for the named variants only "
             "when the node has multiple inputs / outputs: 'add_join' takes "
             "input-0 (left) and input-1 (right); a 'filter' node with "
-            "split_mode=true emits output-0 (matched rows) and output-1 (rejected). "
-            "Don't connect a node to itself; the host rejects self-loops. Example "
-            "after 'add_filter': connect(from_node_id=read_id, to_node_id=filter_id) "
+            "split_mode=true emits output-0 (matched rows) and output-1 (rejected); "
+            "a 'gate' with else_output=true emits output-0 (then, live when the "
+            "condition holds) and output-1 (else, live when it does not). "
+            "Don't connect a node to itself; the host rejects self-loops. Never wire "
+            f"INTO a source node ({get_source_node_types_str()}) — they have no input port and "
+            "the host rejects it; to combine two sources, add a join/union and connect "
+            "both into it. Example after 'add_filter': "
+            "connect(from_node_id=read_id, to_node_id=filter_id) "
             "to give the filter its source rows."
         ),
         parameters=_schema(

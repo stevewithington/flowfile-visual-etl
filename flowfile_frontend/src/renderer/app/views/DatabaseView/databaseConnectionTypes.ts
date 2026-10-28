@@ -1,13 +1,10 @@
 //flowfile_frontend/src/renderer/app/pages/databaseManager/databaseConnectionTypes.ts
 
-export type DatabaseType = "postgresql" | "mysql" | "sqlite";
+import type { AccessInfo } from "../../types/sharing.types";
 
-export const defaultPorts: Partial<Record<DatabaseType, number>> = {
-  postgresql: 5432,
-  mysql: 3306,
-};
-
-export const isFileBased = (dbType: DatabaseType): boolean => dbType === "sqlite";
+// Dialect names come from the backend registry (GET /db_dialects, shared/db_dialects);
+// use composables/useDbDialects for metadata (file_based, default ports, display names).
+export type DatabaseType = string;
 
 export interface PythonFullDatabaseConnection {
   connection_name: string;
@@ -42,6 +39,8 @@ export interface PythonFullDatabaseConnectionInterface {
   database?: string;
   ssl_enabled: boolean;
   url?: string;
+  id?: number;
+  access?: AccessInfo | null;
 }
 
 export interface FullDatabaseConnectionInterface {
@@ -53,4 +52,6 @@ export interface FullDatabaseConnectionInterface {
   database?: string;
   sslEnabled: boolean;
   url?: string;
+  id?: number;
+  access?: AccessInfo | null;
 }

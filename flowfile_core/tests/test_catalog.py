@@ -4,6 +4,10 @@ Covers namespace CRUD, flow registration, favorites, follows,
 run history, stats, and the default namespace seeding.
 """
 
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -25,10 +29,11 @@ from flowfile_core.database.models import (
     User,
 )
 from flowfile_core.flowfile.catalog_helpers import auto_register_flow
+from flowfile_core.routes.routes import flow_file_handler
+from shared.run_logs import run_log_path
+from shared.storage_config import storage
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _get_auth_token() -> str:
@@ -62,9 +67,7 @@ def _cleanup_catalog():
         db.commit()
 
 
-# ---------------------------------------------------------------------------
 # Fixtures
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
@@ -75,9 +78,25 @@ def clean_catalog():
     _cleanup_catalog()
 
 
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def run_log_file():
+    """Write a run's subprocess log where the service resolves it, and clean up."""
+    written: list[Path] = []
+
+    def _write(run_id: int, content: str) -> Path:
+        path = run_log_path(run_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        written.append(path)
+        return path
+
+    yield _write
+
+    for path in written:
+        path.unlink(missing_ok=True)
+
+
 # Namespace tests
-# ---------------------------------------------------------------------------
 
 
 class TestNamespaces:
@@ -93,7 +112,6 @@ class TestNamespaces:
         assert data["parent_id"] is None
 
     def test_create_schema_under_catalog(self):
-        # Create catalog first
         cat = client.post("/catalog/namespaces", json={"name": "Cat"}).json()
         resp = client.post(
             "/catalog/namespaces",
@@ -147,9 +165,7 @@ class TestNamespaces:
         assert root["children"][0]["name"] == "TreeSchema"
 
 
-# ---------------------------------------------------------------------------
 # Flow registration tests
-# ---------------------------------------------------------------------------
 
 
 class TestFlowRegistration:
@@ -207,6 +223,46 @@ class TestFlowRegistration:
         assert resp.status_code == 200
         assert resp.json()["name"] == "new_name"
 
+    def test_update_flow_rejects_duplicate_name_in_namespace(self):
+        ns_id = self._make_namespace()
+        client.post(
+            "/catalog/flows",
+            json={"name": "taken", "flow_path": "/tmp/taken.yaml", "namespace_id": ns_id},
+        )
+        other = client.post(
+            "/catalog/flows",
+            json={"name": "other", "flow_path": "/tmp/other.yaml", "namespace_id": ns_id},
+        ).json()
+        resp = client.put(f"/catalog/flows/{other['id']}", json={"name": "taken"})
+        assert resp.status_code == 409
+        assert client.get(f"/catalog/flows/{other['id']}").json()["name"] == "other"
+
+    def test_update_flow_rename_to_own_name_succeeds(self):
+        ns_id = self._make_namespace()
+        created = client.post(
+            "/catalog/flows",
+            json={"name": "same", "flow_path": "/tmp/same.yaml", "namespace_id": ns_id},
+        ).json()
+        resp = client.put(f"/catalog/flows/{created['id']}", json={"name": "same"})
+        assert resp.status_code == 200
+        assert resp.json()["name"] == "same"
+
+    def test_update_flow_namespace_move_with_name_clash_rejected(self):
+        ns_a = self._make_namespace()
+        cat_b = client.post("/catalog/namespaces", json={"name": "FC2"}).json()
+        ns_b = client.post("/catalog/namespaces", json={"name": "FS2", "parent_id": cat_b["id"]}).json()["id"]
+        client.post(
+            "/catalog/flows",
+            json={"name": "clash", "flow_path": "/tmp/clash_b.yaml", "namespace_id": ns_b},
+        )
+        moving = client.post(
+            "/catalog/flows",
+            json={"name": "clash", "flow_path": "/tmp/clash_a.yaml", "namespace_id": ns_a},
+        ).json()
+        resp = client.put(f"/catalog/flows/{moving['id']}", json={"namespace_id": ns_b})
+        assert resp.status_code == 409
+        assert client.get(f"/catalog/flows/{moving['id']}").json()["namespace_id"] == ns_a
+
     def test_delete_flow(self):
         ns_id = self._make_namespace()
         created = client.post(
@@ -215,6 +271,49 @@ class TestFlowRegistration:
         ).json()
         resp = client.delete(f"/catalog/flows/{created['id']}")
         assert resp.status_code == 204
+
+    def test_delete_flow_removes_file_when_requested(self, tmp_path):
+        ns_id = self._make_namespace()
+        flow_file = tmp_path / "to_delete.yaml"
+        flow_file.write_text("flow: {}")
+        created = client.post(
+            "/catalog/flows",
+            json={"name": "df", "flow_path": str(flow_file), "namespace_id": ns_id},
+        ).json()
+        resp = client.delete(f"/catalog/flows/{created['id']}", params={"delete_file": True})
+        assert resp.status_code == 204
+        assert not flow_file.exists()
+
+    def test_delete_flow_keeps_file_by_default(self, tmp_path):
+        ns_id = self._make_namespace()
+        flow_file = tmp_path / "keep.yaml"
+        flow_file.write_text("flow: {}")
+        created = client.post(
+            "/catalog/flows",
+            json={"name": "kf", "flow_path": str(flow_file), "namespace_id": ns_id},
+        ).json()
+        resp = client.delete(f"/catalog/flows/{created['id']}")
+        assert resp.status_code == 204
+        assert flow_file.exists()
+
+    def test_delete_flow_keeps_file_while_another_registration_points_at_it(self, tmp_path):
+        ns_id = self._make_namespace()
+        flow_file = tmp_path / "shared.yaml"
+        flow_file.write_text("flow: {}")
+        a = client.post(
+            "/catalog/flows",
+            json={"name": "a", "flow_path": str(flow_file), "namespace_id": ns_id},
+        ).json()
+        b = client.post(
+            "/catalog/flows",
+            json={"name": "b", "flow_path": str(flow_file), "namespace_id": ns_id},
+        ).json()
+        # Deleting one registration must not delete the file while another still points at it.
+        client.delete(f"/catalog/flows/{a['id']}", params={"delete_file": True})
+        assert flow_file.exists()
+        # Deleting the last registration removes the file.
+        client.delete(f"/catalog/flows/{b['id']}", params={"delete_file": True})
+        assert not flow_file.exists()
 
     def test_delete_flow_detaches_runs_preserves_uuid(self):
         """Deleting a flow nulls FlowRun.registration_id but preserves flow_uuid.
@@ -385,6 +484,39 @@ class TestFlowRegistration:
         warnings = [r for r in caplog.records if "references missing file" in r.getMessage()]
         assert len(warnings) == 1, f"expected 1 warning, got {len(warnings)}: {warnings}"
 
+    def test_repository_flow_lookup_by_uuid_and_name(self):
+        cat = client.post("/catalog/namespaces", json={"name": "LookupCat"}).json()
+        ns_a = client.post("/catalog/namespaces", json={"name": "A", "parent_id": cat["id"]}).json()["id"]
+        ns_b = client.post("/catalog/namespaces", json={"name": "B", "parent_id": cat["id"]}).json()["id"]
+        first = client.post(
+            "/catalog/flows", json={"name": "shared", "flow_path": "/tmp/shared_a.yaml", "namespace_id": ns_a}
+        ).json()
+        second = client.post(
+            "/catalog/flows", json={"name": "shared", "flow_path": "/tmp/shared_b.yaml", "namespace_id": ns_b}
+        ).json()
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            flow_uuid = repo.get_flow(second["id"]).flow_uuid
+            assert repo.get_flow_by_uuid(flow_uuid).id == second["id"]
+            assert repo.get_flow_by_uuid("00000000-0000-0000-0000-000000000000") is None
+            assert [r.id for r in repo.list_flows_by_name("shared")] == [first["id"], second["id"]]
+            assert [r.id for r in repo.list_flows_by_name("shared", namespace_id=ns_b)] == [second["id"]]
+            assert repo.list_flows_by_name("absent") == []
+
+    def test_ambiguous_flow_error_lists_candidates(self):
+        from flowfile_core.catalog import AmbiguousFlowError, CatalogError
+
+        candidates = [
+            {"id": 1, "name": "shared", "namespace_id": 3, "namespace_name": "Demo.a"},
+            {"id": 2, "name": "shared", "namespace_id": 4, "namespace_name": None},
+        ]
+        err = AmbiguousFlowError("shared", candidates)
+        assert isinstance(err, CatalogError)
+        assert err.name == "shared"
+        assert err.candidates == candidates
+        assert str(err) == "Flow name 'shared' is ambiguous; candidates: Demo.a.shared (id=1), <root>.shared (id=2)"
+
 
 class TestCatalogTableMaterialization:
     def test_register_table_uses_worker_metadata(self, monkeypatch):
@@ -440,9 +572,7 @@ class TestCatalogTableMaterialization:
             assert table_out.schema_columns[0].dtype == "Int64"
 
 
-# ---------------------------------------------------------------------------
 # Favorites tests
-# ---------------------------------------------------------------------------
 
 
 class TestFavorites:
@@ -479,13 +609,10 @@ class TestFavorites:
         fid = self._make_flow()
         client.post(f"/catalog/flows/{fid}/favorite")
         resp = client.post(f"/catalog/flows/{fid}/favorite")
-        # Should not error, returns existing
         assert resp.status_code == 201
 
 
-# ---------------------------------------------------------------------------
 # Follows tests
-# ---------------------------------------------------------------------------
 
 
 class TestFollows:
@@ -517,9 +644,7 @@ class TestFollows:
         assert resp.status_code == 204
 
 
-# ---------------------------------------------------------------------------
 # Runs tests
-# ---------------------------------------------------------------------------
 
 
 class TestRuns:
@@ -568,40 +693,131 @@ class TestRuns:
                 db.add(run)
             db.commit()
 
-        # Page 1: limit=2, offset=0
         resp = client.get("/catalog/runs", params={"limit": 2, "offset": 0})
         assert resp.status_code == 200
         data = resp.json()
         assert len(data["items"]) == 2
         assert data["total"] == 5
 
-        # Page 2: limit=2, offset=2
         resp = client.get("/catalog/runs", params={"limit": 2, "offset": 2})
         data = resp.json()
         assert len(data["items"]) == 2
         assert data["total"] == 5
 
-        # Page 3: limit=2, offset=4
         resp = client.get("/catalog/runs", params={"limit": 2, "offset": 4})
         data = resp.json()
         assert len(data["items"]) == 1
         assert data["total"] == 5
 
-        # Filter by registration_id
         resp = client.get("/catalog/runs", params={"registration_id": flow["id"]})
         data = resp.json()
         assert data["total"] == 5
 
-        # Filter by non-existent registration_id
         resp = client.get("/catalog/runs", params={"registration_id": 99999})
         data = resp.json()
         assert data["total"] == 0
         assert len(data["items"]) == 0
 
+    # Run logs
 
-# ---------------------------------------------------------------------------
+    @staticmethod
+    def _make_run(run_type: str) -> int:
+        """Insert a FlowRun of the given type against a fresh registration."""
+        cat = client.post("/catalog/namespaces", json={"name": f"LogCat_{run_type}"}).json()
+        schema = client.post(
+            "/catalog/namespaces", json={"name": f"LogSch_{run_type}", "parent_id": cat["id"]}
+        ).json()
+        flow = client.post(
+            "/catalog/flows",
+            json={
+                "name": f"log_flow_{run_type}",
+                "flow_path": f"/tmp/log_flow_{run_type}.yaml",
+                "namespace_id": schema["id"],
+            },
+        ).json()
+        with get_db_context() as db:
+            reg_uuid = db.query(FlowRegistration.flow_uuid).filter_by(id=flow["id"]).scalar()
+            run = FlowRun(
+                registration_id=flow["id"],
+                flow_uuid=reg_uuid,
+                flow_name=f"log_flow_{run_type}",
+                flow_path=f"/tmp/log_flow_{run_type}.yaml",
+                user_id=1,
+                started_at=datetime.now(timezone.utc),
+                number_of_nodes=1,
+                run_type=run_type,
+            )
+            db.add(run)
+            db.commit()
+            return run.id
+
+    def test_run_log_endpoint_serves_on_demand_runs(self, run_log_file):
+        """A schedule's 'run now' advertises has_log — the endpoint must serve it."""
+        run_id = self._make_run("on_demand")
+        run_log_file(run_id, "on-demand run output")
+
+        resp = client.get(f"/catalog/runs/{run_id}/log")
+
+        assert resp.status_code == 200
+        assert resp.json()["log"] == "on-demand run output"
+
+    @pytest.mark.parametrize(
+        "run_type", ["scheduled", "manual", "on_demand", "in_designer_run"]
+    )
+    def test_has_log_agrees_with_log_endpoint(self, run_log_file, run_type):
+        """has_log must be true exactly when the log endpoint returns 200."""
+        run_id = self._make_run(run_type)
+        run_log_file(run_id, "output")
+
+        has_log = client.get(f"/catalog/runs/{run_id}").json()["has_log"]
+        served = client.get(f"/catalog/runs/{run_id}/log").status_code == 200
+
+        assert has_log == served
+
+    def test_run_log_404_when_file_absent(self):
+        run_id = self._make_run("scheduled")
+
+        assert client.get(f"/catalog/runs/{run_id}").json()["has_log"] is False
+        assert client.get(f"/catalog/runs/{run_id}/log").status_code == 404
+
+
+def test_open_run_snapshot_does_not_reuse_registration(tmp_path):
+    """A run snapshot serializes source_registration_id; opening it must NOT let that id be
+    matched by the registration-scoped reuse — the snapshot opens as a fresh, unlinked tab."""
+    from datetime import datetime, timezone
+
+    # Build a real flow and serialize it as the run snapshot. save_flow now scrubs an id that
+    # resolves to no registration, so the foreign id is injected into the snapshot text instead.
+    flow_path = tmp_path / "snap_src.yaml"
+    flow_id = flow_file_handler.add_flow(name="snap_src", flow_path=str(flow_path), user_id=1)
+    flow = flow_file_handler.get_flow(flow_id)
+    flow.save_flow(str(flow_path))
+    snapshot_text = flow_path.read_text().replace("source_registration_id: null", "source_registration_id: 4242")
+    flow_file_handler.delete_flow(flow_id)
+    assert "4242" in snapshot_text  # sanity: the id is baked into the snapshot
+
+    with get_db_context() as db:
+        run = FlowRun(
+            registration_id=None,
+            flow_name="snap_src",
+            flow_path=str(flow_path),
+            user_id=1,
+            started_at=datetime.now(timezone.utc),
+            number_of_nodes=0,
+            run_type="in_designer_run",
+            flow_snapshot=snapshot_text,
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+    resp = client.post(f"/catalog/runs/{run_id}/open")
+    assert resp.status_code == 200, resp.text
+    opened = flow_file_handler.get_flow(resp.json()["flow_id"])
+    assert opened.flow_settings.source_registration_id is None  # nulled, cannot hijack reuse
+
+
 # Stats tests
-# ---------------------------------------------------------------------------
 
 
 class TestStats:
@@ -620,13 +836,79 @@ class TestStats:
         cat = client.post("/catalog/namespaces", json={"name": "StatCat"}).json()
         client.post("/catalog/namespaces", json={"name": "StatSch", "parent_id": cat["id"]})
         resp = client.get("/catalog/stats")
-        # Only top-level catalogs should be counted
         assert resp.json()["total_namespaces"] == 1
 
 
-# ---------------------------------------------------------------------------
+# Overview tests
+
+
+class TestOverview:
+    """``GET /catalog/overview`` mirrors the per-resource endpoints the catalog screen used to fan out to."""
+
+    def _seed(self) -> dict:
+        cat = client.post("/catalog/namespaces", json={"name": "OvCat"}).json()
+        schema = client.post("/catalog/namespaces", json={"name": "OvSchema", "parent_id": cat["id"]}).json()
+        flow = client.post(
+            "/catalog/flows",
+            json={"name": "ov_flow", "flow_path": "/tmp/ov_flow.yaml", "namespace_id": schema["id"]},
+        ).json()
+        client.post(f"/catalog/flows/{flow['id']}/favorite")
+        schedule = client.post(
+            "/catalog/schedules",
+            json={"registration_id": flow["id"], "schedule_type": "interval", "interval_seconds": 3600},
+        ).json()
+        with get_db_context() as db:
+            reg_uuid = db.query(FlowRegistration.flow_uuid).filter_by(id=flow["id"]).scalar()
+            for i in range(3):
+                db.add(
+                    FlowRun(
+                        registration_id=flow["id"],
+                        flow_uuid=reg_uuid,
+                        flow_name="ov_flow",
+                        flow_path="/tmp/ov_flow.yaml",
+                        user_id=1,
+                        started_at=datetime.now(timezone.utc),
+                        ended_at=None if i == 0 else datetime.now(timezone.utc),
+                        success=None if i == 0 else True,
+                        number_of_nodes=1,
+                        run_type="manual",
+                    )
+                )
+            db.commit()
+        return {"flow": flow, "schedule": schedule}
+
+    def test_overview_matches_individual_endpoints(self):
+        seeded = self._seed()
+        resp = client.get("/catalog/overview")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["stats"] == client.get("/catalog/stats").json()
+        assert data["tree"] == client.get("/catalog/namespaces/tree").json()
+        assert data["flows"] == client.get("/catalog/flows").json()
+        assert data["tables"] == client.get("/catalog/tables").json()
+        assert data["favorites"] == client.get("/catalog/favorites").json()
+        assert data["schedules"] == client.get("/catalog/schedules").json()
+        assert data["active_runs"] == client.get("/catalog/active-runs").json()
+        assert data["runs"] == client.get("/catalog/runs", params={"limit": 25, "offset": 0}).json()
+        assert data["scheduler"] == client.get("/catalog/scheduler/status").json()
+        assert data["default_namespace_id"] == client.get("/catalog/default-namespace-id").json()
+
+        assert [f["id"] for f in data["favorites"]] == [seeded["flow"]["id"]]
+        assert [s["id"] for s in data["schedules"]] == [seeded["schedule"]["id"]]
+        assert len(data["active_runs"]) == 1
+        assert data["runs"]["total"] == 3
+
+    def test_overview_runs_limit(self):
+        self._seed()
+        data = client.get("/catalog/overview", params={"runs_limit": 2}).json()
+        assert len(data["runs"]["items"]) == 2
+        assert data["runs"]["total"] == 3
+
+        assert client.get("/catalog/overview", params={"runs_limit": 0}).status_code == 422
+
+
 # Default namespace tests
-# ---------------------------------------------------------------------------
 
 
 class TestDefaultNamespace:
@@ -638,7 +920,6 @@ class TestDefaultNamespace:
         ns_id = resp.json()
         assert isinstance(ns_id, int)
 
-        # Verify it points to default under General
         with get_db_context() as db:
             ns = db.get(CatalogNamespace, ns_id)
             assert ns is not None
@@ -700,9 +981,7 @@ class TestDefaultNamespace:
             assert ns.owner_id == general.owner_id
 
 
-# ---------------------------------------------------------------------------
 # Auto-registration tests
-# ---------------------------------------------------------------------------
 
 
 class TestAutoRegisterFlow:
@@ -817,15 +1096,28 @@ class TestAutoRegisterFlow:
             reg = db.query(FlowRegistration).filter_by(name="no_path").first()
             assert reg is None
 
-    def test_skips_when_no_default_namespace(self):
-        """Should silently do nothing when the default namespace doesn't exist."""
+    def test_self_heals_when_root_namespace_missing(self):
+        """A wiped catalog root is re-seeded rather than silently skipping.
+
+        The old behaviour returned None + an INFO log, leaving the flow on disk with
+        no registration while callers assumed one existed — the source of
+        collection-order flakiness that ``restore_seeded_catalog_namespaces`` guards.
+        """
         user_id = self._get_local_user_id()
+        with get_db_context() as db:
+            assert db.query(CatalogNamespace).filter_by(name="General", parent_id=None).first() is None
 
         auto_register_flow("/tmp/no_ns.yaml", "orphan", user_id)
 
         with get_db_context() as db:
+            general = db.query(CatalogNamespace).filter_by(name="General", parent_id=None).first()
+            assert general is not None
+            assert general.is_public is True
             reg = db.query(FlowRegistration).filter_by(flow_path="/tmp/no_ns.yaml").first()
-            assert reg is None
+            assert reg is not None
+            ns = db.get(CatalogNamespace, reg.namespace_id)
+            assert ns is not None
+            assert ns.name == "Local Flows"
 
     def test_uses_filename_stem_when_name_is_empty(self):
         """When name is falsy, should fall back to the filename stem."""
@@ -840,16 +1132,226 @@ class TestAutoRegisterFlow:
             assert reg.name == "my_pipeline"
 
 
-# ---------------------------------------------------------------------------
+class TestKafkaSyncRootHeal:
+    """The kafka sync path must heal a missing root through the canonical helper.
+
+    ``create_namespace`` would mint a *private* General (invisible to other users in
+    docker mode) and snapshot env-default catalog storage onto it — a different root
+    than init_db seeds and ``ensure_root_catalog`` heals.
+    """
+
+    def test_recreated_root_is_public_with_no_storage(self):
+        from flowfile_core.routes.kafka import _ensure_sync_namespace
+
+        init_db()
+        backup_name = "General_backup_kafka_heal"
+        with get_db_context() as db:
+            owner_id = db.query(User).filter_by(username="local_user").first().id
+            db.query(CatalogNamespace).filter_by(name="General", parent_id=None).first().name = backup_name
+            db.commit()
+
+        healed_root_id = None
+        sync_id = None
+        try:
+            with get_db_context() as db:
+                service = CatalogService(SQLAlchemyCatalogRepository(db))
+                sync_id = _ensure_sync_namespace(service, owner_id)
+                sync_ns = db.get(CatalogNamespace, sync_id)
+                assert sync_ns is not None
+                assert sync_ns.is_public is True
+                root = db.get(CatalogNamespace, sync_ns.parent_id)
+                healed_root_id = root.id
+                assert root.name == "General"
+                assert root.is_public is True, "a healed root must be public, like the init_db seed"
+                assert root.storage_uri is None, "a healed root must not snapshot env-default storage"
+        finally:
+            with get_db_context() as db:
+                for ns_id in (sync_id, healed_root_id):
+                    ns = db.get(CatalogNamespace, ns_id) if ns_id is not None else None
+                    if ns is not None:
+                        db.delete(ns)
+                backup = db.query(CatalogNamespace).filter_by(name=backup_name, parent_id=None).first()
+                if backup is not None:
+                    backup.name = "General"
+                db.commit()
+
+
+class TestScratchNamespaceCleanup:
+    """POST /catalog/namespaces/{id}/cleanup_flows — the bulk drop for scratch schemas."""
+
+    @staticmethod
+    def _namespace_id(name: str) -> int:
+        with get_db_context() as db:
+            general = db.query(CatalogNamespace).filter_by(name="General", parent_id=None).first()
+            ns = db.query(CatalogNamespace).filter_by(name=name, parent_id=general.id).first()
+            assert ns is not None, f"seeded namespace '{name}' missing"
+            return ns.id
+
+    def test_cleanup_drops_rows_and_scratch_files_but_keeps_artifact_flows(self):
+        from flowfile_core.database.models import GlobalArtifact, User
+
+        init_db()
+        ns_id = self._namespace_id("Unnamed Flows")
+        with get_db_context() as db:
+            user_id = db.query(User).filter_by(username="local_user").first().id
+
+        scratch_dir = storage.unnamed_flows_directory
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        path_a = str(scratch_dir / "cleanup_test_a.yaml")
+        path_b = str(scratch_dir / "cleanup_test_b.yaml")
+        for p in (path_a, path_b):
+            Path(p).write_text("flowfile_name: cleanup_test\n")
+            auto_register_flow(p, Path(p).stem, user_id)
+
+        artifact_flow_path = str(scratch_dir / "cleanup_test_kept.yaml")
+        with get_db_context() as db:
+            kept_flow = FlowRegistration(
+                name="cleanup_test_kept", flow_path=artifact_flow_path, namespace_id=ns_id, owner_id=user_id
+            )
+            db.add(kept_flow)
+            db.commit()
+            db.refresh(kept_flow)
+            kept_id = kept_flow.id
+            db.add(
+                GlobalArtifact(
+                    name="cleanup-test-artifact",
+                    source_registration_id=kept_id,
+                    owner_id=user_id,
+                    status="active",
+                    serialization_format="joblib",
+                )
+            )
+            db.commit()
+
+        try:
+            resp = client.post(f"/catalog/namespaces/{ns_id}/cleanup_flows")
+            assert resp.status_code == 200, resp.text
+            result = resp.json()
+            assert result["deleted"] >= 2
+            assert result["kept"] >= 1
+
+            with get_db_context() as db:
+                for p in (path_a, path_b):
+                    assert (
+                        db.query(FlowRegistration).filter_by(flow_path=p).first() is None
+                    ), "scratch registration must be dropped"
+                assert db.get(FlowRegistration, kept_id) is not None, "a flow with live artifacts must be kept"
+            assert not os.path.exists(path_a) and not os.path.exists(path_b), "scratch files must be removed"
+        finally:
+            for p in (path_a, path_b):
+                Path(p).unlink(missing_ok=True)
+            with get_db_context() as db:
+                db.query(GlobalArtifact).filter_by(source_registration_id=kept_id).delete()
+                db.query(FlowRegistration).filter(
+                    FlowRegistration.flow_path.in_([path_a, path_b, artifact_flow_path])
+                ).delete(synchronize_session=False)
+                db.commit()
+
+    def test_cleanup_tolerates_rows_a_concurrent_sweep_already_deleted(self, monkeypatch):
+        """A double-fired cleanup must skip rows the other sweep removed, not 500.
+
+        The loop works from an (id, path) snapshot; a row deleted between the
+        snapshot and its turn surfaces as FlowNotFoundError (or ObjectDeletedError
+        via the session identity map) and is skipped.
+        """
+        from flowfile_core.catalog.exceptions import FlowNotFoundError
+        from flowfile_core.catalog.service import CatalogService as ServiceClass
+        from flowfile_core.database.models import User
+
+        init_db()
+        ns_id = self._namespace_id("Unnamed Flows")
+        with get_db_context() as db:
+            user_id = db.query(User).filter_by(username="local_user").first().id
+
+        scratch_dir = storage.unnamed_flows_directory
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        path_gone = str(scratch_dir / "cleanup_race_gone.yaml")
+        path_live = str(scratch_dir / "cleanup_race_live.yaml")
+        for p in (path_gone, path_live):
+            Path(p).write_text("flowfile_name: cleanup_race\n")
+            auto_register_flow(p, Path(p).stem, user_id)
+        with get_db_context() as db:
+            gone_id = db.query(FlowRegistration).filter_by(flow_path=path_gone).one().id
+
+        real_delete = ServiceClass.delete_flow
+
+        def racing_delete(self, registration_id, delete_file=False):
+            if registration_id == gone_id:
+                raise FlowNotFoundError(registration_id=registration_id)
+            return real_delete(self, registration_id, delete_file)
+
+        monkeypatch.setattr(ServiceClass, "delete_flow", racing_delete)
+        try:
+            resp = client.post(f"/catalog/namespaces/{ns_id}/cleanup_flows")
+            assert resp.status_code == 200, resp.text
+            with get_db_context() as db:
+                assert (
+                    db.query(FlowRegistration).filter_by(flow_path=path_live).first() is None
+                ), "rows after the raced one must still be swept"
+        finally:
+            for p in (path_gone, path_live):
+                Path(p).unlink(missing_ok=True)
+            with get_db_context() as db:
+                db.query(FlowRegistration).filter(
+                    FlowRegistration.flow_path.in_([path_gone, path_live])
+                ).delete(synchronize_session=False)
+                db.commit()
+
+    def test_cleanup_rejected_outside_scratch_schemas(self):
+        init_db()
+        local_flows_id = self._namespace_id("Local Flows")
+        resp = client.post(f"/catalog/namespaces/{local_flows_id}/cleanup_flows")
+        assert resp.status_code == 403, resp.text
+        detail = resp.json()["detail"]
+        assert "Unnamed Flows" in detail and "Python Editor" in detail, (
+            f"the 403 must name the sweepable schemas, got: {detail!r}"
+        )
+
+        resp = client.post("/catalog/namespaces/999999/cleanup_flows")
+        assert resp.status_code == 404, resp.text
+
+    def test_lazily_created_scratch_schema_is_public(self):
+        """'Python Editor' is made on demand, not seeded. A private one is invisible
+        to everyone but General's owner in multi-user mode, so neither the tree nor
+        the sweep would ever reach it."""
+        init_db()
+        with get_db_context() as db:
+            general = db.query(CatalogNamespace).filter_by(name="General", parent_id=None).first()
+            existing = db.query(CatalogNamespace).filter_by(name="Python Editor", parent_id=general.id).first()
+            if existing is not None:
+                db.query(FlowRegistration).filter_by(namespace_id=existing.id).delete(synchronize_session=False)
+                db.delete(existing)
+                db.commit()
+
+        with get_db_context() as db:
+            service = CatalogService(SQLAlchemyCatalogRepository(db))
+            namespace = service.ensure_python_editor_flows_namespace()
+            assert namespace is not None
+            assert namespace.is_public is True, "app-managed schemas must be public containers"
+
+    def test_init_db_repairs_a_private_app_managed_schema(self):
+        """Installs created before the fix carry a private 'Python Editor' row."""
+        init_db()
+        with get_db_context() as db:
+            service = CatalogService(SQLAlchemyCatalogRepository(db))
+            namespace_id = service.ensure_python_editor_flows_namespace().id
+            db.query(CatalogNamespace).filter_by(id=namespace_id).update({CatalogNamespace.is_public: False})
+            db.commit()
+
+        init_db()
+
+        with get_db_context() as db:
+            assert db.get(CatalogNamespace, namespace_id).is_public is True
+
+
 # Read link / lineage repository tests
-# ---------------------------------------------------------------------------
 
 
 class TestReadLinks:
-    """Tests for CatalogTableReadLink upsert and query methods."""
+    """Tests for CatalogTableReadLink replace and query methods."""
 
     @staticmethod
-    def _setup_flow_and_table():
+    def _setup_flow_and_table(flow_path: str = "/tmp/reader.yaml"):
         """Create a namespace, flow registration, and catalog table for testing."""
         with get_db_context() as db:
             ns = CatalogNamespace(name="LinkCat", level=0, owner_id=1)
@@ -864,7 +1366,7 @@ class TestReadLinks:
 
             flow = FlowRegistration(
                 name="reader_flow",
-                flow_path="/tmp/reader.yaml",
+                flow_path=flow_path,
                 namespace_id=schema.id,
                 owner_id=1,
             )
@@ -884,32 +1386,43 @@ class TestReadLinks:
 
             return flow.id, table.id
 
-    def test_upsert_read_link_creates_record(self):
+    def test_replace_read_links_creates_record(self):
         flow_id, table_id = self._setup_flow_and_table()
         with get_db_context() as db:
             repo = SQLAlchemyCatalogRepository(db)
-            repo.upsert_read_link(table_id, flow_id)
+            repo.replace_read_links(flow_id, [table_id])
 
         with get_db_context() as db:
             link = db.query(CatalogTableReadLink).filter_by(table_id=table_id, registration_id=flow_id).first()
             assert link is not None
 
-    def test_upsert_read_link_is_idempotent(self):
+    def test_replace_read_links_is_idempotent(self):
         flow_id, table_id = self._setup_flow_and_table()
         with get_db_context() as db:
             repo = SQLAlchemyCatalogRepository(db)
-            repo.upsert_read_link(table_id, flow_id)
-            repo.upsert_read_link(table_id, flow_id)
+            repo.replace_read_links(flow_id, [table_id])
+            repo.replace_read_links(flow_id, [table_id])
 
         with get_db_context() as db:
             links = db.query(CatalogTableReadLink).filter_by(table_id=table_id, registration_id=flow_id).all()
             assert len(links) == 1
 
+    def test_replace_read_links_prunes_dropped_tables(self):
+        flow_id, table_id = self._setup_flow_and_table()
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            repo.replace_read_links(flow_id, [table_id])
+            repo.replace_read_links(flow_id, [])
+
+        with get_db_context() as db:
+            links = db.query(CatalogTableReadLink).filter_by(registration_id=flow_id).all()
+            assert links == []
+
     def test_list_readers_for_table(self):
         flow_id, table_id = self._setup_flow_and_table()
         with get_db_context() as db:
             repo = SQLAlchemyCatalogRepository(db)
-            repo.upsert_read_link(table_id, flow_id)
+            repo.replace_read_links(flow_id, [table_id])
             readers = repo.list_readers_for_table(table_id)
             assert len(readers) == 1
             assert readers[0].id == flow_id
@@ -925,7 +1438,7 @@ class TestReadLinks:
         flow_id, table_id = self._setup_flow_and_table()
         with get_db_context() as db:
             repo = SQLAlchemyCatalogRepository(db)
-            repo.upsert_read_link(table_id, flow_id)
+            repo.replace_read_links(flow_id, [table_id])
             tables = repo.list_read_tables_for_flow(flow_id)
             assert len(tables) == 1
             assert tables[0].id == table_id
@@ -954,16 +1467,60 @@ class TestReadLinks:
 
         with get_db_context() as db:
             repo = SQLAlchemyCatalogRepository(db)
-            repo.upsert_read_link(table_id, flow_id_1)
-            repo.upsert_read_link(table_id, flow_id_2)
+            repo.replace_read_links(flow_id_1, [table_id])
+            repo.replace_read_links(flow_id_2, [table_id])
             readers = repo.list_readers_for_table(table_id)
             reader_ids = {r.id for r in readers}
             assert reader_ids == {flow_id_1, flow_id_2}
 
+    def test_delete_flow_removes_read_links(self):
+        """A deleted flow leaves no read links behind for a reused id to inherit."""
+        flow_id, table_id = self._setup_flow_and_table()
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            repo.replace_read_links(flow_id, [table_id])
+            repo.delete_flow(flow_id)
 
-# ---------------------------------------------------------------------------
+        with get_db_context() as db:
+            assert db.query(CatalogTableReadLink).filter_by(registration_id=flow_id).all() == []
+
+    def test_removed_reader_drops_out_of_tables_read(self, tmp_path):
+        """End-to-end: the catalog stops reporting a table read once its reader node is gone."""
+        from flowfile_core.schemas import input_schema
+
+        flow_path = tmp_path / "reader_flow.yaml"
+        reg_id, table_id = self._setup_flow_and_table(flow_path=str(flow_path))
+        internal_id = flow_file_handler.add_flow(name="reader_flow", flow_path=str(flow_path), user_id=1)
+        graph = flow_file_handler.get_flow(internal_id)
+        graph.flow_settings.source_registration_id = reg_id
+        graph.add_node_promise(
+            input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="catalog_reader")
+        )
+        graph.add_catalog_reader(
+            input_schema.NodeCatalogReader(flow_id=graph.flow_id, node_id=1, catalog_table_id=table_id)
+        )
+        graph.save_flow(str(flow_path))
+
+        try:
+            with get_db_context() as db:
+                svc = CatalogService(SQLAlchemyCatalogRepository(db))
+                assert [t.id for t in svc.get_flow(reg_id, user_id=1).tables_read] == [table_id]
+                listed = [f for f in svc.list_flows(user_id=1) if f.id == reg_id]
+                assert [t.id for t in listed[0].tables_read] == [table_id]
+
+            graph.delete_node(1)
+            graph.save_flow(str(flow_path))
+
+            with get_db_context() as db:
+                svc = CatalogService(SQLAlchemyCatalogRepository(db))
+                assert svc.get_flow(reg_id, user_id=1).tables_read == []
+                listed = [f for f in svc.list_flows(user_id=1) if f.id == reg_id]
+                assert listed[0].tables_read == []
+        finally:
+            flow_file_handler.delete_flow(internal_id)
+
+
 # Table lineage tests (source_registration_id on CatalogTable)
-# ---------------------------------------------------------------------------
 
 
 class TestTableLineage:
@@ -1047,7 +1604,6 @@ class TestTableLineage:
     def test_bulk_get_tables_for_flows(self):
         schema_id, flow_id = self._make_namespace_and_flow()
         with get_db_context() as db:
-            # Create a second flow
             flow2 = FlowRegistration(
                 name="producer2",
                 flow_path="/tmp/producer2.yaml",
@@ -1092,9 +1648,7 @@ class TestTableLineage:
             assert result == {}
 
 
-# ---------------------------------------------------------------------------
 # Service-level lineage enrichment tests
-# ---------------------------------------------------------------------------
 
 
 class TestServiceLineageEnrichment:
@@ -1146,7 +1700,7 @@ class TestServiceLineageEnrichment:
             db.refresh(table)
 
             repo = SQLAlchemyCatalogRepository(db)
-            repo.upsert_read_link(table.id, reader.id)
+            repo.replace_read_links(reader.id, [table.id])
 
             return schema.id, producer.id, reader.id, table.id
 
@@ -1189,9 +1743,7 @@ class TestServiceLineageEnrichment:
         assert table_id in table_ids
 
 
-# ---------------------------------------------------------------------------
 # Push-driven table trigger tests
-# ---------------------------------------------------------------------------
 
 
 class TestPushTableTrigger:
@@ -1303,7 +1855,6 @@ class TestPushTableTrigger:
             svc.overwrite_table_data(table_id, parquet_path)
 
             runs = db.query(FlowRun).filter_by(registration_id=flow_id, run_type="scheduled").all()
-            # Only the pre-existing active run, no new one
             assert len(runs) == 1
 
     def test_push_trigger_updates_schedule_timestamps(self, monkeypatch):
@@ -1344,9 +1895,200 @@ class TestPushTableTrigger:
             assert len(runs) == 0
 
 
-# ---------------------------------------------------------------------------
+# Trigger arming, metadata-edit suppression, scheduler-run visibility
+
+
+class TestTriggerArmingAndRunVisibility:
+    """A trigger schedule must be armed with the tables' current state at create
+    (and re-arm on re-enable) so the scheduler's first tick sees no change; metadata
+    edits must not bump ``updated_at``; scheduler-shaped runs must be visible to
+    core's registration-scoped run queries."""
+
+    OLD = datetime(2020, 1, 1, 0, 0, 0)
+
+    @staticmethod
+    def _setup(n_tables: int = 1, table_updated_at=None):
+        """Create namespace + flow + n tables. Returns (flow_id, [table_ids])."""
+        with get_db_context() as db:
+            cat = CatalogNamespace(name="ArmCat", level=0, owner_id=1)
+            db.add(cat)
+            db.commit()
+            db.refresh(cat)
+
+            schema = CatalogNamespace(name="ArmSch", level=1, parent_id=cat.id, owner_id=1)
+            db.add(schema)
+            db.commit()
+            db.refresh(schema)
+
+            flow = FlowRegistration(
+                name="armed_flow",
+                flow_path="/tmp/armed.yaml",
+                namespace_id=schema.id,
+                owner_id=1,
+            )
+            db.add(flow)
+            db.commit()
+            db.refresh(flow)
+
+            table_ids = []
+            for idx in range(n_tables):
+                kwargs = {}
+                if table_updated_at is not None:
+                    kwargs["updated_at"] = (
+                        table_updated_at[idx] if isinstance(table_updated_at, list) else table_updated_at
+                    )
+                table = CatalogTable(
+                    name=f"armed_table_{idx}",
+                    namespace_id=schema.id,
+                    owner_id=1,
+                    file_path=f"/tmp/armed_{idx}.parquet",
+                    **kwargs,
+                )
+                db.add(table)
+                db.commit()
+                db.refresh(table)
+                table_ids.append(table.id)
+
+            return flow.id, table_ids
+
+    def test_create_table_trigger_arms_watermark(self):
+        flow_id, table_ids = self._setup(1)
+        with get_db_context() as db:
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            out = svc.create_schedule(
+                registration_id=flow_id,
+                owner_id=1,
+                schedule_type="table_trigger",
+                trigger_table_id=table_ids[0],
+            )
+            table = db.get(CatalogTable, table_ids[0])
+            assert out.last_trigger_table_updated_at == table.updated_at
+
+    def test_create_table_set_trigger_arms_watermark_to_max(self):
+        stamps = [datetime(2020, 1, 1, 0, 0, 0), datetime(2021, 6, 5, 4, 3, 2)]
+        flow_id, table_ids = self._setup(2, table_updated_at=stamps)
+        with get_db_context() as db:
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            out = svc.create_schedule(
+                registration_id=flow_id,
+                owner_id=1,
+                schedule_type="table_set_trigger",
+                trigger_table_ids=table_ids,
+            )
+            assert out.last_trigger_table_updated_at == max(stamps)
+
+    def test_re_enabling_disabled_trigger_re_arms(self):
+        flow_id, table_ids = self._setup(1, table_updated_at=self.OLD)
+        with get_db_context() as db:
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            created = svc.create_schedule(
+                registration_id=flow_id,
+                owner_id=1,
+                schedule_type="table_trigger",
+                trigger_table_id=table_ids[0],
+            )
+            svc.update_schedule(created.id, enabled=False)
+
+            # A write lands while the schedule is disabled.
+            bumped = datetime(2026, 3, 1, 12, 0, 0)
+            db.get(CatalogTable, table_ids[0]).updated_at = bumped
+            db.commit()
+
+            out = svc.update_schedule(created.id, enabled=True)
+            assert out.last_trigger_table_updated_at >= bumped
+
+    def test_metadata_edit_does_not_bump_updated_at(self):
+        _flow_id, table_ids = self._setup(1, table_updated_at=self.OLD)
+        with get_db_context() as db:
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            svc.update_table(table_ids[0], name="renamed_table", description="new description")
+            db.expire_all()
+            assert db.get(CatalogTable, table_ids[0]).updated_at == self.OLD
+
+    def test_deleting_prediction_table_does_not_bump_referrer(self):
+        _flow_id, table_ids = self._setup(2, table_updated_at=self.OLD)
+        base_id, prediction_id = table_ids
+        from sqlalchemy import text
+
+        with get_db_context() as db:
+            db.get(CatalogTable, base_id).prediction_table_id = prediction_id
+            db.commit()
+            # Linking is itself an ORM update (onupdate fires) — reset the baseline.
+            db.execute(
+                text("UPDATE catalog_tables SET updated_at = :ts WHERE id = :id"),
+                {"ts": self.OLD, "id": base_id},
+            )
+            db.commit()
+
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            svc.delete_table(prediction_id)
+
+            db.expire_all()
+            base = db.get(CatalogTable, base_id)
+            assert base.prediction_table_id is None
+            assert base.updated_at == self.OLD
+
+    def test_run_is_visible_only_with_flow_uuid(self):
+        """Registration-scoped run queries resolve through ``flow_uuid``, so a run row
+        without one is invisible to core — which is why the scheduler must stamp it."""
+        flow_id, _table_ids = self._setup(1)
+        with get_db_context() as db:
+            run = FlowRun(
+                registration_id=flow_id,
+                flow_uuid=None,
+                flow_name="armed_flow",
+                flow_path="/tmp/armed.yaml",
+                user_id=1,
+                started_at=datetime.now(timezone.utc),
+                number_of_nodes=0,
+                run_type="scheduled",
+            )
+            db.add(run)
+            db.commit()
+
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            assert svc.list_runs(registration_id=flow_id).total == 0
+            assert repo.has_active_run(flow_id) is False
+
+            run.flow_uuid = db.query(FlowRegistration.flow_uuid).filter_by(id=flow_id).scalar()
+            db.commit()
+
+            assert svc.list_runs(registration_id=flow_id).total == 1
+            assert repo.has_active_run(flow_id) is True
+
+    def test_list_active_runs_exposes_schedule_id(self):
+        flow_id, table_ids = self._setup(1)
+        with get_db_context() as db:
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            schedule = svc.create_schedule(
+                registration_id=flow_id,
+                owner_id=1,
+                schedule_type="table_trigger",
+                trigger_table_id=table_ids[0],
+            )
+            reg_uuid = db.query(FlowRegistration.flow_uuid).filter_by(id=flow_id).scalar()
+            db.add(
+                FlowRun(
+                    registration_id=flow_id,
+                    flow_uuid=reg_uuid,
+                    flow_name="armed_flow",
+                    flow_path="/tmp/armed.yaml",
+                    user_id=1,
+                    started_at=datetime.now(timezone.utc),
+                    number_of_nodes=0,
+                    run_type="scheduled",
+                    schedule_id=schedule.id,
+                )
+            )
+            db.commit()
+
+            active = svc.list_active_runs()
+            assert len(active) == 1
+            assert active[0].schedule_id == schedule.id
+
+
 # Cross-namespace table resolution
-# ---------------------------------------------------------------------------
 
 
 class TestCrossNamespaceResolution:
@@ -1406,6 +2148,48 @@ class TestCrossNamespaceResolution:
             b = svc.resolve_table("ns_b.foo")
             assert a.namespace_id == schema_a_id
             assert b.namespace_id == schema_b_id
+
+    def test_resolve_fully_qualified_catalog_schema_table(self):
+        _, schema_a_id, schema_b_id, _ = self._seed_two_foo_tables()
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            assert svc.resolve_table("cat.ns_a.foo").namespace_id == schema_a_id
+            assert svc.resolve_table("cat.ns_b.foo").namespace_id == schema_b_id
+
+    def test_resolve_fully_qualified_unknown_namespace_raises(self):
+        from flowfile_core.catalog.exceptions import NamespaceNotFoundError
+
+        self._seed_two_foo_tables()
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            with pytest.raises(NamespaceNotFoundError):
+                svc.resolve_table("nope.ns_a.foo")
+            with pytest.raises(NamespaceNotFoundError):
+                svc.resolve_table("cat.nope.foo")
+
+    def test_resolve_fully_qualified_unknown_table_raises(self):
+        from flowfile_core.catalog.exceptions import TableNotFoundError
+
+        self._seed_two_foo_tables()
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            with pytest.raises(TableNotFoundError):
+                svc.resolve_table("cat.ns_a.nope")
+
+    def test_resolve_too_many_parts_raises(self):
+        from flowfile_core.catalog.exceptions import TableNotFoundError
+
+        self._seed_two_foo_tables()
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            with pytest.raises(TableNotFoundError):
+                svc.resolve_table("extra.cat.ns_a.foo")
+            with pytest.raises(TableNotFoundError):
+                svc.resolve_table("cat..foo")
 
     def test_resolve_bare_with_default_namespace(self):
         _, schema_a_id, _, _ = self._seed_two_foo_tables()
@@ -1499,6 +2283,14 @@ class TestCrossNamespaceResolution:
     def test_resolve_endpoint_qualified(self):
         _, schema_a_id, _, _ = self._seed_two_foo_tables()
         response = client.get("/catalog/tables/resolve", params={"q": "ns_a.foo"})
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["table"]["namespace_id"] == schema_a_id
+        assert body["warnings"] == []
+
+    def test_resolve_endpoint_fully_qualified(self):
+        _, schema_a_id, _, _ = self._seed_two_foo_tables()
+        response = client.get("/catalog/tables/resolve", params={"q": "cat.ns_a.foo"})
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["table"]["namespace_id"] == schema_a_id
@@ -1626,6 +2418,310 @@ class TestCrossNamespaceResolution:
             # Bare alias for unique name points to the same id as its qualified alias.
             assert virtual_map["only_here"] == virtual_map["ns_a.only_here"]
 
+    def test_resolve_namespace_path(self):
+        cat_id, schema_a_id, _, _ = self._seed_two_foo_tables()
+        with get_db_context() as db:
+            from flowfile_core.catalog.services.namespaces import NamespaceService
+
+            ns = NamespaceService(SQLAlchemyCatalogRepository(db))
+            assert ns.resolve_namespace_path(schema_a_id) == "cat.ns_a"  # catalog.schema
+            assert ns.resolve_namespace_path(cat_id) == "cat"  # level-0 catalog
+            assert ns.resolve_namespace_path(None) is None
+
+    def test_resolve_namespace_path_walks_full_chain(self):
+        """resolve_namespace_path walks the whole parent chain, so a 3-level namespace
+        resolves to catalog.schema.sub — not just its two lowest segments. The tree is
+        built directly since create_namespace caps nesting at 2 levels."""
+        _cleanup_catalog()
+        with get_db_context() as db:
+            from flowfile_core.catalog.services.namespaces import NamespaceService
+
+            cat = CatalogNamespace(name="cat", level=0, owner_id=1)
+            db.add(cat)
+            db.commit()
+            db.refresh(cat)
+            schema = CatalogNamespace(name="schema", level=1, parent_id=cat.id, owner_id=1)
+            db.add(schema)
+            db.commit()
+            db.refresh(schema)
+            sub = CatalogNamespace(name="sub", level=2, parent_id=schema.id, owner_id=1)
+            db.add(sub)
+            db.commit()
+            db.refresh(sub)
+
+            ns = NamespaceService(SQLAlchemyCatalogRepository(db))
+            assert ns.resolve_namespace_path(sub.id) == "cat.schema.sub"
+            assert ns.resolve_namespace_path(schema.id) == "cat.schema"
+            assert ns.resolve_namespace_path(cat.id) == "cat"
+
+    def _seed_demo_market_delta(self, db) -> str:
+        """Demo(catalog) -> market(schema) -> fx_rates delta-shaped table. Returns its dir."""
+        import os
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmpdir, "_delta_log"))  # make it look like a Delta table
+        demo = CatalogNamespace(name="Demo", level=0, owner_id=1)
+        db.add(demo)
+        db.commit()
+        db.refresh(demo)
+        market = CatalogNamespace(name="market", level=1, parent_id=demo.id, owner_id=1)
+        db.add(market)
+        db.commit()
+        db.refresh(market)
+        db.add(
+            CatalogTable(
+                name="fx_rates",
+                namespace_id=market.id,
+                owner_id=1,
+                file_path=tmpdir,
+                storage_format="delta",
+            )
+        )
+        db.commit()
+        return tmpdir
+
+    def test_queryable_tables_include_three_part_key(self):
+        _cleanup_catalog()
+        with get_db_context() as db:
+            tmpdir = self._seed_demo_market_delta(db)
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            delta_map, _ = svc.resolve_all_queryable_tables()
+            dir_name = Path(tmpdir).name
+            # Fully-qualified 3-part, 2-part, and bare all point at the same table.
+            assert delta_map.get("Demo.market.fx_rates") == dir_name
+            assert delta_map.get("market.fx_rates") == dir_name
+            assert delta_map.get("fx_rates") == dir_name
+
+    def test_execute_sql_resolves_three_part_and_quoted_forms(self, monkeypatch):
+        """The 3-part catalog.schema.table forms a user naturally writes — bare, per-segment
+        quoted, single quoted identifier, and the mixed single/double quoting from the catalog
+        tree — all collapse to the registered flat key and reach the worker."""
+        import flowfile_core.catalog.service as svc_module
+
+        _cleanup_catalog()
+        with get_db_context() as db:
+            self._seed_demo_market_delta(db)
+
+            captured: dict = {}
+
+            def fake_trigger(query, tables, max_rows, virtual_refs=None):
+                captured["query"] = query
+                captured["tables"] = tables
+                return {
+                    "columns": [],
+                    "dtypes": [],
+                    "rows": [],
+                    "total_rows": 0,
+                    "truncated": False,
+                    "execution_time_ms": 0.0,
+                    "used_tables": [],
+                }
+
+            monkeypatch.setattr(svc_module, "trigger_sql_query", fake_trigger)
+
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            for form in (
+                "SELECT * FROM Demo.market.fx_rates",
+                'SELECT * FROM "Demo"."market"."fx_rates"',
+                'SELECT * FROM "Demo.market.fx_rates"',
+                "SELECT * FROM 'Demo'.'market'.\"fx_rates\"",
+            ):
+                svc.execute_sql_query(form)
+                assert captured["query"] == 'SELECT * FROM "Demo.market.fx_rates"', form
+                assert "Demo.market.fx_rates" in captured["tables"], form
+
+    def test_table_out_qualified_name_is_three_part(self):
+        _, _, _, foo_a_id = self._seed_two_foo_tables()
+        with get_db_context() as db:
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            out = svc.get_table(foo_a_id, user_id=1)
+            assert out.qualified_name == "cat.ns_a.foo"  # catalog.schema.table
+            assert out.full_table_name == "ns_a.foo"  # unchanged 2-part
+
+    def test_execute_sql_cloud_table_returns_clear_error(self):
+        """Object-storage-backed tables aren't queryable in the SQL editor; the error should
+        name the table and explain the limitation instead of a raw 'relation not found'."""
+        _cleanup_catalog()
+        with get_db_context() as db:
+            gcat = CatalogNamespace(name="global-catalog", level=0, owner_id=1)
+            db.add(gcat)
+            db.commit()
+            db.refresh(gcat)
+            main = CatalogNamespace(name="main", level=1, parent_id=gcat.id, owner_id=1)
+            db.add(main)
+            db.commit()
+            db.refresh(main)
+            db.add(
+                CatalogTable(
+                    name="local",
+                    namespace_id=main.id,
+                    owner_id=1,
+                    file_path="s3://bucket/global-catalog/main/local",
+                    storage_format="delta",
+                )
+            )
+            db.commit()
+
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            for form in (
+                'SELECT * FROM "global-catalog.main.local"',
+                'SELECT * FROM "global-catalog"."main"."local"',
+            ):
+                res = svc.execute_sql_query(form)
+                assert res.error is not None, form
+                assert "cloud/object storage" in res.error, form
+                assert "global-catalog.main.local" in res.error, form
+
+    def test_virtual_tables_not_flagged_as_cloud_limited(self):
+        """Virtual tables materialize through their flow (with the flow's credentials), so they
+        must resolve normally and never be reported as cloud-limited — even with a cloud path."""
+        _cleanup_catalog()
+        with get_db_context() as db:
+            cat = CatalogNamespace(name="c", level=0, owner_id=1)
+            db.add(cat)
+            db.commit()
+            db.refresh(cat)
+            # Virtual table with a cloud-ish path: resolves via its flow, must NOT be flagged.
+            db.add(
+                CatalogTable(
+                    name="v",
+                    namespace_id=cat.id,
+                    owner_id=1,
+                    file_path="s3://bucket/v",
+                    storage_format="delta",
+                    table_type="virtual",
+                )
+            )
+            # Physical cloud table: the one that IS cloud-limited.
+            db.add(
+                CatalogTable(
+                    name="p",
+                    namespace_id=cat.id,
+                    owner_id=1,
+                    file_path="s3://bucket/p",
+                    storage_format="delta",
+                )
+            )
+            db.commit()
+
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            aliases = svc.resolve_cloud_only_table_aliases()
+            leaf_names = {a.split(".")[-1] for a in aliases}
+            assert "v" not in leaf_names, aliases  # virtual never flagged
+            assert "p" in leaf_names, aliases  # physical cloud table flagged
+            # And the virtual table is registered as queryable so it can resolve via the flow.
+            _, virtual_map = svc.resolve_all_queryable_tables()
+            assert "c.v" in virtual_map
+
+    def test_cloud_only_aliases_drop_ambiguous_bare_name(self):
+        """Two object-storage tables sharing a bare name across namespaces each keep their
+        qualified aliases with the correct display; the colliding bare name is dropped rather
+        than last-write-wins to one table's display. A uniquely-named cloud table keeps its bare."""
+        _cleanup_catalog()
+        with get_db_context() as db:
+            cat = CatalogNamespace(name="cat", level=0, owner_id=1)
+            db.add(cat)
+            db.commit()
+            db.refresh(cat)
+            ns_a = CatalogNamespace(name="ns_a", level=1, parent_id=cat.id, owner_id=1)
+            ns_b = CatalogNamespace(name="ns_b", level=1, parent_id=cat.id, owner_id=1)
+            db.add_all([ns_a, ns_b])
+            db.commit()
+            db.refresh(ns_a)
+            db.refresh(ns_b)
+            db.add_all(
+                [
+                    CatalogTable(
+                        name="shared", namespace_id=ns_a.id, owner_id=1,
+                        file_path="s3://bucket/a/shared", storage_format="delta",
+                    ),
+                    CatalogTable(
+                        name="shared", namespace_id=ns_b.id, owner_id=1,
+                        file_path="s3://bucket/b/shared", storage_format="delta",
+                    ),
+                    CatalogTable(
+                        name="solo", namespace_id=ns_a.id, owner_id=1,
+                        file_path="s3://bucket/a/solo", storage_format="delta",
+                    ),
+                ]
+            )
+            db.commit()
+
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            aliases = svc.resolve_cloud_only_table_aliases()
+
+            # Qualified forms carry each table's own display, never the other's.
+            assert aliases["ns_a.shared"] == "cat.ns_a.shared"
+            assert aliases["ns_b.shared"] == "cat.ns_b.shared"
+            assert aliases["cat.ns_a.shared"] == "cat.ns_a.shared"
+            assert aliases["cat.ns_b.shared"] == "cat.ns_b.shared"
+            # Colliding bare name dropped (would misattribute under a hardcoded bare_unique).
+            assert "shared" not in aliases
+            # Unique bare name still kept.
+            assert aliases["solo"] == "cat.ns_a.solo"
+
+    def test_execute_sql_missing_virtual_producer_flow_returns_clear_error(self):
+        """A virtual table whose producer flow file is gone should give a clear reason,
+        not a swallowed warning + a downstream 'relation not found'."""
+        _cleanup_catalog()
+        with get_db_context() as db:
+            cat = CatalogNamespace(name="c", level=0, owner_id=1)
+            db.add(cat)
+            db.commit()
+            db.refresh(cat)
+            reg = FlowRegistration(
+                name="producer", flow_path="/nonexistent/does_not_exist.yaml", owner_id=1, namespace_id=cat.id
+            )
+            db.add(reg)
+            db.commit()
+            db.refresh(reg)
+            db.add(
+                CatalogTable(
+                    name="broken_virtual",
+                    namespace_id=cat.id,
+                    owner_id=1,
+                    table_type="virtual",
+                    producer_registration_id=reg.id,
+                )
+            )
+            db.commit()
+
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            res = svc.execute_sql_query("SELECT * FROM broken_virtual")
+            assert res.error is not None
+            assert "broken_virtual" in res.error
+            assert "could not be resolved" in res.error
+            assert "source flow is missing" in res.error
+
+    def test_execute_sql_unknown_table_names_full_reference(self, monkeypatch):
+        """polars reports only the first segment of an a.b.c reference; the SQL editor should
+        name the full table the user wrote instead of blaming the (existing) catalog."""
+        import flowfile_core.catalog.service as svc_module
+
+        _cleanup_catalog()
+        with get_db_context() as db:
+            self._seed_demo_market_delta(db)  # a queryable table so we reach the worker call
+
+            def fake_trigger(query, tables, max_rows, virtual_refs=None):
+                return {
+                    "columns": [],
+                    "dtypes": [],
+                    "rows": [],
+                    "total_rows": 0,
+                    "truncated": False,
+                    "execution_time_ms": 0.0,
+                    "used_tables": [],
+                    "error": "relation 'global-catalog' was not found",
+                }
+
+            monkeypatch.setattr(svc_module, "trigger_sql_query", fake_trigger)
+            svc = CatalogService(SQLAlchemyCatalogRepository(db))
+            res = svc.execute_sql_query('SELECT * FROM "global-catalog".main.locals')
+            assert res.error is not None
+            assert "global-catalog.main.locals" in res.error
+            assert "was not found in the catalog" in res.error
+
     def test_schedule_out_includes_namespace_fields(self):
         _, schema_a_id, _, foo_a_id = self._seed_two_foo_tables()
         with get_db_context() as db:
@@ -1653,3 +2749,635 @@ class TestCrossNamespaceResolution:
             assert out.trigger_namespace_id == schema_a_id
             assert out.trigger_namespace_name == "ns_a"
             assert out.trigger_full_table_name == "ns_a.foo"
+
+
+class TestRewriteQualifiedReferences:
+    """Pure-function tests for the N-part SQL identifier rewriter."""
+
+    NAMES = {"Demo.market.fx_rates", "market.fx_rates", "fx_rates"}
+
+    def _rw(self, query: str) -> str:
+        from flowfile_core.catalog.text_utils import rewrite_qualified_references
+
+        return rewrite_qualified_references(query, self.NAMES)
+
+    @pytest.mark.parametrize(
+        "form",
+        [
+            "SELECT * FROM Demo.market.fx_rates",
+            'SELECT * FROM "Demo"."market"."fx_rates"',
+            'SELECT * FROM "Demo.market.fx_rates"',
+            "SELECT * FROM 'Demo'.'market'.\"fx_rates\"",
+            'SELECT * FROM "Demo" . "market" . "fx_rates"',
+        ],
+    )
+    def test_three_part_forms_collapse_to_flat_identifier(self, form):
+        assert self._rw(form) == 'SELECT * FROM "Demo.market.fx_rates"'
+
+    def test_two_part_and_bare_unchanged_behaviour(self):
+        assert self._rw("SELECT * FROM market.fx_rates") == 'SELECT * FROM "market.fx_rates"'
+        assert self._rw('SELECT * FROM "market"."fx_rates"') == 'SELECT * FROM "market.fx_rates"'
+        assert self._rw("SELECT * FROM fx_rates") == "SELECT * FROM fx_rates"  # bare: no dot, untouched
+
+    def test_column_qualifier_on_three_part_table(self):
+        assert (
+            self._rw("SELECT Demo.market.fx_rates.col FROM Demo.market.fx_rates")
+            == 'SELECT "Demo.market.fx_rates".col FROM "Demo.market.fx_rates"'
+        )
+
+    def test_string_literals_are_not_clobbered(self):
+        # A whole-string literal containing a dot (or a registered name) must never be rewritten:
+        # the joining '.' is matched outside quotes.
+        assert (
+            self._rw("SELECT * FROM market.fx_rates WHERE label = 'market.fx_rates'")
+            == "SELECT * FROM \"market.fx_rates\" WHERE label = 'market.fx_rates'"
+        )
+        assert self._rw("SELECT * FROM fx_rates WHERE c = 'US'") == "SELECT * FROM fx_rates WHERE c = 'US'"
+
+
+class TestFriendlyRelationError:
+    """Pure-function tests for clarifying polars 'relation not found' errors."""
+
+    def _f(self, err: str, q: str) -> str:
+        from flowfile_core.catalog.text_utils import friendly_relation_error
+
+        return friendly_relation_error(err, q)
+
+    def test_multipart_reference_names_full_table(self):
+        out = self._f("relation 'global-catalog' was not found", 'SELECT * FROM "global-catalog".main.locals')
+        assert "global-catalog.main.locals" in out
+        assert "was not found in the catalog" in out
+
+    def test_single_part_unknown_left_as_is(self):
+        err = "relation 'nonexistent' was not found"
+        assert self._f(err, "SELECT * FROM nonexistent") == err  # already clear
+
+    def test_unrelated_error_passthrough(self):
+        assert self._f("some parse error", "SELECT 1") == "some parse error"
+
+
+class TestCronSchedules:
+    """Cron schedule create/read/update via the catalog API."""
+
+    @staticmethod
+    def _register_flow() -> int:
+        with get_db_context() as db:
+            flow = FlowRegistration(name="cron_flow", flow_path="/tmp/cron_flow.flowfile", owner_id=1)
+            db.add(flow)
+            db.commit()
+            db.refresh(flow)
+            return flow.id
+
+    def test_create_cron_schedule(self):
+        flow_id = self._register_flow()
+        resp = client.post(
+            "/catalog/schedules",
+            json={
+                "registration_id": flow_id,
+                "schedule_type": "cron",
+                "cron_expression": "0 9 * * 1-5",
+                "cron_timezone": "Europe/Amsterdam",
+                "name": "Weekday morning",
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        data = resp.json()
+        assert data["schedule_type"] == "cron"
+        assert data["cron_expression"] == "0 9 * * 1-5"
+        assert data["cron_timezone"] == "Europe/Amsterdam"
+
+        got = client.get(f"/catalog/schedules/{data['id']}")
+        assert got.status_code == 200
+        assert got.json()["cron_expression"] == "0 9 * * 1-5"
+
+    def test_create_cron_invalid_expression_rejected(self):
+        flow_id = self._register_flow()
+        resp = client.post(
+            "/catalog/schedules",
+            json={
+                "registration_id": flow_id,
+                "schedule_type": "cron",
+                "cron_expression": "not a cron",
+                "cron_timezone": "UTC",
+            },
+        )
+        assert resp.status_code == 422, resp.text
+
+    def test_update_cron_expression(self):
+        flow_id = self._register_flow()
+        created = client.post(
+            "/catalog/schedules",
+            json={
+                "registration_id": flow_id,
+                "schedule_type": "cron",
+                "cron_expression": "0 9 * * *",
+                "cron_timezone": "UTC",
+            },
+        ).json()
+        resp = client.put(
+            f"/catalog/schedules/{created['id']}",
+            json={"cron_expression": "0 18 * * *"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["cron_expression"] == "0 18 * * *"
+
+    def test_update_cron_on_non_cron_schedule_rejected(self):
+        # Cron fields must not be stored on a non-cron schedule (they'd be silently ignored).
+        flow_id = self._register_flow()
+        with get_db_context() as db:
+            sched = FlowSchedule(
+                registration_id=flow_id,
+                owner_id=1,
+                schedule_type="interval",
+                interval_seconds=3600,
+                enabled=True,
+            )
+            db.add(sched)
+            db.commit()
+            db.refresh(sched)
+            sched_id = sched.id
+        resp = client.put(
+            f"/catalog/schedules/{sched_id}",
+            json={"cron_expression": "0 9 * * *"},
+        )
+        assert resp.status_code == 422, resp.text
+
+    def test_validate_cron_endpoint(self):
+        # Same croniter rules as create, but returns a flag (200) instead of 422
+        # so the builder can gate its submit button on the backend's verdict.
+        ok = client.post(
+            "/catalog/schedules/validate-cron",
+            json={"cron_expression": "0 9 * * 1-5", "cron_timezone": "Europe/Amsterdam"},
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json() == {"valid": True, "error": None}
+
+        bad_expr = client.post(
+            "/catalog/schedules/validate-cron",
+            json={"cron_expression": "not a cron", "cron_timezone": "UTC"},
+        )
+        assert bad_expr.status_code == 200, bad_expr.text
+        assert bad_expr.json()["valid"] is False
+        assert bad_expr.json()["error"]  # carries the backend's reason
+
+        bad_tz = client.post(
+            "/catalog/schedules/validate-cron",
+            json={"cron_expression": "0 9 * * *", "cron_timezone": "Not/AZone"},
+        )
+        assert bad_tz.status_code == 200, bad_tz.text
+        assert bad_tz.json()["valid"] is False
+
+
+# Catalog table storage-deletion tests
+
+
+class TestCatalogTableStorageDeletion:
+    """delete_table only removes Flowfile-managed storage; external files are kept."""
+
+    def _make_namespace(self) -> int:
+        cat = client.post("/catalog/namespaces", json={"name": "TC"}).json()
+        schema = client.post("/catalog/namespaces", json={"name": "TS", "parent_id": cat["id"]}).json()
+        return schema["id"]
+
+    def _insert_table(self, namespace_id: int, file_path: str, storage_format: str) -> int:
+        with get_db_context() as db:
+            owner_id = db.query(User).first().id
+            table = CatalogTable(
+                name=f"t_{file_path.split('/')[-1]}",
+                namespace_id=namespace_id,
+                owner_id=owner_id,
+                file_path=file_path,
+                storage_format=storage_format,
+            )
+            db.add(table)
+            db.commit()
+            return table.id
+
+    def test_delete_managed_table_removes_storage(self):
+        from shared.storage_config import storage
+
+        ns_id = self._make_namespace()
+        managed_dir = storage.catalog_tables_directory / "test_managed_tbl"
+        managed_dir.mkdir(parents=True, exist_ok=True)
+        (managed_dir / "data.parquet").write_bytes(b"x")
+        table_id = self._insert_table(ns_id, str(managed_dir), "delta")
+
+        resp = client.delete(f"/catalog/tables/{table_id}", params={"delete_file": True})
+        assert resp.status_code == 204
+        assert not managed_dir.exists()
+
+    def test_delete_external_table_preserves_storage(self, tmp_path):
+        ns_id = self._make_namespace()
+        external = tmp_path / "my_own_data.parquet"
+        external.write_bytes(b"x")
+        table_id = self._insert_table(ns_id, str(external), "parquet")
+
+        resp = client.delete(f"/catalog/tables/{table_id}", params={"delete_file": True})
+        assert resp.status_code == 204
+        assert external.exists()  # external/user-owned file must never be deleted
+
+    def test_delete_managed_table_keeps_storage_without_flag(self):
+        from shared.storage_config import storage
+
+        ns_id = self._make_namespace()
+        managed_dir = storage.catalog_tables_directory / "test_keep_tbl"
+        managed_dir.mkdir(parents=True, exist_ok=True)
+        (managed_dir / "data.parquet").write_bytes(b"x")
+        table_id = self._insert_table(ns_id, str(managed_dir), "delta")
+
+        resp = client.delete(f"/catalog/tables/{table_id}")  # delete_file defaults False
+        assert resp.status_code == 204
+        assert managed_dir.exists()
+        # cleanup
+        import shutil
+
+        shutil.rmtree(managed_dir, ignore_errors=True)
+
+
+class TestSaveFlowToCatalog:
+    """``/save_flow_to_catalog`` Save-As semantics: a new name copies (leaves the
+    original intact), and a name freed by a deleted file can be reclaimed."""
+
+    def _make_namespace(self) -> int:
+        cat = client.post("/catalog/namespaces", json={"name": "SaveCat"}).json()
+        schema = client.post("/catalog/namespaces", json={"name": "SaveSchema", "parent_id": cat["id"]}).json()
+        return schema["id"]
+
+    def _user_id(self) -> int:
+        with get_db_context() as db:
+            return db.query(User).first().id
+
+    def _new_inmemory_flow(self, name: str) -> int:
+        """Create a quick-create scratch flow in the in-memory handler."""
+        return flow_file_handler.add_flow(name=name, user_id=self._user_id())
+
+    def _path_of(self, flow_id: int) -> Path:
+        return Path(flow_file_handler.get_flow(flow_id).flow_settings.path)
+
+    @staticmethod
+    def _cleanup(flow_ids: tuple[int, ...], paths: tuple[Path, ...]) -> None:
+        for p in paths:
+            p.unlink(missing_ok=True)
+        for fid in flow_ids:
+            try:
+                flow_file_handler.delete_flow(fid)
+            except Exception:
+                pass
+
+    def test_unnamed_flow_has_friendly_untitled_name(self):
+        """A quick-created flow (no name) reads clearly as unnamed and keeps the display
+        name out of the on-disk filename (filesystem-safe, unique per flow id)."""
+        from flowfile_core.flowfile.handler import create_flow_name, create_unnamed_flow_filename
+
+        assert create_flow_name().startswith("Untitled flow ")
+        assert ".yaml" not in create_flow_name()
+        fname = create_unnamed_flow_filename(1234)
+        assert fname.endswith(".yaml") and "1234" in fname
+        assert " " not in fname and ":" not in fname
+
+        fid = flow_file_handler.add_flow(user_id=self._user_id())
+        path = Path(flow_file_handler.get_flow(fid).flow_settings.path)
+        try:
+            name = flow_file_handler.get_flow(fid).flow_settings.name
+            assert name.startswith("Untitled flow "), name
+            assert str(path).startswith(str(storage.unnamed_flows_directory)), path
+            # File name is filesystem-safe and decoupled from the display name.
+            assert path.name != name
+            assert " " not in path.name and ":" not in path.name
+            assert path.name.endswith(".yaml")
+        finally:
+            self._cleanup((fid,), (path,))
+
+    def test_save_as_new_name_keeps_original(self):
+        ns_id = self._make_namespace()
+        fid = self._new_inmemory_flow("sa_alpha")
+        scratch = self._path_of(fid)
+        assert str(scratch).startswith(str(storage.unnamed_flows_directory))
+
+        # First catalog save (scratch -> managed): throwaway scratch file is cleaned up.
+        r1 = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": fid, "flow_name": "sa_alpha", "namespace_id": ns_id},
+        )
+        assert r1.status_code == 200, r1.text
+        fid2 = r1.json()
+        alpha_path = self._path_of(fid2)
+        assert alpha_path.exists()
+        assert not scratch.exists(), "scratch temp flow should be cleaned up on first catalog save"
+
+        # Save-As under a NEW name: the original managed flow must survive (copy, not move).
+        r2 = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": fid2, "flow_name": "sa_beta", "namespace_id": ns_id},
+        )
+        assert r2.status_code == 200, r2.text
+        fid3 = r2.json()
+        beta_path = self._path_of(fid3)
+
+        assert alpha_path.exists(), "Save-As under a new name must not delete the original file"
+        assert beta_path.exists()
+
+        flows = client.get("/catalog/flows", params={"namespace_id": ns_id}).json()
+        by_name = {f["name"]: f for f in flows}
+        assert {"sa_alpha", "sa_beta"} <= set(by_name)
+        # Save-As is a copy: the new name is a brand-new registration row pointing
+        # at its own file — never a repoint of the original's row onto the new path.
+        assert by_name["sa_alpha"]["id"] != by_name["sa_beta"]["id"], (
+            "Save-As must create a new catalog registration, not reuse the original's id"
+        )
+        assert by_name["sa_alpha"]["flow_path"] == str(alpha_path)
+        assert by_name["sa_beta"]["flow_path"] == str(beta_path)
+
+        self._cleanup((fid2, fid3), (alpha_path, beta_path))
+
+    def test_save_as_over_ghost_reclaims_name(self):
+        ns_id = self._make_namespace()
+        ghost_path = str(storage.flows_directory / "999999999_ghost.yaml")
+        assert not Path(ghost_path).exists()
+        client.post(
+            "/catalog/flows",
+            json={"name": "ghost", "flow_path": ghost_path, "namespace_id": ns_id},
+        )
+
+        fid = self._new_inmemory_flow("sa_scratch_ghost")
+        resp = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": fid, "flow_name": "ghost", "namespace_id": ns_id},
+        )
+        assert resp.status_code == 200, resp.text  # ghost reclaimed instead of a dead-end 409
+        new_fid = resp.json()
+        new_path = self._path_of(new_fid)
+        assert new_path.exists()
+
+        flows = client.get("/catalog/flows", params={"namespace_id": ns_id}).json()
+        ghosts = [f for f in flows if f["name"] == "ghost"]
+        assert len(ghosts) == 1, "the dead ghost row should be replaced, not duplicated"
+        # The id may be reused (SQLite recycles rowids); what matters is the
+        # surviving row points at the new, existing file — not the dead path.
+        assert ghosts[0]["flow_path"] == str(new_path)
+        assert ghosts[0]["flow_path"] != ghost_path
+        assert ghosts[0]["file_exists"] is True
+
+        self._cleanup((new_fid,), (new_path,))
+
+    def test_name_collision_with_live_file_still_409(self):
+        ns_id = self._make_namespace()
+        fid_a = self._new_inmemory_flow("sa_dup_a")
+        ra = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": fid_a, "flow_name": "sa_dup", "namespace_id": ns_id},
+        )
+        assert ra.status_code == 200, ra.text
+        fid_a2 = ra.json()
+        dup_path = self._path_of(fid_a2)
+        assert dup_path.exists()
+
+        # A different flow cannot silently take a name whose file is alive.
+        fid_b = self._new_inmemory_flow("sa_dup_b")
+        rb = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": fid_b, "flow_name": "sa_dup", "namespace_id": ns_id},
+        )
+        assert rb.status_code == 409
+
+        self._cleanup((fid_a2, fid_b), (dup_path,))
+
+
+# ==================== Flow interface endpoint (run_flow support) ====================
+
+
+class TestFlowInterfaceEndpoint:
+    def _register(self, path: Path, name: str) -> int:
+        import uuid as _uuid
+
+        with get_db_context() as db:
+            reg = FlowRegistration(flow_uuid=str(_uuid.uuid4()), name=name, flow_path=str(path), owner_id=1)
+            db.add(reg)
+            db.commit()
+            db.refresh(reg)
+            return reg.id
+
+    def _build_subflow_file(self, path: Path) -> None:
+        from flowfile_core.flowfile.handler import FlowfileHandler
+        from flowfile_core.schemas import input_schema, schemas
+        from flowfile_core.schemas.schemas import FlowParameter
+
+        handler = FlowfileHandler()
+        handler.register_flow(
+            schemas.FlowSettings(
+                flow_id=901, name="iface_flow", path=".", execution_mode="Development", execution_location="local"
+            )
+        )
+        graph = handler.get_flow(901)
+        graph.flow_settings.parameters = [FlowParameter(name="limit", default_value="5", type="integer")]
+        graph.add_node_promise(input_schema.NodePromise(flow_id=901, node_id=1, node_type="flow_input"))
+        graph.add_flow_input(input_schema.NodeFlowInput(flow_id=901, node_id=1, input_name="customers"))
+        graph.add_node_promise(input_schema.NodePromise(flow_id=901, node_id=2, node_type="flow_output"))
+        graph.add_flow_output(
+            input_schema.NodeFlowOutput(flow_id=901, node_id=2, output_name="result", depending_on_id=1)
+        )
+        from flowfile_core.flowfile.flow_graph import add_connection
+
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
+        graph.save_flow(str(path))
+
+    def test_get_flow_interface(self, tmp_path):
+        _cleanup_catalog()
+        flow_path = tmp_path / "iface_flow.yaml"
+        self._build_subflow_file(flow_path)
+        reg_id = self._register(flow_path, "iface_flow")
+
+        response = client.get(f"/catalog/flows/{reg_id}/interface")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["registration_id"] == reg_id
+        assert body["file_exists"] is True
+        assert [p["name"] for p in body["inputs"]] == ["customers"]
+        assert [p["name"] for p in body["outputs"]] == ["result"]
+        assert body["parameters"][0]["name"] == "limit"
+        assert body["parameters"][0]["type"] == "integer"
+
+    def test_get_flow_interface_unknown_registration(self):
+        response = client.get("/catalog/flows/99999999/interface")
+        assert response.status_code == 404
+
+    def test_get_flow_interface_missing_file_degrades(self, tmp_path):
+        _cleanup_catalog()
+        reg_id = self._register(tmp_path / "gone.yaml", "gone_flow")
+        response = client.get(f"/catalog/flows/{reg_id}/interface")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["file_exists"] is False
+        assert body["inputs"] == [] and body["outputs"] == []
+
+
+# Flow code tests
+
+
+class TestFlowCode:
+    """``GET /catalog/flows/{id}/code``: a registered flow as text, read from its file, never opened."""
+
+    @staticmethod
+    def _make_namespace() -> int:
+        cat = client.post("/catalog/namespaces", json={"name": "CodeCat"}).json()
+        return client.post("/catalog/namespaces", json={"name": "CodeSchema", "parent_id": cat["id"]}).json()["id"]
+
+    @staticmethod
+    def _save_flow(flow_path: Path) -> int:
+        """Write a manual-input flow to ``flow_path`` through the editor and close it; returns its flow id."""
+        from flowfile_core.schemas import input_schema
+
+        flow_id = flow_file_handler.add_flow(name="code_src", flow_path=str(flow_path), user_id=1)
+        flow = flow_file_handler.get_flow(flow_id)
+        flow.add_manual_input(
+            input_schema.NodeManualInput(
+                flow_id=flow_id,
+                node_id=1,
+                raw_data_format=input_schema.RawData.from_pylist([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]),
+            )
+        )
+        flow.save_flow(str(flow_path))
+        flow_file_handler.delete_flow(flow_id)
+        return flow_id
+
+    def _register(self, flow_path: Path) -> int:
+        ns_id = self._make_namespace()
+        created = client.post(
+            "/catalog/flows", json={"name": "code_src", "flow_path": str(flow_path), "namespace_id": ns_id}
+        )
+        assert created.status_code == 201, created.text
+        return created.json()["id"]
+
+    def _saved_registration(self, tmp_path: Path) -> int:
+        flow_path = tmp_path / "code_src.yaml"
+        self._save_flow(flow_path)
+        return self._register(flow_path)
+
+    def test_flowframe_code_by_default(self, tmp_path):
+        reg_id = self._saved_registration(tmp_path)
+        resp = client.get(f"/catalog/flows/{reg_id}/code")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["format"] == "flowframe"
+        assert body["file_exists"] is True and body["error"] is None
+        assert "import flowfile as ff" in body["content"]
+        assert "from_raw_data" in body["content"]
+
+    def test_polars_format(self, tmp_path):
+        reg_id = self._saved_registration(tmp_path)
+        body = client.get(f"/catalog/flows/{reg_id}/code", params={"format": "polars"}).json()
+        assert body["format"] == "polars"
+        assert "import polars as pl" in body["content"]
+
+    def test_yaml_format_is_the_file(self, tmp_path):
+        flow_path = tmp_path / "code_src.yaml"
+        self._save_flow(flow_path)
+        reg_id = self._register(flow_path)
+        body = client.get(f"/catalog/flows/{reg_id}/code", params={"format": "yaml"}).json()
+        assert body["content"] == flow_path.read_text(encoding="utf-8")
+
+    def test_notebook_format_is_the_cells_as_a_percent_script(self, tmp_path):
+        reg_id = self._saved_registration(tmp_path)
+        body = client.get(f"/catalog/flows/{reg_id}/code", params={"format": "notebook"}).json()
+        content = body["content"]
+        assert content.startswith("# %%\nimport flowfile as ff")
+        assert content.count("# %%") >= 2 and "from_raw_data" in content
+        assert content.endswith("\n") and "\n\n\n# %%" not in content
+
+    def test_unknown_format_is_rejected(self, tmp_path):
+        reg_id = self._saved_registration(tmp_path)
+        assert client.get(f"/catalog/flows/{reg_id}/code", params={"format": "rust"}).status_code == 422
+
+    def test_missing_file_is_a_soft_result(self, tmp_path):
+        reg_id = self._register(tmp_path / "gone.yaml")
+        body = client.get(f"/catalog/flows/{reg_id}/code").json()
+        assert body == {
+            "registration_id": reg_id,
+            "format": "flowframe",
+            "content": None,
+            "file_exists": False,
+            "error": None,
+        }
+
+    def test_unknown_registration_is_404(self):
+        assert client.get("/catalog/flows/987654321/code").status_code == 404
+
+    def test_leaves_the_open_editor_flow_and_its_logger_alone(self, tmp_path):
+        """The file carries the editor's flow id; the read must not share or tear down that flow's logger."""
+        from flowfile_core.configs.flow_logger import FlowLogger, get_flow_log_file
+        from flowfile_core.flowfile.manage import ephemeral_graph
+
+        flow_path = tmp_path / "code_src.yaml"
+        self._save_flow(flow_path)
+        reg_id = self._register(flow_path)
+        open_id = flow_file_handler.import_flow(flow_path, user_id=1)
+        try:
+            assert FlowLogger.get_instance(open_id) is not None
+            seen: list[int] = []
+            original = ephemeral_graph.free_flow_id
+
+            def spy() -> int:
+                seen.append(original())
+                return seen[-1]
+
+            ephemeral_graph.free_flow_id = spy
+            try:
+                body = client.get(f"/catalog/flows/{reg_id}/code").json()
+            finally:
+                ephemeral_graph.free_flow_id = original
+            assert "import flowfile as ff" in body["content"]
+            assert seen and seen[0] != open_id
+            assert flow_file_handler.get_flow(open_id) is not None
+            assert FlowLogger.get_instance(open_id) is not None
+            assert FlowLogger.get_instance(seen[0]) is None
+            assert not get_flow_log_file(seen[0]).exists()
+        finally:
+            flow_file_handler.delete_flow(open_id)
+
+    @staticmethod
+    def _docker_mode(monkeypatch) -> None:
+        from flowfile_core.flowfile.manage import io_flowfile
+
+        monkeypatch.setattr(io_flowfile, "is_docker_mode", lambda: True)
+
+    @pytest.mark.parametrize("fmt", ["yaml", "notebook", "flowframe", "polars"])
+    def test_docker_mode_refuses_a_registered_path_outside_the_flow_folders(self, tmp_path, monkeypatch, fmt):
+        """A registration stores any path, so the read must not echo a server file it points at."""
+        secret = tmp_path / "server_config.json"
+        secret.write_text('{"token": "canary-7f3a"}', encoding="utf-8")
+        reg_id = self._register(secret)
+        self._docker_mode(monkeypatch)
+        resp = client.get(f"/catalog/flows/{reg_id}/code", params={"format": fmt})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["content"] is None
+        assert body["error"] == "the flow's file is outside the server's flow folders"
+        assert "canary-7f3a" not in resp.text
+
+    def test_docker_mode_refuses_a_symlink_out_of_the_flow_folders(self, tmp_path, monkeypatch):
+        secret = tmp_path / "server_config.yaml"
+        secret.write_text("token: canary-7f3a\n", encoding="utf-8")
+        link = storage.flows_directory / f"code_link_{os.getpid()}.yaml"
+        link.symlink_to(secret)
+        try:
+            reg_id = self._register(link)
+            self._docker_mode(monkeypatch)
+            resp = client.get(f"/catalog/flows/{reg_id}/code", params={"format": "yaml"})
+            assert resp.json()["content"] is None
+            assert "canary-7f3a" not in resp.text
+        finally:
+            link.unlink()
+
+    def test_docker_mode_reads_a_flow_in_the_flows_folder(self, monkeypatch):
+        flow_path = storage.flows_directory / f"code_src_{os.getpid()}.yaml"
+        self._save_flow(flow_path)
+        try:
+            reg_id = self._register(flow_path)
+            self._docker_mode(monkeypatch)
+            for fmt in ("yaml", "flowframe"):
+                body = client.get(f"/catalog/flows/{reg_id}/code", params={"format": fmt}).json()
+                assert body["error"] is None and body["content"], (fmt, body)
+            yaml_body = client.get(f"/catalog/flows/{reg_id}/code", params={"format": "yaml"}).json()
+            assert yaml_body["content"] == flow_path.read_text(encoding="utf-8")
+        finally:
+            flow_path.unlink(missing_ok=True)

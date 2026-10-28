@@ -15,7 +15,6 @@ from pydantic import SecretStr
 
 from flowfile_worker.configs import TEST_MODE
 
-# Set up logging
 logger = logging.getLogger(__name__)
 
 # Version identifier for key derivation scheme (must match flowfile_core)
@@ -29,8 +28,14 @@ class SecureStorage:
     """A secure local storage mechanism for reading secrets using Fernet encryption."""
 
     def __init__(self):
-        app_data = os.environ.get("APPDATA") or os.path.expanduser("~/.config")
-        self.storage_path = Path(app_data) / "flowfile"
+        # Must resolve to the same directory core writes to: core encrypts with the
+        # master key found here, and the worker re-derives it independently.
+        override = os.environ.get("FLOWFILE_SECURE_STORAGE_PATH")
+        if override:
+            self.storage_path = Path(override)
+        else:
+            app_data = os.environ.get("APPDATA") or os.path.expanduser("~/.config")
+            self.storage_path = Path(app_data) / "flowfile"
         logger.debug(f"Using storage path: {self.storage_path}")
         self.key_path = self.storage_path / ".secret_key"
 
@@ -88,10 +93,8 @@ def get_docker_secret_key() -> str | None:
     Raises:
         RuntimeError: If the secret file exists but cannot be read, or key is invalid.
     """
-    # First, check for environment variable (allows runtime configuration)
     env_key = os.environ.get("FLOWFILE_MASTER_KEY")
     if env_key:
-        # Validate it's a proper Fernet key
         try:
             Fernet(env_key.encode())
             return env_key
@@ -99,20 +102,17 @@ def get_docker_secret_key() -> str | None:
             logger.error("FLOWFILE_MASTER_KEY environment variable is not a valid Fernet key")
             raise RuntimeError("FLOWFILE_MASTER_KEY is not a valid Fernet key") from None
 
-    # Then, check for Docker secret file
     secret_path = "/run/secrets/flowfile_master_key"
     if os.path.exists(secret_path):
         try:
             with open(secret_path) as f:
                 key = f.read().strip()
-                # Validate the key
                 Fernet(key.encode())
                 return key
         except Exception as e:
             logger.error(f"Failed to read or validate master key from Docker secret: {e}")
             raise RuntimeError("Failed to read master key from Docker secret") from e
 
-    # No key configured
     return None
 
 
@@ -131,11 +131,9 @@ def get_master_key() -> str:
         RuntimeError: If in Docker mode and no key is configured.
         ValueError: If the master key is not found in storage.
     """
-    # First check for test mode
     if TEST_MODE:
         return b"06t640eu3AG2FmglZS0n0zrEdqadoT7lYDwgSmKyxE4=".decode()
 
-    # Next check if running in Docker
     if os.environ.get("FLOWFILE_MODE") == "docker":
         key = get_docker_secret_key()
         if key is None:
@@ -145,7 +143,6 @@ def get_master_key() -> str:
             )
         return key
 
-    # Otherwise read from local storage
     key = get_password("flowfile", "master_key")
     if not key:
         raise ValueError("Master key not found in storage.")
@@ -167,7 +164,6 @@ def derive_user_key(user_id: int) -> bytes:
     """
     master_key = get_master_key().encode()
 
-    # Use HKDF to derive a user-specific key
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,  # Fernet requires 32 bytes
@@ -175,7 +171,6 @@ def derive_user_key(user_id: int) -> bytes:
         info=f"user-{user_id}".encode(),  # User-specific context
     )
 
-    # Derive raw key material and encode for Fernet
     derived_key = hkdf.derive(master_key)
     return base64.urlsafe_b64encode(derived_key)
 
@@ -194,7 +189,6 @@ def decrypt_secret(encrypted_value: str) -> SecretStr:
     Returns:
         SecretStr: The decrypted value as a SecretStr
     """
-    # Check for new versioned format with embedded user_id
     if encrypted_value.startswith(SECRET_FORMAT_PREFIX):
         # Parse: $ffsec$1${user_id}${fernet_token}
         remainder = encrypted_value[len(SECRET_FORMAT_PREFIX) :]

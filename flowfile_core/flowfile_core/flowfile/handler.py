@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from flowfile_core.configs.flow_logger import FlowLogger
+from flowfile_core.events import publish
 from flowfile_core.flowfile.flow_graph import FlowGraph
 from flowfile_core.flowfile.manage.io_flowfile import open_flow
 from flowfile_core.flowfile.utils import create_unique_id
@@ -23,8 +25,17 @@ def get_flow_save_location(flow_name: str) -> Path:
 
 
 def create_flow_name() -> str:
-    """Creates a unique flow name"""
-    return datetime.now().strftime("%Y%m%d_%H_%M_%S") + "_flow.yaml"
+    """Human-facing default name for a quick-created / unnamed flow. Reads clearly as
+    unnamed — matching 'Untitled notebook'/'Untitled dashboard' — with a timestamp so
+    multiple unnamed flows stay distinguishable in the 'Unnamed Flows' catalog namespace."""
+    return "Untitled flow " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def create_unnamed_flow_filename(flow_id: int) -> str:
+    """Filesystem-safe YAML filename for an unnamed flow's on-disk file, keeping the
+    display name's spaces/colons out of the path. The flow id makes it unique even when
+    two flows are created in the same second (registration dedupes on path, not name)."""
+    return f"Unnamed_flow_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{flow_id}.yaml"
 
 
 @dataclass
@@ -65,24 +76,50 @@ class FlowfileHandler:
             return flow_id in self._flows
         return flow_id in self._user_sessions.get(user_id, set())
 
+    def _held_by_another_user(self, flow_id: int, user_id: int | None) -> bool:
+        return any(flow_id in flow_ids for uid, flow_ids in self._user_sessions.items() if uid != user_id)
+
     def __add__(self, other: FlowGraph) -> int:
         self._flows[other.flow_id] = other
         return other.flow_id
 
-    def import_flow(self, flow_path: Path | str, user_id: int | None = None) -> int:
+    def import_flow(self, flow_path: Path | str, user_id: int | None = None, register_session: bool = True) -> int:
+        """Load a flow into the registry. ``register_session=False`` loads it into ``_flows`` (still
+        passing ``user_id`` to ``open_flow`` for connection resolution) without opening an editor
+        session, so project import doesn't auto-open every flow on the canvas.
+
+        The flow keeps the id stored in its file unless another user's session already holds that
+        id: then it gets a fresh one, so opening a shared file never replaces (or shares) someone
+        else's in-memory flow. Re-opening a file the caller already has open still reloads it in place.
+        """
         if isinstance(flow_path, str):
             flow_path = Path(flow_path)
         imported_flow = open_flow(flow_path, user_id=user_id)
+        if self._held_by_another_user(imported_flow.flow_id, user_id):
+            imported_flow.flow_id = create_unique_id()
+            # The setter keeps the per-id logger, which would share the other user's log file.
+            imported_flow.flow_logger = FlowLogger(imported_flow.flow_id)
         self._flows[imported_flow.flow_id] = imported_flow
         imported_flow.flow_settings = self.get_flow_info(imported_flow.flow_id)
+        # The stored id is machine-local and a copied file carries the original's; callers
+        # re-resolve it from the path (same reasoning as save_as_flow and project normalize).
+        try:
+            imported_flow.flow_settings.source_registration_id = None
+        except (AttributeError, ValueError):
+            # Legacy .flowfile pickles unpickle a FlowSettings class without the field.
+            object.__setattr__(imported_flow.flow_settings, "source_registration_id", None)
         imported_flow.flow_settings.is_running = False
-        self._register_user_session(user_id, imported_flow.flow_id)
+        if register_session:
+            self._register_user_session(user_id, imported_flow.flow_id)
         return imported_flow.flow_id
 
     def register_flow(self, flow_settings: FlowSettings, user_id: int | None = None) -> FlowGraph:
-        """Register a flow with the handler and associate it with a user session."""
+        """Register a flow with the handler and associate it with a user session.
+
+        Raises ``ValueError`` when the id is taken; the existing flow is left alone, since it may
+        belong to another user's session.
+        """
         if flow_settings.flow_id in self._flows:
-            self.delete_flow(flow_settings.flow_id)
             raise ValueError("Flow already registered")
         name = flow_settings.name if flow_settings.name else str(flow_settings.flow_id)
         self._flows[flow_settings.flow_id] = FlowGraph(name=name, flow_settings=flow_settings)
@@ -92,8 +129,7 @@ class FlowfileHandler:
     def get_flow(self, flow_id: int, user_id: int | None = None) -> FlowGraph | None:
         """Get a flow by ID, optionally checking user access."""
         flow = self._flows.get(flow_id, None)
-        if flow and user_id is not None:
-            # Only return the flow if user has access
+        if flow is not None and user_id is not None:
             if not self.user_has_flow(user_id, flow_id):
                 return None
         return flow
@@ -104,16 +140,32 @@ class FlowfileHandler:
             if not self.user_has_flow(user_id, flow_id):
                 raise Exception(f"Flow {flow_id} not found in user's session")
             self._unregister_user_session(user_id, flow_id)
-            # Check if any user still has this flow open
             flow_still_open = any(flow_id in flows for flows in self._user_sessions.values())
             if not flow_still_open and flow_id in self._flows:
                 flow = self._flows.pop(flow_id)
                 del flow
+                publish("flow_closed", flow_id=flow_id)
         else:
-            # No user context - delete directly
             if flow_id in self._flows:
                 flow = self._flows.pop(flow_id)
                 del flow
+                publish("flow_closed", flow_id=flow_id)
+
+    def evict_flow_by_path(self, flow_path: str) -> int | None:
+        """Force-remove a flow (matched by on-disk path) from the registry and ALL user sessions,
+        regardless of who has it open. Used by project prune so a deleted flow can't linger as a
+        ghost session. Returns the evicted flow_id or None when nothing matched."""
+        target_id = next(
+            (fid for fid, f in self._flows.items() if f.flow_settings and f.flow_settings.path == flow_path),
+            None,
+        )
+        if target_id is None:
+            return None
+        self._flows.pop(target_id, None)
+        for flow_ids in self._user_sessions.values():
+            flow_ids.discard(target_id)
+        publish("flow_closed", flow_id=target_id)
+        return target_id
 
     def rekey_flow(self, old_flow_id: int, new_flow_id: int, user_id: int | None = None) -> None:
         """Replace the handler key for a flow (e.g. after Save-As).
@@ -127,6 +179,9 @@ class FlowfileHandler:
         if user_id is not None:
             self._unregister_user_session(user_id, old_flow_id)
             self._register_user_session(user_id, new_flow_id)
+        if flow is not None:
+            # A client following the old id (the change feed) learns where the flow went.
+            publish("flow_rekeyed", old_flow_id=old_flow_id, new_flow_id=new_flow_id)
 
     def save_flow(self, flow_id: int, flow_path: str, user_id: int | None = None):
         flow = self.get_flow(flow_id, user_id)
@@ -159,34 +214,35 @@ class FlowfileHandler:
         old_flow_id = flow.flow_id
         new_flow_id = create_unique_id()
 
-        # 1. Clear old catalog link and assign new flow identity
         flow.flow_settings.source_registration_id = None
         flow.flow_id = new_flow_id  # propagates to child nodes + settings
 
-        # 2. Save to the new path (updates flow.flow_settings.path)
         flow.save_flow(flow_path=new_path)
 
-        # 3. Re-key in handler: remove old entry, register under new id
         self.rekey_flow(old_flow_id, new_flow_id, user_id)
 
-        # 4. Catalog registration (if callbacks provided)
         if on_catalog_register is not None:
             on_catalog_register(new_path, flow.flow_settings.name, user_id)
         if on_resolve_registration is not None:
             on_resolve_registration(flow)
 
-        # 5. Re-save to persist the resolved source_registration_id in YAML
+        # Re-save to persist the resolved source_registration_id in YAML
         flow.save_flow(flow_path=new_path)
 
         return new_flow_id
 
-    def add_flow(self, name: str = None, flow_path: str = None, user_id: int | None = None) -> int:
+    def add_flow(
+        self, name: str = None, flow_path: str = None, user_id: int | None = None, persist: bool = True
+    ) -> int:
         """
         Creates a new flow with a reference to the flow path
         Args:
             name (str): The name of the flow
             flow_path (str): The path to the flow file
             user_id (int): The ID of the user creating the flow
+            persist (bool): When False, keep the flow in-memory only and do not write its
+                YAML to disk. Used for ephemeral scratch flows so an abandoned blank canvas
+                leaves no orphan file; the path is still set, so a later save/run writes it.
 
         Returns:
             int: The flow id
@@ -195,11 +251,16 @@ class FlowfileHandler:
         next_id = create_unique_id()
         if not name:
             name = create_flow_name()
-        if not flow_path:
+            # Keep the friendly display name off the filesystem path — derive a safe file name.
+            flow_path = flow_path or get_flow_save_location(create_unnamed_flow_filename(next_id))
+        elif not flow_path:
             flow_path = get_flow_save_location(name)
         flow_info = FlowSettings(name=name, flow_id=next_id, save_location=str(flow_path), path=str(flow_path))
         flow = self.register_flow(flow_info, user_id=user_id)
-        flow.save_flow(flow.flow_settings.path)
+        if persist:
+            flow.save_flow(flow.flow_settings.path)
+        else:
+            flow.mark_as_saved()  # clean baseline, no YAML on disk until first save/run
         return next_id
 
     def get_flow_info(self, flow_id: int) -> FlowSettings:

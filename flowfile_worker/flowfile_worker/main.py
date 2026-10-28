@@ -7,8 +7,10 @@ from fastapi import FastAPI
 
 from flowfile_worker import mp_context
 from flowfile_worker.configs import FLOWFILE_CORE_URI, SERVICE_HOST, SERVICE_PORT, logger
+from flowfile_worker.pool import task_pool
 from flowfile_worker.routes import router
 from flowfile_worker.streaming import streaming_router
+from shared.parent_watcher import start_parent_death_watcher
 from shared.storage_config import storage
 
 should_exit = False
@@ -19,10 +21,15 @@ server_instance = None
 async def shutdown_handler(app: FastAPI):
     """Handle application startup and shutdown"""
     logger.info("Starting application...")
+    task_pool.prewarm()
     try:
         yield
     finally:
         logger.info("Shutting down application...")
+        try:
+            task_pool.shutdown()
+        except Exception as e:
+            logger.error(f"worker pool shutdown failed: {e}")
         try:
             from flowfile_worker.viz_sessions import viz_session_registry
 
@@ -54,7 +61,6 @@ app.include_router(streaming_router)
 async def shutdown():
     """Endpoint to handle graceful shutdown"""
     if server_instance:
-        # Schedule the shutdown
         await asyncio.create_task(trigger_shutdown())
     return {"message": "Shutting down"}
 
@@ -77,13 +83,11 @@ def run(host: str = None, port: int = None):
     """Run the FastAPI app with graceful shutdown"""
     global server_instance
 
-    # Use values from settings if not explicitly provided
     if host is None:
         host = SERVICE_HOST
     if port is None:
         port = SERVICE_PORT
 
-    # Log service configuration
     logger.info(f"Starting worker service on {host}:{port}")
     logger.info(f"Core service configured at {FLOWFILE_CORE_URI}")
 
@@ -92,7 +96,10 @@ def run(host: str = None, port: int = None):
 
     config = uvicorn.Config(app, host=host, port=port, loop="asyncio")
     server = uvicorn.Server(config)
-    server_instance = server  # Store server instance globally
+    server_instance = server
+
+    # In desktop-sidecar mode, exit if the Tauri shell dies without reaping us.
+    start_parent_death_watcher(lambda: setattr(server, "should_exit", True))
 
     logger.info("Starting server...")
     logger.info("Server started")

@@ -4,6 +4,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from shared.path_utils import default_scan_extension, ensure_glob_pattern, is_cloud_path, is_url
+
 
 class MinimalFieldInfo(BaseModel):
     name: str
@@ -29,6 +31,7 @@ class InputCsvTable(InputTableBase):
     row_delimiter: str = "\n"
     quote_char: str = '"'
     infer_schema_length: int = 10_000
+    infer_schema: bool = True
     truncate_ragged_lines: bool = False
     ignore_errors: bool = False
 
@@ -57,6 +60,14 @@ class InputExcelTable(InputTableBase):
     has_headers: bool = True
     type_inference: bool = False
 
+    @field_validator("sheet_name", mode="before")
+    @classmethod
+    def normalize_sheet_name(cls, v):
+        """A blank sheet name means 'read the first sheet'."""
+        if isinstance(v, str):
+            return v.strip() or None
+        return v
+
     @model_validator(mode="after")
     def validate_range_values(self):
         """Validates that the Excel cell range is logical."""
@@ -70,13 +81,43 @@ class InputExcelTable(InputTableBase):
         return self
 
 
-# Create the discriminated union (similar to OutputTableSettings)
+class InputIpcTable(InputTableBase):
+    """Defines settings for reading an Arrow IPC/Feather file."""
+
+    file_type: Literal["ipc"] = "ipc"
+
+
+class InputNdjsonTable(InputTableBase):
+    """Defines settings for reading a newline-delimited JSON file."""
+
+    file_type: Literal["ndjson"] = "ndjson"
+
+
+class InputAvroTable(InputTableBase):
+    """Defines settings for reading an Avro file."""
+
+    file_type: Literal["avro"] = "avro"
+
+
+class InputIpcStreamTable(InputTableBase):
+    """Defines settings for reading an Arrow IPC stream file (``.arrows``); read eagerly, no footer to scan."""
+
+    file_type: Literal["ipc_stream"] = "ipc_stream"
+
+
 InputTableSettings = Annotated[
-    InputCsvTable | InputJsonTable | InputParquetTable | InputExcelTable, Field(discriminator="file_type")
+    InputCsvTable
+    | InputJsonTable
+    | InputParquetTable
+    | InputExcelTable
+    | InputIpcTable
+    | InputNdjsonTable
+    | InputAvroTable
+    | InputIpcStreamTable,
+    Field(discriminator="file_type"),
 ]
 
 
-# Now create the main ReceivedTable model
 class ReceivedTable(BaseModel):
     """Model for defining a table received from an external source."""
 
@@ -89,22 +130,40 @@ class ReceivedTable(BaseModel):
     status: str | None = None
     fields: list[MinimalFieldInfo] = Field(default_factory=list)
     abs_file_path: str | None = None
+    scan_mode: Literal["single_file", "directory"] = "single_file"
+    include_file_paths: str | None = None
 
-    file_type: Literal["csv", "json", "parquet", "excel"]
+    file_type: Literal["csv", "json", "parquet", "excel", "ipc", "ndjson", "avro", "ipc_stream"]
 
     table_settings: InputTableSettings
 
+    @field_validator("include_file_paths", mode="before")
     @classmethod
-    def create_from_path(cls, path: str, file_type: Literal["csv", "json", "parquet", "excel"] = "csv"):
+    def normalize_include_file_paths(cls, v):
+        """A blank column name means 'do not add the source-path column'."""
+        if isinstance(v, str):
+            stripped = v.strip()
+            return stripped or None
+        return v
+
+    @classmethod
+    def create_from_path(
+        cls,
+        path: str,
+        file_type: Literal["csv", "json", "parquet", "excel", "ipc", "ndjson", "avro", "ipc_stream"] = "csv",
+    ):
         """Creates an instance from a file path string."""
         filename = Path(path).name
 
-        # Create appropriate table_settings based on file_type
         settings_map = {
             "csv": InputCsvTable(),
             "json": InputJsonTable(),
             "parquet": InputParquetTable(),
             "excel": InputExcelTable(),
+            "ipc": InputIpcTable(),
+            "ndjson": InputNdjsonTable(),
+            "avro": InputAvroTable(),
+            "ipc_stream": InputIpcStreamTable(),
         }
 
         return cls(
@@ -120,13 +179,20 @@ class ReceivedTable(BaseModel):
             return self.path
 
     def set_absolute_filepath(self):
-        """Resolves the path to an absolute file path."""
+        """Resolves the path to an absolute file path (or, in directory mode, to a glob pattern)."""
+        if is_url(self.path) or is_cloud_path(self.path):
+            self.abs_file_path = self.path
+            return
         base_path = Path(self.path).expanduser()
         if not base_path.is_absolute():
             base_path = Path.cwd() / base_path
-        if self.name and self.name not in base_path.name:
+        # In directory mode the name is a node label, not a filename to append.
+        if self.scan_mode == "single_file" and self.name and self.name not in base_path.name:
             base_path = base_path / self.name
-        self.abs_file_path = str(base_path.resolve())
+        resolved = str(base_path.resolve())
+        if self.scan_mode == "directory":
+            resolved = ensure_glob_pattern(resolved, default_scan_extension(self.file_type))
+        self.abs_file_path = resolved
 
     @field_validator("table_settings", mode="before")
     @classmethod
@@ -134,16 +200,18 @@ class ReceivedTable(BaseModel):
         """Ensures table_settings matches the file_type."""
         if v is None:
             file_type = info.data.get("file_type", "csv")
-            # Create default based on file_type
             settings_map = {
                 "csv": InputCsvTable(),
                 "json": InputJsonTable(),
                 "parquet": InputParquetTable(),
                 "excel": InputExcelTable(),
+                "ipc": InputIpcTable(),
+                "ndjson": InputNdjsonTable(),
+                "avro": InputAvroTable(),
+                "ipc_stream": InputIpcStreamTable(),
             }
             return settings_map.get(file_type, InputCsvTable())
 
-        # If it's a dict, add file_type if missing
         if isinstance(v, dict) and "file_type" not in v:
             v["file_type"] = info.data.get("file_type", "csv")
 

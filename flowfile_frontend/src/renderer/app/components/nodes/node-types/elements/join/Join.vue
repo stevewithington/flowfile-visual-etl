@@ -19,6 +19,15 @@
           />
         </div>
         <div class="join-mapping-section">
+          <div v-if="invalidJoinKeys.length" class="join-warning-banner">
+            <unavailable-field
+              tooltip-text="Join keys reference columns that no longer exist upstream"
+            />
+            <span>
+              These join keys no longer exist upstream: {{ invalidJoinKeys.join(", ") }}. Re-map or
+              remove them.
+            </span>
+          </div>
           <div class="suggest-keys-row">
             <button class="suggest-keys-button" :disabled="aiSuggesting" @click="suggestJoinKeys">
               <span v-if="aiSuggesting">Asking AI…</span>
@@ -56,6 +65,15 @@
                     @update:value="(value: string) => handleChange(value, index, 'right')"
                   />
                 </div>
+                <unavailable-field
+                  v-if="
+                    (selector.left_col &&
+                      !containsVal(result?.main_input?.columns ?? [], selector.left_col)) ||
+                    (selector.right_col &&
+                      !containsVal(result?.right_input?.columns ?? [], selector.right_col))
+                  "
+                  tooltip-text="Join key is no longer valid — the column was removed upstream"
+                />
                 <div class="action-buttons">
                   <button class="action-button remove-button" @click="removeJoinCondition(index)">
                     -
@@ -79,7 +97,6 @@
         :show-keep-option="true"
         :show-title="true"
         :show-headers="true"
-        :show-data="true"
         title="Left data"
         @update-select-inputs="
           (updatedInputs: any) => updateSelectInputsHandler(updatedInputs, true)
@@ -91,12 +108,15 @@
         :show-keep-option="true"
         :show-headers="true"
         :show-title="true"
-        :show-data="true"
         title="Right data"
         @update-select-inputs="
           (updatedInputs: any) => updateSelectInputsHandler(updatedInputs, false)
         "
       />
+      <div v-if="!showColumnSelection" class="semi-anti-note">
+        Semi/anti joins pass all left-side columns through unchanged. Column selection and renaming
+        are not available for these join types.
+      </div>
     </generic-node-settings>
   </div>
   <code-loader v-else />
@@ -113,13 +133,17 @@ import { SelectInput } from "../../../baseNode/nodeInput";
 import { NodeJoin } from "./joinInterfaces";
 import DropDown from "../../../baseNode/page_objects/dropDown.vue";
 import selectDynamic from "../../../baseNode/selectComponents/selectDynamic.vue";
+import unavailableField from "../../../baseNode/selectComponents/UnavailableFields.vue";
 import GenericNodeSettings from "../../../baseNode/genericNodeSettings.vue";
 
 type JoinType = "inner" | "left" | "right" | "full" | "semi" | "anti" | "cross";
 
-const joinTypes: JoinType[] = ["inner", "left", "right", "full", "semi", "anti", "cross"];
+// "cross" is excluded: the backend's JoinKeyStrategy rejects it on a join node.
+const joinTypes: JoinType[] = ["inner", "left", "right", "full", "semi", "anti"];
 
 const JOIN_TYPES_WITHOUT_COLUMN_SELECTION: JoinType[] = ["anti", "semi"];
+
+const containsVal = (arr: string[], val: string) => arr.includes(val);
 
 const handleJoinTypeError = (error: string) => {
   console.error("Join type error:", error);
@@ -133,7 +157,8 @@ const nodeJoin = ref<NodeJoin | null>(null);
 const aiSuggesting = ref(false);
 const aiSuggestNotice = ref<string>("");
 
-// Use the standardized node settings composable
+// Missing join keys light the canvas dot via the backend settings validation;
+// the in-drawer banner (invalidJoinKeys) stays client-side.
 const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSettings({
   nodeRef: nodeJoin,
 });
@@ -167,6 +192,21 @@ const showColumnSelection = computed(() => {
   const joinType = nodeJoin.value?.join_input.how;
   return joinType && !JOIN_TYPES_WITHOUT_COLUMN_SELECTION.includes(joinType);
 });
+
+const invalidJoinKeys = computed<string[]>(() => {
+  if (!nodeJoin.value?.join_input || !result.value) return [];
+  const leftCols = result.value.main_input?.columns ?? [];
+  const rightCols = result.value.right_input?.columns ?? [];
+  const msgs: string[] = [];
+  for (const m of nodeJoin.value.join_input.join_mapping) {
+    if (m.left_col && !containsVal(leftCols, m.left_col)) msgs.push(`left key "${m.left_col}"`);
+    if (m.right_col && !containsVal(rightCols, m.right_col))
+      msgs.push(`right key "${m.right_col}"`);
+  }
+  return msgs;
+});
+
+const hasInvalidFields = computed(() => invalidJoinKeys.value.length > 0);
 
 const removeJoinCondition = (index: number) => {
   if (nodeJoin.value && index >= 0) {
@@ -230,7 +270,6 @@ const suggestJoinKeys = async () => {
     const mapping = nodeJoin.value.join_input.join_mapping;
     let filled = 0;
     for (const pair of pairs) {
-      // Find the next empty row, or append a new one.
       const emptyIdx = mapping.findIndex(
         (m) => (!m.left_col || m.left_col === "") && (!m.right_col || m.right_col === ""),
       );
@@ -301,6 +340,28 @@ defineExpose({
 .suggest-keys-notice {
   font-size: 11px;
   color: var(--color-text-secondary);
+}
+
+/* Invalid-key warning banner */
+.join-warning-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 5px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-danger);
+  border-radius: 6px;
+  background-color: var(--color-danger-subtle, rgba(220, 38, 38, 0.08));
+  color: var(--color-danger);
+  font-size: 12px;
+}
+
+/* Semi/anti passthrough note */
+.semi-anti-note {
+  margin: 12px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  font-style: italic;
 }
 
 /* Join Mapping Section */

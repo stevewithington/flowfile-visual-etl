@@ -13,17 +13,20 @@ export const designerHelp: PageHelpContent = {
         {
           icon: "fa-solid fa-plus-circle",
           title: "Add Nodes",
-          description: "Right-click the canvas or drag from the node panel to add transformation steps",
+          description:
+            "Right-click the canvas or drag from the node panel to add transformation steps",
         },
         {
           icon: "fa-solid fa-link",
           title: "Connect Nodes",
-          description: "Drag from an output handle to an input handle to define data flow between steps",
+          description:
+            "Drag from an output handle to an input handle to define data flow between steps",
         },
         {
           icon: "fa-solid fa-play",
           title: "Run Flows",
-          description: "Execute the entire flow or run individual nodes to preview intermediate results",
+          description:
+            "Execute the entire flow or run individual nodes to preview intermediate results",
         },
         {
           icon: "fa-solid fa-floppy-disk",
@@ -44,13 +47,20 @@ export const designerHelp: PageHelpContent = {
         },
         {
           type: "success",
+          title: "Alt+click to select several nodes",
+          description:
+            "Alt+click nodes (or Shift+drag a box) to select several at once, then drag them together or group them from the right-click menu.",
+        },
+        {
+          type: "success",
           title: "Use Ctrl+S to save and Ctrl+E to run",
           description: "Keyboard shortcuts help you work faster without reaching for buttons.",
         },
         {
           type: "warning",
           title: "Connect nodes before running",
-          description: "Unconnected nodes won't receive data. Make sure your pipeline is fully wired.",
+          description:
+            "Unconnected nodes won't receive data. Make sure your pipeline is fully wired.",
         },
       ],
     },

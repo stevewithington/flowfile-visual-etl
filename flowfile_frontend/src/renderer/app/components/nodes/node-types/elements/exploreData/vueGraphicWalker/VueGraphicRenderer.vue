@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, defineProps, toRaw, watch } from "vue";
 
-import type { IRow, IMutField, IChart, IGWProps } from "@kanaries/graphic-walker/dist/interfaces";
+import type { IRow, IMutField, IChart, IGWProps } from "@kanaries/graphic-walker/interfaces";
 
 interface VueGRProps {
   chart: IChart;
@@ -26,14 +26,21 @@ let resizeObserver: ResizeObserver | null = null;
 let resizeTimer: ReturnType<typeof setTimeout> | null = null;
 let measuredSize = { w: 0, h: 0 };
 let shadowReadyObserver: MutationObserver | null = null;
+let chartSiblingObserver: ResizeObserver | null = null;
+let chartMarksObserver: MutationObserver | null = null;
+// Height GW renders above the chart (error panel + filter widgets); subtracted from the fixed size.
+let chartTopOffset = 0;
+// How much smaller than the tile the size handed to GW must be for the rendered marks to fit.
+let fitInset = { w: 0, h: 0 };
+let fitPasses = 0;
 
-// Suppress two graphic-walker artefacts inside its open Shadow DOM:
-// (a) the `border-primary border-2` frame its <Resizable> wrapper draws
-// when size.mode is 'fixed', and (b) the eight `cursor: *-resize` drag
-// handles that project past the wrapper and trigger the parent
-// .overflow-auto's scrollbars. No prop disables either; outside CSS
-// can't pierce the boundary; instead we append a <style> into the
-// shadow root, which scopes to all descendants.
+const CHART_CONTAINER_CLASS = "flowfile-gw-chart";
+// Padding GW puts around the chart frame in fixed-size mode.
+const FRAME_PADDING = 12;
+
+// Inject a <style> into GW's shadow root to hide its resize frame + drag handles (no prop disables them).
+// The frame is pinned to the tile so GW's scroll container stays tile-sized while the fixed size we
+// hand GW only drives the spec (see measureFit); the inner wrapper is un-sized so marks stay visible.
 const SHADOW_STYLE_MARKER = "data-flowfile-gw-overrides";
 
 const findShadowRoot = (root: HTMLElement): ShadowRoot | null => {
@@ -50,13 +57,8 @@ const injectShadowOverride = (shadow: ShadowRoot): void => {
   if (shadow.querySelector(`style[${SHADOW_STYLE_MARKER}]`)) return;
   const style = document.createElement("style");
   style.setAttribute(SHADOW_STYLE_MARKER, "");
-  // The third rule mimics "remove the class" on the inner
-  // <div class="w-full h-full relative" style="overflow:hidden"> wrapper:
-  // letting it size to its content (and not clip) lets the outer
-  // `.overflow-auto` ancestor render scrollbars when the chart is larger
-  // than the tile body.
   style.textContent = `
-    .border-primary.border-2 { border-width: 0 !important; }
+    .border-primary.border-2 { border-width: 0 !important; width: 100% !important; height: 100% !important; }
     [style*="-resize"] { display: none !important; }
     .border-primary.border-2 > .w-full.h-full.relative {
       width: auto !important;
@@ -67,19 +69,31 @@ const injectShadowOverride = (shadow: ShadowRoot): void => {
   shadow.appendChild(style);
 };
 
-// GraphicRenderer's own ResizeObserver mis-measures height (its outer
-// wrapper is missing h-full), so we measure the tile ourselves and pass
-// the result as `overrideSize: { mode: 'fixed', ... }` — the library
-// treats it as a hard replacement for layout.size.
+// GW re-imports the chart (and refetches its data) whenever the chart array identity changes,
+// so keep one array per props change and let size-only re-renders reuse the loaded data.
+let chartProp: IChart[] = [];
+let fieldsProp: IMutField[] | undefined;
+
+const syncDataProps = () => {
+  chartProp = [toRaw(props.chart)];
+  fieldsProp = props.fields ? toRaw(props.fields) : undefined;
+};
+
+// Measure the tile ourselves and pass overrideSize; GW's own ResizeObserver mis-measures height.
 const getReactProps = (): Record<string, any> => {
   const reactProps: Record<string, any> = {
-    fields: props.fields ? toRaw(props.fields) : undefined,
-    chart: [toRaw(props.chart)],
+    fields: fieldsProp,
+    chart: chartProp,
     appearance: props.appearance || "light",
     themeKey: props.themeKey,
     computation: props.computation,
-    containerStyle: { width: "100%", height: "100%" },
-    overrideSize: { mode: "fixed", width: measuredSize.w, height: measuredSize.h },
+    containerStyle: { width: `${measuredSize.w}px`, height: `${measuredSize.h}px` },
+    containerClassName: CHART_CONTAINER_CLASS,
+    overrideSize: {
+      mode: "fixed",
+      width: Math.max(1, measuredSize.w - fitInset.w),
+      height: Math.max(1, measuredSize.h - fitInset.h),
+    },
   };
   Object.keys(reactProps).forEach((key) => {
     if (reactProps[key] === undefined) delete reactProps[key];
@@ -96,9 +110,114 @@ const renderReact = () => {
 const measure = (el: HTMLElement) => {
   const rect = el.getBoundingClientRect();
   const w = Math.max(1, Math.floor(rect.width));
-  const h = Math.max(1, Math.floor(rect.height));
+  const h = Math.max(1, Math.floor(rect.height - chartTopOffset));
   if (Math.abs(w - measuredSize.w) < 2 && Math.abs(h - measuredSize.h) < 2) return false;
   measuredSize = { w, h };
+  fitPasses = 0;
+  return true;
+};
+
+const FIT_TOLERANCE = 3;
+const MAX_FIT_PASSES = 6;
+const MARKS_SELECTOR = "canvas.marks, svg.marks";
+
+/**
+ * GW derives facet cell sizes from the fixed size without accounting for axes, headers and
+ * legends, so a chart with a dimension on rows/columns renders taller or wider than the tile
+ * (and GW's own post-render correction is a no-op inside our un-sized wrapper). Measure the
+ * rendered marks against the tile and hand GW a size reduced by the overshoot, so the marks
+ * land at the same inset a plain chart gets. The inset is derived from the frame size GW
+ * rendered the marks with, which makes repeated measurements of one render idempotent; the
+ * pass cap stops a jittering label layout from re-rendering forever.
+ */
+const measureFit = (chartEl: HTMLElement): boolean => {
+  const marks = Array.from(chartEl.querySelectorAll<HTMLElement>(MARKS_SELECTOR));
+  if (!marks.length || fitPasses >= MAX_FIT_PASSES) return false;
+  const frame = chartEl.querySelector<HTMLElement>(".border-primary");
+  // The frame may predate the latest tile measurement, so the derived inset can dip below zero.
+  const renderedInset = {
+    w: frame ? Math.max(0, measuredSize.w - parseFloat(frame.style.width)) : fitInset.w,
+    h: frame ? Math.max(0, measuredSize.h - parseFloat(frame.style.height)) : fitInset.h,
+  };
+  const origin = chartEl.getBoundingClientRect();
+  let right = 0;
+  let bottom = 0;
+  for (const mark of marks) {
+    const rect = mark.getBoundingClientRect();
+    // Vega inserts the canvas before sizing it; wait for the sized one.
+    if (!rect.width || !rect.height) return false;
+    right = Math.max(right, rect.right - origin.left);
+    bottom = Math.max(bottom, rect.bottom - origin.top);
+  }
+  const fit = (inset: number, over: number) => {
+    if (!Number.isFinite(inset)) return 0;
+    const grow = over > FIT_TOLERANCE || (over < -FIT_TOLERANCE && inset > 0);
+    return Math.max(0, Math.round(grow ? inset + over : inset));
+  };
+  const next = {
+    w: fit(renderedInset.w, right - (measuredSize.w - FRAME_PADDING)),
+    h: fit(renderedInset.h, bottom - (measuredSize.h - FRAME_PADDING)),
+  };
+  if (next.w === fitInset.w && next.h === fitInset.h) return false;
+  fitInset = next;
+  fitPasses += 1;
+  return true;
+};
+
+const scheduleRender = () => {
+  if (resizeTimer) clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    resizeTimer = null;
+    renderReact();
+  }, 80);
+};
+
+const updateChartTopOffset = (chartEl: HTMLElement): boolean => {
+  if (!wrapper.value) return false;
+  const top = chartEl.getBoundingClientRect().top - wrapper.value.getBoundingClientRect().top;
+  const next = Math.max(0, Math.round(top));
+  if (Math.abs(next - chartTopOffset) < 2) return false;
+  chartTopOffset = next;
+  return true;
+};
+
+// Vega replaces and then sizes the canvas on every render; measure on those mutations only, so
+// GW's frame changing size on our own re-render never triggers a measurement of a stale canvas.
+// (A ResizeObserver would do, but its callbacks wait for a paint frame a hidden tab never gets.)
+const touchesMarks = (records: MutationRecord[]): boolean =>
+  records.some((record) => {
+    if (record.type === "attributes") return (record.target as Element).matches(MARKS_SELECTOR);
+    return Array.from(record.addedNodes).some(
+      (node) =>
+        node instanceof Element &&
+        (node.matches(MARKS_SELECTOR) || node.querySelector(MARKS_SELECTOR)),
+    );
+  });
+
+// Watch what GW renders above the chart; filter widgets mount async and change height.
+const bindChartContainer = (shadow: ShadowRoot): boolean => {
+  const chartEl = shadow.querySelector<HTMLElement>(`.${CHART_CONTAINER_CLASS}`);
+  if (!chartEl) return false;
+  chartSiblingObserver?.disconnect();
+  chartSiblingObserver = new ResizeObserver(() => {
+    if (!wrapper.value || !updateChartTopOffset(chartEl)) return;
+    if (measure(wrapper.value)) scheduleRender();
+  });
+  for (const sibling of Array.from(chartEl.parentElement?.children ?? [])) {
+    if (sibling !== chartEl) chartSiblingObserver.observe(sibling);
+  }
+  if (updateChartTopOffset(chartEl) && wrapper.value && measure(wrapper.value)) scheduleRender();
+  chartMarksObserver?.disconnect();
+  chartMarksObserver = new MutationObserver((records) => {
+    if (touchesMarks(records) && measureFit(chartEl)) scheduleRender();
+  });
+  chartMarksObserver.observe(chartEl, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["style", "width", "height"],
+  });
+  if (measureFit(chartEl)) scheduleRender();
   return true;
 };
 
@@ -119,21 +238,22 @@ onMounted(async () => {
     GraphicRenderer = gwModule.GraphicRenderer;
 
     measure(wrapper.value);
+    syncDataProps();
 
     reactRootInstance = ReactDOMClient.createRoot(container.value);
     renderReact();
     isLoading.value = false;
 
     const root = container.value;
-    const tryInject = (): boolean => {
+    const tryBindShadow = (): boolean => {
       const shadow = findShadowRoot(root);
       if (!shadow) return false;
       injectShadowOverride(shadow);
-      return true;
+      return bindChartContainer(shadow);
     };
-    if (!tryInject()) {
+    if (!tryBindShadow()) {
       shadowReadyObserver = new MutationObserver(() => {
-        if (tryInject()) {
+        if (tryBindShadow()) {
           shadowReadyObserver?.disconnect();
           shadowReadyObserver = null;
         }
@@ -143,12 +263,7 @@ onMounted(async () => {
 
     resizeObserver = new ResizeObserver(() => {
       if (!wrapper.value) return;
-      if (!measure(wrapper.value)) return;
-      if (resizeTimer) clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => {
-        resizeTimer = null;
-        renderReact();
-      }, 80);
+      if (measure(wrapper.value)) scheduleRender();
     });
     resizeObserver.observe(wrapper.value);
   } catch (e) {
@@ -160,7 +275,12 @@ onMounted(async () => {
 
 watch(
   () => [props.chart, props.fields, props.appearance, props.themeKey],
-  () => renderReact(),
+  () => {
+    syncDataProps();
+    fitInset = { w: 0, h: 0 };
+    fitPasses = 0;
+    renderReact();
+  },
   { deep: true },
 );
 
@@ -173,6 +293,10 @@ onUnmounted(() => {
   resizeObserver = null;
   shadowReadyObserver?.disconnect();
   shadowReadyObserver = null;
+  chartSiblingObserver?.disconnect();
+  chartSiblingObserver = null;
+  chartMarksObserver?.disconnect();
+  chartMarksObserver = null;
   if (reactRootInstance) {
     reactRootInstance.unmount();
     reactRootInstance = null;

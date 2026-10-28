@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import os
-from importlib.metadata import PackageNotFoundError, version
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from flowfile_core.auth.jwt import get_current_active_user
+from flowfile_core.catalog.access import AccessResolver
+from flowfile_core.catalog.constants import KAFKA_SYNC
+from flowfile_core.catalog.exceptions import NotAuthorizedError
 from flowfile_core.catalog.repository import SQLAlchemyCatalogRepository
 from flowfile_core.catalog.service import CatalogService
 from flowfile_core.configs import logger
 from flowfile_core.database.connection import get_db
+from flowfile_core.database.models import CatalogNamespace as CatalogNamespaceModel
 from flowfile_core.kafka.connection_manager import (
     build_consumer_config,
     decrypt_secret_value,
@@ -27,6 +30,10 @@ from flowfile_core.kafka.connection_manager import (
     test_kafka_connection,
     update_kafka_connection,
 )
+from flowfile_core.routes._connection_sharing import (
+    authorize_connection_mutation,
+    require_credentials_on_target_change,
+)
 from flowfile_core.schemas.catalog_schema import FlowRegistrationOut
 from flowfile_core.schemas.kafka_schemas import (
     KafkaConnectionCreate,
@@ -36,21 +43,17 @@ from flowfile_core.schemas.kafka_schemas import (
     KafkaSyncCreate,
     KafkaTopicInfo,
 )
+from shared._version import get_version
 from shared.kafka.consumer import infer_topic_schema
 from shared.kafka.models import KafkaReadSettings
 from shared.storage_config import storage
 
-try:
-    _flowfile_version = version("Flowfile")
-except PackageNotFoundError:
-    _flowfile_version = "0.5.0"
+_flowfile_version = get_version()
 
 router = APIRouter(prefix="/kafka", tags=["kafka"])
 
 
-# ---------------------------------------------------------------------------
 # Connection management
-# ---------------------------------------------------------------------------
 
 
 @router.post("/connections", response_model=KafkaConnectionOut)
@@ -83,9 +86,33 @@ def update_kafka_connection_route(
     current_user=Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
-    """Update an existing Kafka connection."""
+    """Update an existing Kafka connection (own, or group-shared with manage access)."""
+    db_conn = get_kafka_connection(db, connection_id, current_user.id)
+    if db_conn is None:
+        raise HTTPException(status_code=404, detail=f"Kafka connection {connection_id} not found")
+    if authorize_connection_mutation(db, current_user, "kafka_connection", db_conn):
+        provided = update.model_fields_set
+        changed = [
+            field
+            for field in (
+                "bootstrap_servers",
+                "security_protocol",
+                "sasl_mechanism",
+                "schema_registry_url",
+                "ssl_ca_location",
+                "ssl_cert_location",
+            )
+            if field in provided and getattr(update, field) != getattr(db_conn, field)
+        ]
+        has_new_credentials = bool(
+            (update.sasl_password is not None and update.sasl_password.get_secret_value())
+            or (update.ssl_key_pem is not None and update.ssl_key_pem.get_secret_value())
+        )
+        has_bundled_secrets = db_conn.sasl_password_id is not None or db_conn.ssl_key_id is not None
+        require_credentials_on_target_change(changed, has_new_credentials, has_bundled_secrets)
     try:
-        return update_kafka_connection(db, connection_id, update, current_user.id)
+        # Owner's user_id keeps rotated secrets encrypted under the OWNER's key.
+        return update_kafka_connection(db, connection_id, update, db_conn.user_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from None
 
@@ -96,9 +123,13 @@ def delete_kafka_connection_route(
     current_user=Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
-    """Delete a Kafka connection."""
+    """Delete a Kafka connection (own, or group-shared with manage access)."""
+    db_conn = get_kafka_connection(db, connection_id, current_user.id)
+    if db_conn is None:
+        raise HTTPException(status_code=404, detail=f"Kafka connection {connection_id} not found")
+    authorize_connection_mutation(db, current_user, "kafka_connection", db_conn)
     try:
-        delete_kafka_connection(db, connection_id, current_user.id)
+        delete_kafka_connection(db, connection_id, db_conn.user_id)
         return {"message": "Kafka connection deleted successfully"}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from None
@@ -161,9 +192,7 @@ def infer_kafka_topic_schema(
         raise HTTPException(status_code=400, detail="Schema inference failed. Check server logs for details.") from None
 
 
-# ---------------------------------------------------------------------------
 # Consumer group management (offsets tracked by broker)
-# ---------------------------------------------------------------------------
 
 
 @router.get("/sync/{sync_name}/offsets", response_model=dict[int, int])
@@ -196,20 +225,37 @@ def reset_sync_offsets_route(
         raise HTTPException(status_code=400, detail=str(e)) from None
 
 
-# ---------------------------------------------------------------------------
 # Kafka sync flow creation
-# ---------------------------------------------------------------------------
 
 
 def _ensure_sync_namespace(service: CatalogService, owner_id: int) -> int:
-    """Return the namespace ID for ``General / sync``, creating both if needed."""
+    """Return the namespace ID for ``General / sync``, creating both if needed.
+
+    ``sync`` is a shared system container (like the seeded General schemas): it is
+    created public so every user's default-namespace sync keeps working, and an
+    older private row is healed to public for the same reason.
+    """
     repo = service.repo
-    general = repo.get_namespace_by_name("General", parent_id=None)
-    if general is None:
-        general = service.create_namespace("General", owner_id=owner_id)
-    sync_ns = repo.get_namespace_by_name("sync", parent_id=general.id)
+    # Canonical heal: public root with no storage snapshot, same as init_db's seed —
+    # create_namespace would mint a private General and bind env-default storage to it.
+    general = service.ensure_root_catalog(owner_id)
+    sync_ns = repo.get_namespace_by_name(KAFKA_SYNC.name, parent_id=general.id)
     if sync_ns is None:
-        sync_ns = service.create_namespace("sync", owner_id=owner_id, parent_id=general.id)
+        sync_ns = repo.create_namespace(
+            CatalogNamespaceModel(
+                name=KAFKA_SYNC.name,
+                parent_id=general.id,
+                level=1,
+                description=KAFKA_SYNC.description,
+                owner_id=owner_id,
+                is_public=True,
+            )
+        )
+    elif not sync_ns.is_public and sync_ns.owner_id == owner_id:
+        # Heal a legacy private sync only for its own owner — never force-publish
+        # another user's private namespace that happens to be named "sync".
+        sync_ns.is_public = True
+        repo.update_namespace(sync_ns)
     return sync_ns.id
 
 
@@ -303,12 +349,10 @@ def create_kafka_sync(
     Generates a flow YAML with a ``kafka_source`` → ``catalog_writer`` pipeline,
     saves it to disk, and registers it in the catalog.
     """
-    # Validate connection
     db_conn = get_kafka_connection(db, body.kafka_connection_id, current_user.id)
     if db_conn is None:
         raise HTTPException(status_code=404, detail="Kafka connection not found")
 
-    # Infer topic schema for the fields list
     consumer_config = build_consumer_config(db, db_conn, current_user.id)
     settings = KafkaReadSettings.from_consumer_config(
         consumer_config,
@@ -333,7 +377,6 @@ def create_kafka_sync(
         # Group may not exist yet — that's fine, first run will create it
         logger.debug("No existing consumer group '%s' to reset (new group will be created on first run)", sync_group_id)
 
-    # Save path
     flow_name = f"sync-{body.sync_name}"
     flow_path = storage.flows_directory / f"{flow_name}.yaml"
     if flow_path.exists():
@@ -341,7 +384,7 @@ def create_kafka_sync(
 
     # Register in catalog first to get the registration ID
     repo = SQLAlchemyCatalogRepository(db)
-    service = CatalogService(repo)
+    service = CatalogService(repo, access=AccessResolver(db, current_user))
 
     # Default to "General / sync" namespace when not specified
     namespace_id = body.namespace_id
@@ -357,10 +400,11 @@ def create_kafka_sync(
             namespace_id=namespace_id,
             description=f"Kafka sync: {body.topic_name} → {body.table_name}",
         )
+    except NotAuthorizedError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from None
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
 
-    # Build and write YAML
     flow_data = _build_sync_flow_data(
         body,
         connection_name=db_conn.connection_name,

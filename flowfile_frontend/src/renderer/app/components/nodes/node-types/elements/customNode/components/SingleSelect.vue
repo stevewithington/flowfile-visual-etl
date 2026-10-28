@@ -1,5 +1,3 @@
-// 📄 SingleSelect.vue
-
 <template>
   <div class="component-container">
     <label class="listbox-subtitle">{{ schema.label }}</label>
@@ -8,23 +6,31 @@
       filterable
       placeholder="Select an option"
       style="width: 100%"
-      size="large"
+      size="small"
+      :loading="loading"
+      loading-text="Loading options…"
       @update:model-value="$emit('update:modelValue', $event)"
     >
       <el-option
         v-for="item in options"
-        :key="Array.isArray(item) ? item[0] : item"
-        :label="Array.isArray(item) ? item[1] : item"
-        :value="Array.isArray(item) ? item[0] : item"
+        :key="optionKey(item)"
+        :label="optionLabel(item)"
+        :value="optionValue(item)"
       />
     </el-select>
   </div>
 </template>
 
 <script setup lang="ts">
-// No changes are needed in the <script> section
 import { computed, PropType } from "vue";
-import type { SingleSelectComponent } from "../interface";
+import type { ArtifactOption, GlobalArtifactOption, SingleSelectComponent } from "../interface";
+import {
+  buildArtifactOptions,
+  optionKey,
+  optionLabel,
+  optionValue,
+  type SelectOptionItem,
+} from "./artifactFilter";
 
 const props = defineProps({
   schema: {
@@ -40,22 +46,37 @@ const props = defineProps({
     default: () => [],
   },
   availableArtifacts: {
-    type: Array as PropType<string[]>,
+    type: Array as PropType<ArtifactOption[]>,
     default: () => [],
+  },
+  globalArtifacts: {
+    type: Array as PropType<GlobalArtifactOption[]>,
+    default: () => [],
+  },
+  loading: {
+    type: Boolean,
+    default: false,
   },
 });
 
 defineEmits(["update:modelValue"]);
 
-const options = computed(() => {
-  if (Array.isArray(props.schema.options)) {
-    return props.schema.options;
+// Artifact values are bare names or namespace-qualified refs; scope decides the source.
+const options = computed((): SelectOptionItem[] => {
+  const opts = props.schema.options;
+  if (Array.isArray(opts)) {
+    return opts;
   }
-  if (props.schema.options?.__type__ === "IncomingColumns") {
+  if (opts?.__type__ === "IncomingColumns") {
     return props.incomingColumns;
   }
-  if (props.schema.options?.__type__ === "AvailableArtifacts") {
-    return props.availableArtifacts;
+  if (opts?.__type__ === "AvailableArtifacts") {
+    return buildArtifactOptions(
+      opts.scope,
+      props.availableArtifacts,
+      props.globalArtifacts,
+      opts.type_filter,
+    );
   }
   return [];
 });

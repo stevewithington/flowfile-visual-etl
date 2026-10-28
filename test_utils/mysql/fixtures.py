@@ -14,7 +14,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
-# Configure logging
+from test_utils.docker_images import pull_image_if_missing
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -93,12 +94,10 @@ def is_docker_available() -> bool:
         logger.info("Skipping Docker on macOS/Windows in CI environment")
         return False
 
-    # If docker executable is not in PATH
     if shutil.which("docker") is None:
         logger.warning("Docker executable not found in PATH")
         return False
 
-    # Try a simple docker command
     try:
         result = subprocess.run(
             ["docker", "info"],
@@ -173,7 +172,6 @@ def _init_sample_data() -> bool:
         )
         try:
             with conn.cursor() as cursor:
-                # Execute each statement separately
                 for statement in SAMPLE_DATA_SQL.strip().split(";"):
                     statement = statement.strip()
                     if statement:
@@ -204,14 +202,12 @@ def start_mysql_container(
     Returns:
         Tuple containing the process object (or None) and a success flag
     """
-    # Check Docker availability
     if not is_docker_available():
         logger.warning("Docker not available, skipping MySQL container start")
         return None, False
 
     logger.info("Starting MySQL container...")
 
-    # Check if container is already running
     if is_container_running(container_name):
         logger.info(f"Container {container_name} is already running")
         return None, True
@@ -224,23 +220,9 @@ def start_mysql_container(
         check=False,
     )
 
-    # Pull the image first (may take a while on first run)
-    try:
-        logger.info(f"Pulling Docker image {image}...")
-        subprocess.run(
-            ["docker", "pull", image],
-            capture_output=True,
-            timeout=300,
-            check=True,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error(f"Timed out pulling Docker image {image}")
-        return None, False
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to pull Docker image {image}: {e}")
+    if not pull_image_if_missing(image, logger):
         return None, False
 
-    # Run the container in the background
     try:
         result = subprocess.run(
             [
@@ -286,16 +268,13 @@ def start_mysql_container(
             elapsed = time.time() - start_time
             logger.info(f"MySQL container started successfully in {elapsed:.2f} seconds")
 
-            # Initialize sample data
             _init_sample_data()
             return None, True
 
-        # Log progress
         elapsed = time.time() - start_time
         logger.info(f"Waiting for MySQL to start... ({elapsed:.1f}s / {STARTUP_TIMEOUT}s)")
         time.sleep(STARTUP_CHECK_INTERVAL)
 
-    # Timeout reached
     logger.error(f"MySQL failed to start within {STARTUP_TIMEOUT} seconds")
     return None, False
 
@@ -311,7 +290,6 @@ def stop_mysql_container(container_name: str = MYSQL_CONTAINER_NAME, timeout: in
     Returns:
         True if stop succeeds or container not running, False otherwise
     """
-    # Check Docker availability
     if not is_docker_available():
         logger.warning("Docker not available, skipping MySQL container stop")
         return True
@@ -376,13 +354,11 @@ def managed_mysql() -> Generator[dict[str, Any], None, None]:
     Yields:
         Dictionary with database connection information or empty dict if Docker isn't available
     """
-    # Check Docker availability
     if not is_docker_available():
         logger.warning("Docker not available, skipping managed_mysql context")
         yield {}
         return
 
-    # Start container
     _, success = start_mysql_container()
     if not success:
         logger.error("Failed to start MySQL container")
@@ -390,7 +366,6 @@ def managed_mysql() -> Generator[dict[str, Any], None, None]:
         return
 
     try:
-        # Create connection details
         connection_info = {
             "host": MYSQL_HOST,
             "port": MYSQL_PORT,
@@ -402,7 +377,6 @@ def managed_mysql() -> Generator[dict[str, Any], None, None]:
 
         yield connection_info
     finally:
-        # Always try to stop the container
         stop_mysql_container()
 
 
@@ -413,7 +387,6 @@ def get_db_engine():
     Returns:
         SQLAlchemy engine object or None if Docker isn't available
     """
-    # Check Docker availability
     if not is_docker_available():
         logger.warning("Docker not available, skipping get_db_engine")
         return None

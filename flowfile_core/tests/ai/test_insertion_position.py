@@ -10,8 +10,10 @@ Cases:
 * ``test_resolves_from_single_upstream`` — one upstream → upstream.x + Δx,
   upstream.y + 0.
 * ``test_chain_offsets_horizontally`` — chained adds (each upstream is the
-  prior staged add) lay out as a straight horizontal line because each call
-  passes ``staged_offset_index=0``.
+  prior staged add, threaded through ``extra_upstream_positions``) lay out as
+  a straight horizontal line because each call passes ``staged_offset_index=0``.
+* ``test_an_occupied_slot_moves_the_node_down`` — a live node on the preferred
+  spot is never covered: the next free row of that column is taken.
 * ``test_fan_out_uses_staged_offset_index`` — multiple staged adds anchored
   to the same upstream stack vertically as ``staged_offset_index`` grows.
 * ``test_no_upstream_falls_back_to_seed`` — empty ``upstream_node_ids`` →
@@ -78,9 +80,7 @@ def _make_flow_with_node(node_id: int, pos_x: float, pos_y: float) -> FlowGraph:
     return flow
 
 
-# --------------------------------------------------------------------------- #
-# Single upstream #
-# --------------------------------------------------------------------------- #
+# Single upstream
 
 
 def test_resolves_from_single_upstream() -> None:
@@ -90,25 +90,20 @@ def test_resolves_from_single_upstream() -> None:
     assert pos_y == 300.0
 
 
-# --------------------------------------------------------------------------- #
-# Chained — each new call has a different upstream #
-# --------------------------------------------------------------------------- #
+# Chained — each new call has a different upstream
 
 
 def test_chain_offsets_horizontally() -> None:
     """Chained transformations: caller passes ``staged_offset_index=0`` for
-    each call (each upstream has 0 prior siblings). Result: straight
+    each call (each upstream has 0 prior siblings) and threads the prior
+    staged adds through ``extra_upstream_positions``. Result: straight
     horizontal chain."""
-    flow = FlowGraph(flow_settings=_flow_settings(), name="chain")
-    _add_manual_input(flow, node_id=1, pos_x=0.0, pos_y=0.0)
-    _add_manual_input(flow, node_id=2, pos_x=_AUTO_LAYOUT_X_SPACING, pos_y=0.0)
-    _add_manual_input(flow, node_id=3, pos_x=2 * _AUTO_LAYOUT_X_SPACING, pos_y=0.0)
+    flow = _make_flow_with_node(node_id=1, pos_x=0.0, pos_y=0.0)
 
     p1 = _resolve_insertion_position(flow, [1], staged_offset_index=0)
-    p2 = _resolve_insertion_position(flow, [2], staged_offset_index=0)
-    p3 = _resolve_insertion_position(flow, [3], staged_offset_index=0)
+    p2 = _resolve_insertion_position(flow, [2], staged_offset_index=0, extra_upstream_positions={2: p1})
+    p3 = _resolve_insertion_position(flow, [3], staged_offset_index=0, extra_upstream_positions={2: p1, 3: p2})
 
-    # All three downstreams lay out at the same y, increasing x.
     assert {p[1] for p in (p1, p2, p3)} == {0.0}
     xs = [p[0] for p in (p1, p2, p3)]
     assert xs == sorted(xs)
@@ -116,9 +111,23 @@ def test_chain_offsets_horizontally() -> None:
     assert xs[2] - xs[1] == _AUTO_LAYOUT_X_SPACING
 
 
-# --------------------------------------------------------------------------- #
-# Fan-out — same upstream, multiple offset indices #
-# --------------------------------------------------------------------------- #
+def test_an_occupied_slot_moves_the_node_down() -> None:
+    """A live node already on the preferred spot is never covered."""
+    flow = FlowGraph(flow_settings=_flow_settings(), name="occupied")
+    _add_manual_input(flow, node_id=1, pos_x=0.0, pos_y=0.0)
+    _add_manual_input(flow, node_id=2, pos_x=_AUTO_LAYOUT_X_SPACING, pos_y=0.0)
+    assert _resolve_insertion_position(flow, [1], staged_offset_index=0) == (
+        _AUTO_LAYOUT_X_SPACING,
+        _AUTO_LAYOUT_Y_SPACING,
+    )
+    staged = {3: (_AUTO_LAYOUT_X_SPACING, _AUTO_LAYOUT_Y_SPACING)}
+    assert _resolve_insertion_position(flow, [1], staged_offset_index=0, extra_upstream_positions=staged) == (
+        _AUTO_LAYOUT_X_SPACING,
+        -_AUTO_LAYOUT_Y_SPACING,
+    )
+
+
+# Fan-out — same upstream, multiple offset indices
 
 
 def test_fan_out_uses_staged_offset_index() -> None:
@@ -135,9 +144,7 @@ def test_fan_out_uses_staged_offset_index() -> None:
     assert len({p0[1], p1[1], p2[1]}) == 3
 
 
-# --------------------------------------------------------------------------- #
-# Cold flow / fallback #
-# --------------------------------------------------------------------------- #
+# Cold flow / fallback
 
 
 def test_no_upstream_falls_back_to_seed() -> None:
@@ -154,13 +161,10 @@ def test_no_upstream_with_offset_index_stacks() -> None:
     assert p0 == (_AUTO_LAYOUT_FALLBACK_X, _AUTO_LAYOUT_FALLBACK_Y)
     assert p1 == (_AUTO_LAYOUT_FALLBACK_X, _AUTO_LAYOUT_FALLBACK_Y + _AUTO_LAYOUT_Y_SPACING)
     assert p2 == (_AUTO_LAYOUT_FALLBACK_X, _AUTO_LAYOUT_FALLBACK_Y + 2 * _AUTO_LAYOUT_Y_SPACING)
-    # Three cold-flow adds in one batch land at three distinct points.
     assert len({p0, p1, p2}) == 3
 
 
-# --------------------------------------------------------------------------- #
-# Multi-upstream picks most-recent #
-# --------------------------------------------------------------------------- #
+# Multi-upstream picks most-recent
 
 
 def test_picks_most_recent_upstream() -> None:
@@ -171,20 +175,17 @@ def test_picks_most_recent_upstream() -> None:
     _add_manual_input(flow, node_id=1, pos_x=10.0, pos_y=10.0)
     _add_manual_input(flow, node_id=2, pos_x=999.0, pos_y=888.0)
     pos_x, pos_y = _resolve_insertion_position(flow, [1, 2], staged_offset_index=0)
-    # Anchored on node 2, not node 1.
     assert pos_x == 999.0 + _AUTO_LAYOUT_X_SPACING
     assert pos_y == 888.0
 
 
-# --------------------------------------------------------------------------- #
-# Robustness #
-# --------------------------------------------------------------------------- #
+# Robustness
 
 
 def test_unknown_upstream_falls_back_to_seed() -> None:
     """Stale ``upstream_node_ids`` referencing a deleted node → resolver
     falls through to the cold-flow seed instead of raising."""
-    flow = _make_flow_with_node(node_id=1, pos_x=42.0, pos_y=42.0)
+    flow = _make_flow_with_node(node_id=1, pos_x=400.0, pos_y=400.0)
     pos_x, pos_y = _resolve_insertion_position(flow, [999], staged_offset_index=0)
     assert (pos_x, pos_y) == (_AUTO_LAYOUT_FALLBACK_X, _AUTO_LAYOUT_FALLBACK_Y)
 
@@ -197,9 +198,7 @@ def test_skips_unknown_then_uses_known_upstream() -> None:
     assert pos_y == 42.0
 
 
-# --------------------------------------------------------------------------- #
-# Canonical-constant lockstep #
-# --------------------------------------------------------------------------- #
+# Canonical-constant lockstep
 
 
 def test_uses_canonical_layout_constants() -> None:
@@ -220,9 +219,7 @@ def test_uses_canonical_layout_constants() -> None:
     assert _AUTO_LAYOUT_FALLBACK_Y == float(canonical_initial_y)
 
 
-# --------------------------------------------------------------------------- #
-# Defensive — non-numeric pos_x on upstream #
-# --------------------------------------------------------------------------- #
+# Defensive — non-numeric pos_x on upstream
 
 
 def test_non_numeric_upstream_pos_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:

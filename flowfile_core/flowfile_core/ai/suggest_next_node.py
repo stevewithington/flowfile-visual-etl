@@ -24,11 +24,18 @@ Design (mirrors the ``autocomplete`` posture):
   the ``ghost_node`` preset — if the LLM ignores the preset hint and
   proposes one anyway, it survives only if Pydantic + column-ref
   validation pass; we don't run a kernel dry-run on the ghost-node
-  hot path (latency budget is <2s TTFB).
-* Cache-only schema reads, no ``LazyFrame.collect()``.
-* When upstream schema is ``None``, ``degraded=True`` (the ghost
-  surface should never block a casual hover; users wanting to
-  populate schema for cold flows can run the upstream first).
+  path (that would need a live kernel and is out of scope for a
+  suggestion).
+* The upstream schema is computed on demand via
+  ``get_predicted_schema`` (offloaded to a thread) rather than read
+  from the raw cache — the cache is nulled on every settings edit, so
+  a bare read is almost always ``None`` at trigger time and the
+  surface would degrade before ever calling the LLM. Schema prediction
+  is a lazy ``collect_schema`` (no full-data ``LazyFrame.collect()``),
+  matching every other AI surface (context builder, planner, predictor,
+  live observation).
+* When the upstream schema can't be predicted at all, ``degraded=True``
+  with reason ``upstream_schema_unknown`` (run the upstream first).
 
 Wire-layer note: ``node_type`` is the un-namespaced flowfile name
 (``"filter"``), not the MCP-shaped tool name. The catalog uses
@@ -75,25 +82,19 @@ logger = logging.getLogger(__name__)
 
 
 SURFACE: str = "ghost_node"
-"""The ``SurfaceLiteral`` value the ghost-node surface emits — kept as
-a constant so call sites and test assertions stay in lock-step."""
 
-DEFAULT_TIMEOUT_SECONDS: float = 3.5
-"""Hard timeout per call. TTFB <2s, total <4s — leaves ~500 ms of
-headroom for the route/scheduler/serdes overhead before the user
-perceives the hover as stale."""
+DEFAULT_TIMEOUT_SECONDS: float = 20.0
+"""Generous by design: this is a deliberate right-click action (not a hover),
+so the user is willing to wait for a slower provider/model rather than see a
+premature "AI took too long" degrade."""
 
 MAX_SUGGESTIONS: int = 3
 """§3.3 spec: top-3 by upstream-schema fit."""
 
 MAX_TOKENS: int = 1024
-"""Generous-but-bounded — three candidates with full settings JSON
-typically fit well under 700 tokens; we add slack for the rationale field."""
 
 
-# --------------------------------------------------------------------------- #
-# Wire types                                                                   #
-# --------------------------------------------------------------------------- #
+# Wire types
 
 
 class NextNodeSuggestion(BaseModel):
@@ -107,20 +108,11 @@ class NextNodeSuggestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     node_type: str
-    """Un-namespaced flowfile node type (e.g. ``"filter"``).
-    Always one of the entries in the ``ghost_node`` ``SURFACE_PRESETS``."""
     settings: dict[str, Any]
-    """Validated settings payload — already model_dump'd through the matching
-    Pydantic class so it round-trips back to the real-graph add path."""
     label: str
-    """Short human label rendered in the ghost popover (e.g. ``"Filter rows
-    where region == 'EU'"``)."""
     description: str | None = None
     """One-line elaboration; optional — cheap providers tend to skip it."""
     predicted_output_schema: list[dict[str, Any]] | None = None
-    """Result of ``predict_schema_via_mirror`` if available; ``None`` when
-    the node is dynamic / source-without-callback / mirror-prediction failed.
-    The frontend can show downstream-friendly schema previews when present."""
     rationale: str | None = None
     """The LLM's reasoning for why this node fits. Optional."""
 
@@ -128,13 +120,9 @@ class NextNodeSuggestion(BaseModel):
 class NextNodeSuggestionsResponse(BaseModel):
     suggestions: list[NextNodeSuggestion] = Field(default_factory=list)
     degraded: bool = False
-    """``True`` when no real suggestions were produced (cold upstream,
-    timeout, parse error, all candidates filtered, etc.) — frontend hides
-    the popover. ``reason`` carries a stable string for analytics."""
     reason: str | None = None
 
 
-# Internal: shape the LLM is asked to return.
 class _LLMSuggestion(BaseModel):
     """Subset of ``NextNodeSuggestion`` the LLM emits.
 
@@ -158,9 +146,7 @@ class _LLMOutput(BaseModel):
     suggestions: list[_LLMSuggestion] = Field(default_factory=list)
 
 
-# --------------------------------------------------------------------------- #
-# Surface preset → candidate node-type set                                     #
-# --------------------------------------------------------------------------- #
+# Surface preset → candidate node-type set
 
 
 def _allowed_node_types() -> frozenset[str]:
@@ -187,37 +173,62 @@ def _allowed_node_types() -> frozenset[str]:
 _ALLOWED_NODE_TYPES: frozenset[str] = _allowed_node_types()
 
 
-# --------------------------------------------------------------------------- #
-# Schema lookup                                                                #
-# --------------------------------------------------------------------------- #
+# Schema lookup
 
 
-def _column_names_for_node(node: FlowNode | None) -> list[str] | None:
-    """Return predicted column names, or ``None`` if unknown / missing.
+async def _predicted_columns_for_node(node: FlowNode | None) -> list[FlowfileColumn] | None:
+    """Return the upstream node's predicted output schema, computing it on
+    demand when the cache is cold.
 
-    Schema-only path, no force-recompute. Cold upstreams propagate as
-    ``None`` to the caller's degraded branch.
+    Every other AI surface calls ``get_predicted_schema`` rather than reading
+    ``node_schema.predicted_schema`` directly, because ``reset()`` nulls that
+    cache on every settings edit — a bare read is almost always ``None`` at
+    trigger time. Schema prediction is a lazy ``collect_schema`` (no full-data
+    ``LazyFrame.collect()``); we offload it to a thread so the async route
+    never blocks the event loop, and degrade cleanly to ``None`` on any error.
     """
     if node is None:
         return None
-    schema: list[FlowfileColumn] | None = node.node_schema.predicted_schema
-    if not schema:
+    try:
+        schema: list[FlowfileColumn] | None = await asyncio.to_thread(node.get_predicted_schema)
+    except Exception as exc:  # noqa: BLE001 — a cold/broken upstream degrades, never raises
+        logger.debug("suggest_next_node: get_predicted_schema failed: %s", exc)
         return None
-    return [col.column_name for col in schema]
-
-
-def _columns_for_node(node: FlowNode | None) -> list[FlowfileColumn] | None:
-    if node is None:
-        return None
-    schema: list[FlowfileColumn] | None = node.node_schema.predicted_schema
     if not schema:
         return None
     return list(schema)
 
 
-# --------------------------------------------------------------------------- #
-# Prompt construction                                                          #
-# --------------------------------------------------------------------------- #
+# Prompt construction
+
+
+# Worked settings shapes shown to the LLM so it emits the correct nested
+# structure per node type — without these, a cheap model guesses the shape and
+# every candidate fails Pydantic validation. Scoped to the single-input
+# transforms (join/union need a second input that a "next node after this one"
+# can't wire, so they're not exemplified). The illustrative columns are
+# replaced with real upstream columns at generation time. ``flow_id`` /
+# ``node_id`` are omitted on purpose — they're injected server-side before
+# validation (see ``_validate_candidate``). Validated against the settings
+# classes by ``test_ghost_settings_examples_are_valid``.
+_GHOST_SETTINGS_EXAMPLES: dict[str, dict[str, Any]] = {
+    "filter": {"filter_input": {"mode": "basic", "basic_filter": {"field": "region", "operator": "==", "value": "EU"}}},
+    "select": {"select_input": [{"old_name": "region", "new_name": "region", "keep": True}]},
+    "sort": {"sort_input": [{"column": "amount", "how": "desc"}]},
+    "formula": {"function": {"field": {"name": "total", "data_type": "Float64"}, "function": "[amount] * 1.1"}},
+    "group_by": {
+        "groupby_input": {
+            "agg_cols": [
+                {"old_name": "region", "agg": "groupby"},
+                {"old_name": "amount", "agg": "sum", "new_name": "total_amount"},
+            ]
+        }
+    },
+}
+
+
+def _format_settings_examples() -> str:
+    return "\n".join(f"{node_type}: {json.dumps(example)}" for node_type, example in _GHOST_SETTINGS_EXAMPLES.items())
 
 
 _SYSTEM_PROMPT = """\
@@ -228,7 +239,7 @@ Output a single JSON object — no prose, no code blocks. Shape:
 
   {"suggestions": [
      {"node_type": "<one of the allowed types>",
-      "settings": { ... pydantic-valid settings for that node type ... },
+      "settings": { ... settings matching the shape for that node type ... },
       "label": "<short imperative label, max 50 chars>",
       "description": "<one-line elaboration, optional>",
       "rationale": "<why this fits, optional>"}
@@ -238,14 +249,20 @@ Hard rules:
 
 * `node_type` MUST be one of: {{ALLOWED_TYPES}}. Reject any other value;
   the user has scoped this surface to fast in-flow editing.
-* `settings` MUST validate against the Pydantic class for that node type.
-  When unsure of a field, omit it and let the default apply.
+* `settings` MUST copy the exact shape shown for that node type below,
+  substituting real upstream column names. Do NOT include `flow_id` or
+  `node_id` — they are filled in automatically.
 * You MAY only reference columns from the upstream schema you're given.
   Do not invent column names. Match capitalisation exactly.
 * Keep `label` short (<50 chars). Order suggestions by relevance —
-  most-likely-fit first.
-* Return at most {{MAX_SUGGESTIONS}} suggestions. If no plausible
-  suggestion exists, return `{"suggestions": []}`.
+  most-likely-fit first. Prefer the shapes below; if none fits the schema,
+  return `{"suggestions": []}`.
+* Return at most {{MAX_SUGGESTIONS}} suggestions.
+
+Settings shapes (copy these structures exactly; the example columns like
+"region"/"amount" are illustrative — replace them with real upstream columns):
+
+{{SETTINGS_EXAMPLES}}
 """
 
 
@@ -273,16 +290,18 @@ def _build_messages(
     # prompt use literal ``{`` / ``}``, which would be interpreted as
     # format placeholders. Same posture as the autocomplete path.
     allowed = ", ".join(sorted(_ALLOWED_NODE_TYPES))
-    system = _SYSTEM_PROMPT.replace("{{ALLOWED_TYPES}}", allowed).replace("{{MAX_SUGGESTIONS}}", str(max_suggestions))
+    system = (
+        _SYSTEM_PROMPT.replace("{{ALLOWED_TYPES}}", allowed)
+        .replace("{{MAX_SUGGESTIONS}}", str(max_suggestions))
+        .replace("{{SETTINGS_EXAMPLES}}", _format_settings_examples())
+    )
     return [
         Message(role="system", content=system),
         Message(role="user", content="\n".join(user_lines)),
     ]
 
 
-# --------------------------------------------------------------------------- #
-# Provider call wrapper                                                        #
-# --------------------------------------------------------------------------- #
+# Provider call wrapper
 
 
 async def _call_provider_for_json(
@@ -341,9 +360,7 @@ def _parse_json_payload(content: str | None) -> tuple[Any, str | None]:
     return None, "parse_error"
 
 
-# --------------------------------------------------------------------------- #
-# Candidate validation                                                         #
-# --------------------------------------------------------------------------- #
+# Candidate validation
 
 
 def _validate_candidate(
@@ -365,7 +382,6 @@ def _validate_candidate(
     by design — the user shouldn't see hallucinated suggestions in the
     popover, and a degraded popover is preferable to a noisy one.
     """
-    # 1. Allowed node type.
     if candidate.node_type not in _ALLOWED_NODE_TYPES:
         logger.debug(
             "ghost_node candidate rejected: %s not in ghost_node preset",
@@ -373,7 +389,6 @@ def _validate_candidate(
         )
         return None
 
-    # 2. Pydantic settings validation.
     settings_cls = get_settings_class_for_node_type(candidate.node_type)
     if settings_cls is None:
         # Defensive — _ALLOWED_NODE_TYPES is derived from the preset which is
@@ -381,8 +396,14 @@ def _validate_candidate(
         # effectively unreachable. Log if it fires.
         logger.debug("ghost_node candidate rejected: no settings class for %s", candidate.node_type)
         return None
+    # ``flow_id``/``node_id`` are required graph-structural ids the LLM can't
+    # know and consistently omits; the frontend overwrites them on materialise
+    # anyway. Inject placeholders so a correct-shaped candidate isn't dropped
+    # for lacking them (executor-seam normalisation — leniency lives here, not
+    # in the strict schema or the prompt). LLM-provided ids still win.
+    settings_payload = {"flow_id": 0, "node_id": 0, **candidate.settings}
     try:
-        settings_obj = settings_cls.model_validate(candidate.settings)
+        settings_obj = settings_cls.model_validate(settings_payload)
     except ValidationError as exc:
         logger.debug(
             "ghost_node candidate rejected: settings validation failed for %s: %s",
@@ -391,7 +412,6 @@ def _validate_candidate(
         )
         return None
 
-    # 3. Column-ref validation against upstream.
     if upstream_columns:
         refs = collect_column_refs(candidate.node_type, settings_obj)
         if refs:
@@ -404,7 +424,6 @@ def _validate_candidate(
                 )
                 return None
 
-    # 4. Predicted schema via mirror (best-effort).
     predicted_dicts: list[dict[str, Any]] | None = None
     if is_predictable_via_mirror(candidate.node_type) and upstream_columns_full is not None:
         try:
@@ -435,9 +454,7 @@ def _validate_candidate(
     )
 
 
-# --------------------------------------------------------------------------- #
-# Public API                                                                   #
-# --------------------------------------------------------------------------- #
+# Public API
 
 
 async def suggest_next_node(
@@ -459,7 +476,6 @@ async def suggest_next_node(
     started = time.monotonic()
 
     upstream_node = graph.get_node(upstream_node_id)
-    upstream_columns = _column_names_for_node(upstream_node)
 
     if upstream_node is None:
         latency_ms = int((time.monotonic() - started) * 1000)
@@ -473,10 +489,12 @@ async def suggest_next_node(
         return NextNodeSuggestionsResponse(
             suggestions=[],
             degraded=True,
-            reason="Upstream node not found.",
+            reason="missing_upstream",
         )
 
-    if upstream_columns is None:
+    upstream_columns_full = await _predicted_columns_for_node(upstream_node)
+
+    if not upstream_columns_full:
         latency_ms = int((time.monotonic() - started) * 1000)
         record_autocomplete_call(
             surface=SURFACE,
@@ -488,10 +506,10 @@ async def suggest_next_node(
         return NextNodeSuggestionsResponse(
             suggestions=[],
             degraded=True,
-            reason="Upstream schema unknown — run the upstream node first.",
+            reason="upstream_schema_unknown",
         )
 
-    upstream_columns_full = _columns_for_node(upstream_node)
+    upstream_columns = [col.column_name for col in upstream_columns_full]
 
     # Cap on input + treat values <=0 as the default.
     effective_max = max(1, min(max_suggestions, MAX_SUGGESTIONS * 2))

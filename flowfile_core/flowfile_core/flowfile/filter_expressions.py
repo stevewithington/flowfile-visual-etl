@@ -16,6 +16,32 @@ if TYPE_CHECKING:
 
 from flowfile_core.schemas.transform_schema import FilterOperator
 
+_COMPARISON_OPERATORS = frozenset(
+    {
+        FilterOperator.EQUALS,
+        FilterOperator.NOT_EQUALS,
+        FilterOperator.GREATER_THAN,
+        FilterOperator.GREATER_THAN_OR_EQUALS,
+        FilterOperator.LESS_THAN,
+        FilterOperator.LESS_THAN_OR_EQUALS,
+    }
+)
+
+_NATIVE_MEMBERSHIP_BASE_DTYPES = frozenset(
+    {
+        "Int8",
+        "Int16",
+        "Int32",
+        "Int64",
+        "Int128",
+        "Float64",
+        "String",
+        "Categorical",
+        "Date",
+    }
+)
+_NATIVE_MEMBERSHIP_DATETIME = "Datetime(time_unit='us', time_zone=None)"
+
 
 def _is_numeric_string(value: str) -> bool:
     """Check if a string value represents a numeric value.
@@ -45,14 +71,60 @@ def _should_quote_value(value: str, field_data_type: str | None) -> bool:
     Returns:
         True if the value should be quoted, False otherwise.
     """
-    # If field is explicitly string type, always quote
     if field_data_type == "str":
         return True
-    # If field is explicitly numeric type, never quote
     if field_data_type == "numeric":
         return False
-    # Otherwise, quote if the value doesn't look numeric
     return not _is_numeric_string(value)
+
+
+def resolve_filter_field_type(column) -> str | None:
+    """The ``field_data_type`` a column needs: "str", "numeric", "date", "datetime" or None.
+
+    ``generic_datatype`` lumps Date, Datetime and Time together (and misses a
+    parametrized ``Datetime(time_unit=...)``), but the literal a comparison needs
+    differs per dtype, so the base dtype token decides for temporal columns.
+    """
+    base = str(column.data_type).split("(", 1)[0]
+    if base == "Date":
+        return "date"
+    if base == "Datetime":
+        return "datetime"
+    return column.generic_datatype()
+
+
+def supports_native_membership(column) -> bool:
+    """Whether ``[col] in (...)`` keeps exactly the rows the ``=`` / ``!=`` chain keeps on this column.
+
+    ``is_in`` does not cast its members to the column's dtype the way a comparison does: a Float32
+    column misses ``0.1``, a non-microsecond Datetime misses or rejects a ``to_datetime`` member, an
+    Enum rejects a value outside its categories, a Boolean column rejects ``1`` / ``0``, an unsigned
+    column treats a negative member differently and a Decimal column (resolved as "str") rejects
+    its quoted members. Those dtypes, and any not listed, keep the chain.
+    """
+    data_type = str(column.data_type)
+    return data_type == _NATIVE_MEMBERSHIP_DATETIME or data_type.split("(", 1)[0] in _NATIVE_MEMBERSHIP_BASE_DTYPES
+
+
+def _normalize_datetime_value(value: str) -> str:
+    """Bring a typed or ISO datetime into the ``%Y-%m-%d %H:%M:%S`` shape ``to_datetime`` parses."""
+    value = value.strip().replace("T", " ", 1)
+    if len(value) == 10:
+        return f"{value} 00:00:00"
+    if len(value) == 16:
+        return f"{value}:00"
+    return value
+
+
+def _render_value(value: str, field_data_type: str | None) -> str:
+    """The literal to embed for ``value``: a temporal parse call, a quoted string or a bare number."""
+    if field_data_type == "date":
+        return f'to_date("{value.strip()}")'
+    if field_data_type == "datetime":
+        return f'to_datetime("{_normalize_datetime_value(value)}")'
+    if _should_quote_value(value, field_data_type):
+        return f'"{value}"'
+    return value
 
 
 def _format_field(field_name: str) -> str:
@@ -144,56 +216,52 @@ def _build_is_not_null_expression(field: str) -> str:
     return f"is_not_empty({field})"
 
 
-def _build_in_expression(field: str, value: str, field_data_type: str | None) -> str:
+def _build_in_expression(field: str, value: str, field_data_type: str | None, native: bool = False) -> str:
     """Build an IN expression for matching any of multiple values.
 
     Args:
         field: The formatted field name.
         value: Comma-separated list of values.
         field_data_type: The data type of the field.
+        native: Emit ``[field] in (a, b)`` instead of an OR chain. Only pass True when
+            ``supports_native_membership`` holds for the column. An empty bare member keeps the
+            chain, because the parser silently ends an ``in (...)`` list at one.
 
     Returns:
-        An OR-combined expression for each value.
+        A membership test, or an OR-combined expression for each value.
     """
     values = [v.strip() for v in value.split(",")]
     if len(values) == 1:
-        should_quote = _should_quote_value(values[0], field_data_type)
-        return _build_equals_expression(field, values[0], should_quote)
+        return _build_equals_expression(field, _render_value(values[0], field_data_type), False)
 
-    conditions = []
-    for v in values:
-        should_quote = _should_quote_value(v, field_data_type)
-        if should_quote:
-            conditions.append(f'({field}="{v}")')
-        else:
-            conditions.append(f"({field}={v})")
-    return " | ".join(conditions)
+    members = [_render_value(v, field_data_type) for v in values]
+    if native and all(members):
+        return f"{field} in ({', '.join(members)})"
+    return " | ".join(f"({field}={m})" for m in members)
 
 
-def _build_not_in_expression(field: str, value: str, field_data_type: str | None) -> str:
+def _build_not_in_expression(field: str, value: str, field_data_type: str | None, native: bool = False) -> str:
     """Build a NOT IN expression for excluding multiple values.
 
     Args:
         field: The formatted field name.
         value: Comma-separated list of values.
         field_data_type: The data type of the field.
+        native: Emit ``[field] not in (a, b)`` instead of an AND chain. Only pass True when
+            ``supports_native_membership`` holds for the column. An empty bare member keeps the
+            chain, because the parser silently ends an ``in (...)`` list at one.
 
     Returns:
-        An AND-combined expression for each value.
+        A negated membership test, or an AND-combined expression for each value.
     """
     values = [v.strip() for v in value.split(",")]
     if len(values) == 1:
-        should_quote = _should_quote_value(values[0], field_data_type)
-        return _build_not_equals_expression(field, values[0], should_quote)
+        return _build_not_equals_expression(field, _render_value(values[0], field_data_type), False)
 
-    conditions = []
-    for v in values:
-        should_quote = _should_quote_value(v, field_data_type)
-        if should_quote:
-            conditions.append(f'({field}!="{v}")')
-        else:
-            conditions.append(f"({field}!={v})")
-    return " & ".join(conditions)
+    members = [_render_value(v, field_data_type) for v in values]
+    if native and all(members):
+        return f"{field} not in ({', '.join(members)})"
+    return " & ".join(f"({field}!={m})" for m in members)
 
 
 def _build_between_expression(field: str, value: str, value2: str, field_data_type: str | None) -> str:
@@ -214,31 +282,26 @@ def _build_between_expression(field: str, value: str, value2: str, field_data_ty
     if value2 is None:
         raise ValueError("BETWEEN operator requires value2")
 
-    should_quote_v1 = _should_quote_value(value, field_data_type)
-    should_quote_v2 = _should_quote_value(value2, field_data_type)
-
-    if should_quote_v1:
-        lower = f'({field}>="{value}")'
-    else:
-        lower = f"({field}>={value})"
-
-    if should_quote_v2:
-        upper = f'({field}<="{value2}")'
-    else:
-        upper = f"({field}<={value2})"
-
+    lower = f"({field}>={_render_value(value, field_data_type)})"
+    upper = f"({field}<={_render_value(value2, field_data_type)})"
     return f"{lower} & {upper}"
 
 
-def build_filter_expression(basic_filter: BasicFilter, field_data_type: str | None = None) -> str:
+def build_filter_expression(
+    basic_filter: BasicFilter, field_data_type: str | None = None, native_membership: bool = False
+) -> str:
     """Build a filter expression string from a BasicFilter object.
 
     Uses the Flowfile expression language that is compatible with polars_expr_transformer.
 
     Args:
         basic_filter: The basic filter configuration.
-        field_data_type: The data type of the field ("str", "numeric", "date", or None).
-            If None, the type is inferred from the value.
+        field_data_type: The data type of the field ("str", "numeric", "date", "datetime", or None).
+            If None, the type is inferred from the value. Date and datetime columns wrap the
+            value in ``to_date``/``to_datetime`` so the comparison is typed.
+        native_membership: Render a multi-value IN / NOT_IN as ``[field] in (...)`` /
+            ``[field] not in (...)`` instead of an ``=`` / ``!=`` chain. Pass
+            ``supports_native_membership(column)``.
 
     Returns:
         A filter expression string compatible with polars_expr_transformer.
@@ -266,26 +329,26 @@ def build_filter_expression(basic_filter: BasicFilter, field_data_type: str | No
     except (ValueError, AttributeError):
         operator = FilterOperator.from_symbol(str(basic_filter.operator))
 
-    # For simple comparison operators, determine quoting based on the single value
-    should_quote = _should_quote_value(value, field_data_type)
+    if operator in _COMPARISON_OPERATORS:
+        value = _render_value(value, field_data_type)
 
     if operator == FilterOperator.EQUALS:
-        return _build_equals_expression(field, value, should_quote)
+        return _build_equals_expression(field, value, False)
 
     elif operator == FilterOperator.NOT_EQUALS:
-        return _build_not_equals_expression(field, value, should_quote)
+        return _build_not_equals_expression(field, value, False)
 
     elif operator == FilterOperator.GREATER_THAN:
-        return _build_greater_than_expression(field, value, should_quote)
+        return _build_greater_than_expression(field, value, False)
 
     elif operator == FilterOperator.GREATER_THAN_OR_EQUALS:
-        return _build_greater_than_or_equals_expression(field, value, should_quote)
+        return _build_greater_than_or_equals_expression(field, value, False)
 
     elif operator == FilterOperator.LESS_THAN:
-        return _build_less_than_expression(field, value, should_quote)
+        return _build_less_than_expression(field, value, False)
 
     elif operator == FilterOperator.LESS_THAN_OR_EQUALS:
-        return _build_less_than_or_equals_expression(field, value, should_quote)
+        return _build_less_than_or_equals_expression(field, value, False)
 
     elif operator == FilterOperator.CONTAINS:
         return _build_contains_expression(field, value)
@@ -306,16 +369,14 @@ def build_filter_expression(basic_filter: BasicFilter, field_data_type: str | No
         return _build_is_not_null_expression(field)
 
     elif operator == FilterOperator.IN:
-        return _build_in_expression(field, value, field_data_type)
+        return _build_in_expression(field, value, field_data_type, native_membership)
 
     elif operator == FilterOperator.NOT_IN:
-        return _build_not_in_expression(field, value, field_data_type)
+        return _build_not_in_expression(field, value, field_data_type, native_membership)
 
     elif operator == FilterOperator.BETWEEN:
         return _build_between_expression(field, value, value2, field_data_type)
 
     else:
         # Fallback for unknown operators - use legacy format
-        if should_quote:
-            return f'{field}{operator.to_symbol()}"{value}"'
-        return f"{field}{operator.to_symbol()}{value}"
+        return f"{field}{operator.to_symbol()}{_render_value(value, field_data_type)}"

@@ -1,6 +1,7 @@
 import { computed, ref, watch, type ComputedRef, type Ref } from "vue";
 import { CatalogApi } from "../api/catalog.api";
 import type { ColumnSchema, ColumnStatsResponse, DashboardLayout } from "../types";
+import type { TileField } from "./useDashboardComputation";
 
 export interface DashboardDatasource {
   id: number;
@@ -29,8 +30,10 @@ export function useDashboardDatasources(
   const tableCache = ref<Record<number, DashboardDatasource>>({});
   const loading = ref(false);
 
-  const fetchViz = async (vizId: number) => {
-    if (vizId in vizToTable.value) return;
+  // Force refetches assign on resolve (never clear-then-fetch): a transient
+  // null datasource would change tiles' filterKey and double-remount them.
+  const fetchViz = async (vizId: number, force = false) => {
+    if (!force && vizId in vizToTable.value) return;
     try {
       const viz = await CatalogApi.getVisualization(vizId);
       vizToTable.value[vizId] =
@@ -38,12 +41,12 @@ export function useDashboardDatasources(
       vizNameById.value[vizId] = viz.name;
     } catch (err) {
       console.warn(`[dashboard] could not fetch viz ${vizId}:`, err);
-      vizToTable.value[vizId] = null;
+      if (!(vizId in vizToTable.value)) vizToTable.value[vizId] = null;
     }
   };
 
-  const fetchTable = async (tableId: number) => {
-    if (tableId in tableCache.value) return;
+  const fetchTable = async (tableId: number, force = false) => {
+    if (!force && tableId in tableCache.value) return;
     try {
       const table = await CatalogApi.getTable(tableId);
       tableCache.value[tableId] = {
@@ -56,7 +59,33 @@ export function useDashboardDatasources(
     }
   };
 
-  const refresh = async () => {
+  // (table_id, column_name) -> stats. Promise caching dedupes concurrent
+  // requests; the resolved Promise stays in the cache so subsequent
+  // lookups are synchronous.
+  const statsCache = new Map<string, Promise<ColumnStatsResponse>>();
+  const statsKey = (tableId: number, column: string) => `${tableId}:${column}`;
+
+  // viz_id → columns of the viz's data; filled on demand by loadTileFields
+  const vizFields = ref<Record<number, TileField[]>>({});
+
+  const fetchFields = async (vizId: number) => {
+    if (vizId in vizFields.value) return;
+    try {
+      const resp = await CatalogApi.getSavedVisualizationFields(vizId);
+      vizFields.value[vizId] = (resp.fields ?? []).map((f) => ({
+        fid: String(f.fid),
+        semanticType: f.semanticType,
+      }));
+    } catch (err) {
+      console.warn(`[dashboard] could not fetch fields for viz ${vizId}:`, err);
+    }
+  };
+
+  const refresh = async (force = false) => {
+    if (force) {
+      statsCache.clear();
+      vizFields.value = {};
+    }
     const vizIds = Array.from(
       new Set(
         layout.value.tiles.map((t) => t.viz_id).filter((id): id is number => id != null),
@@ -64,7 +93,7 @@ export function useDashboardDatasources(
     );
     loading.value = true;
     try {
-      await Promise.all(vizIds.map(fetchViz));
+      await Promise.all(vizIds.map((id) => fetchViz(id, force)));
       const tableIds = Array.from(
         new Set(
           vizIds
@@ -72,7 +101,7 @@ export function useDashboardDatasources(
             .filter((id): id is number => id != null),
         ),
       );
-      await Promise.all(tableIds.map(fetchTable));
+      await Promise.all(tableIds.map((id) => fetchTable(id, force)));
     } finally {
       loading.value = false;
     }
@@ -110,6 +139,11 @@ export function useDashboardDatasources(
     return acc;
   });
 
+  /** Every tile that renders a visualization, whatever its source. */
+  const vizTileIds = computed<string[]>(() =>
+    layout.value.tiles.filter((t) => t.viz_id != null).map((t) => t.id),
+  );
+
   const tileDatasource = (tileId: string): number | null => {
     const tile = layout.value.tiles.find((t) => t.id === tileId);
     if (!tile || tile.viz_id == null) return null;
@@ -121,12 +155,6 @@ export function useDashboardDatasources(
 
   const getDatasource = (tableId: number): DashboardDatasource | null =>
     tableCache.value[tableId] ?? null;
-
-  // (table_id, column_name) -> stats. Promise caching dedupes concurrent
-  // requests; the resolved Promise stays in the cache so subsequent
-  // lookups are synchronous.
-  const statsCache = new Map<string, Promise<ColumnStatsResponse>>();
-  const statsKey = (tableId: number, column: string) => `${tableId}:${column}`;
 
   const getColumnStats = (
     tableId: number,
@@ -147,18 +175,38 @@ export function useDashboardDatasources(
     return entry;
   };
 
+  /** Columns of every viz tile, for the filter dialog's reach preview. */
+  const loadTileFields = async () => {
+    const vizIds = Array.from(
+      new Set(layout.value.tiles.map((t) => t.viz_id).filter((id): id is number => id != null)),
+    );
+    await Promise.all(vizIds.map((id) => fetchFields(id)));
+  };
+
+  const tileFields = (tileId: string): TileField[] | null => {
+    const tile = layout.value.tiles.find((t) => t.id === tileId);
+    if (!tile || tile.viz_id == null) return null;
+    return vizFields.value[tile.viz_id] ?? null;
+  };
+
   const tileLabel = (tileId: string): string => {
     const tile = layout.value.tiles.find((t) => t.id === tileId);
     if (!tile) return tileId;
     if (tile.type === "text") return "Text tile";
-    if (tile.viz_id == null) return `Tile ${tileId.slice(0, 6)}`;
-    return vizNameById.value[tile.viz_id] ?? `Viz #${tile.viz_id}`;
+    if (tile.type === "separator") return "Separator";
+    if (tile.type === "kpi" && tile.kpi?.label) return tile.kpi.label;
+    if (tile.viz_id == null) return tile.type === "kpi" ? "KPI" : `Tile ${tileId.slice(0, 6)}`;
+    const vizName = vizNameById.value[tile.viz_id] ?? `Viz #${tile.viz_id}`;
+    return tile.type === "kpi" ? `KPI · ${vizName}` : vizName;
   };
 
   return {
     datasourcesInUse,
     tilesByDatasource,
+    vizTileIds,
     tileDatasource,
+    tileFields,
+    loadTileFields,
     tileLabel,
     getSchema,
     getDatasource,

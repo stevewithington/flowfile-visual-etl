@@ -33,12 +33,6 @@ export interface DesignerSection {
   components: DesignerComponent[];
 }
 
-/** Validation error structure */
-export interface ValidationError {
-  field: string;
-  message: string;
-}
-
 /** Custom node info from the backend */
 export interface CustomNodeInfo {
   file_name: string;
@@ -47,6 +41,11 @@ export interface CustomNodeInfo {
   title: string;
   intro: string;
   node_icon: string;
+  node_key?: string;
+  environment?: "local" | "kernel";
+  source_hash?: string;
+  tags?: string[];
+  error?: string | null;
 }
 
 /** Icon info from the backend */

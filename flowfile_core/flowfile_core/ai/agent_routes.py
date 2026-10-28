@@ -49,14 +49,18 @@ from flowfile_core import flow_file_handler
 from flowfile_core.ai import sessions
 from flowfile_core.ai.agents.planner import (
     DEFAULT_MAX_RETRIES_PER_STEP,
-    DEFAULT_MAX_STEPS,
     DEFAULT_MAX_TOKENS,
+    MAX_STEPS_HARD_CAP,
     FollowupAction,
     inject_followup_message,
     run_planner_session,
 )
 from flowfile_core.ai.byok import ProviderNotConfiguredError, get_configured_provider
-from flowfile_core.ai.providers.registry import PROVIDERS, UnknownProviderError
+from flowfile_core.ai.providers.registry import (
+    LOCAL_PROVIDER_ID,
+    PROVIDERS,
+    UnknownProviderError,
+)
 from flowfile_core.ai.replay_buffer import default_replay_buffer
 from flowfile_core.ai.streaming import (
     make_streaming_response,
@@ -70,9 +74,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# --------------------------------------------------------------------------- #
-# Request / response shapes                                                    #
-# --------------------------------------------------------------------------- #
+# Request / response shapes
 
 
 class AgentStartRequest(BaseModel):
@@ -83,54 +85,16 @@ class AgentStartRequest(BaseModel):
     flow_id: int = Field(ge=0)
     prompt: str = Field(min_length=1, max_length=5_000)
     surface: Literal["agent_complex", "agent_staged", "agent_live"] = "agent_staged"
-    """Defaults to ``agent_staged`` (multi-stage state machine).
-    Big-model power users can opt into ``agent_complex`` (single-shot
-    full catalog) by passing it explicitly.
-    A third option ``agent_live`` mirrors the ``agent_staged`` state
-    machine but applies each step LIVE to the canvas (mode=apply, not
-    stage), runs the affected subgraph (Performance) or evaluates a
-    sample (Development), and feeds the runtime observation back to
-    the LLM. Auto-undoes the just-added node on runtime failure and
-    retries up to 3×."""
     samples_mode: Literal["off", "regex"] = "off"
     provider: str = Field(default="anthropic", min_length=1)
     model: str | None = None
-    max_steps: int = Field(default=DEFAULT_MAX_STEPS, ge=1, le=64)
+    max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS_HARD_CAP)
     max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=64, le=16_384)
     max_retries_per_step: int = Field(default=DEFAULT_MAX_RETRIES_PER_STEP, ge=1, le=8)
     session_id: str | None = None
-    """If supplied, the session reuses this id instead of auto-generating one
-    — useful for clients that want to pre-allocate session ids for routing.
-    Must not collide with an existing session for any user."""
     selected_node_ids: list[int] | None = None
-    """Node ids the user has selected on the canvas at start time.
-    Read by the planner's ``_resolve_insertion_context`` as a fallback
-    upstream signal when the LLM does not emit an explicit
-    ``upstream_node_ids`` arg. ``None`` and empty list both resolve to
-    "no selection" — the resolver will refuse on ambiguity rather than
-    guess. Frontend reads this from the live flow store at start
-    time."""
     skip_plan: bool = False
-    """When True, the agent_staged / agent_live state machine starts
-    at ``stage="classify"`` instead of the default ``stage="plan"``.
-    The auto-promote-from-chat path (``_dispatchPromotedAgent`` in
-    the frontend) sets this to True because the chat-mode response
-    that preceded the promotion already produced a plan-shaped
-    narrative; emitting a fresh plan would cost an extra round and
-    duplicate the chat-mode output. Direct agent runs (user typed
-    with the
-    agent toggle on) leave this False so the plan stage fires."""
     verify_plan_completion: bool = False
-    """Opt-in: when True, after classify picks ``op_kind="other"``
-    (intending to terminate), the planner runs ONE extra round at
-    ``stage="verify_completion"``. The LLM sees a single tool
-    ``flowfile.meta.verify_completion``, walks the chat-mode plan as
-    an authoritative checklist, and either terminates the loop
-    (``is_complete=true``) or sends control back to ``classify`` for
-    another op (``is_complete=false``). Default off because of the
-    extra LLM round per run; users opt in via a frontend toggle when
-    they've seen the agent terminate prematurely on multi-step plans
-    (e.g. add a node mid-flow but skip the rewires)."""
 
 
 class AgentResumeRequest(BaseModel):
@@ -192,26 +156,13 @@ class AgentStateResponse(BaseModel):
     pause_reason: str | None
     drift_detail: sessions.DriftDetail | None
     stage: sessions.PlannerStage
-    """Current state-machine stage for ``agent_staged`` sessions.
-    Stays at ``"classify"`` for ``agent_complex`` (which doesn't drive
-    transitions). The frontend reads this to render *"Step 1/4:
-    classifying intent"* etc. on the agent panel."""
     picked_op_kind: sessions.PlannerOpKind | None
-    """Op kind chosen by the stage-0 ``classify_intent`` call,
-    surfaced so the UI can show the in-flight intent (*"Adding a
-    node…"* vs *"Modifying node 3…"*). ``None`` until classify
-    resolves."""
     picked_node_type: str | None
-    """Node type chosen by stage 1's ``pick_node_type`` call. Surfaced
-    so the UI can show the in-flight node type. ``None`` until
-    pick_type resolves; reset to ``None`` after each successful add."""
     created_at: str
     updated_at: str
 
 
-# --------------------------------------------------------------------------- #
-# Helpers                                                                      #
-# --------------------------------------------------------------------------- #
+# Helpers
 
 
 def _ensure_known_provider(name: str) -> None:
@@ -222,8 +173,8 @@ def _ensure_known_provider(name: str) -> None:
         )
 
 
-def _resolve_flow(flow_id: int):
-    flow = flow_file_handler.get_flow(flow_id)
+def _resolve_flow(flow_id: int, user_id: int):
+    flow = flow_file_handler.get_flow(flow_id, user_id)
     if flow is None:
         raise HTTPException(status_code=404, detail=f"Flow {flow_id} not found")
     return flow
@@ -281,9 +232,7 @@ def _looks_cold_started(session: sessions.AgentSession) -> bool:
     return delta > 45.0
 
 
-# --------------------------------------------------------------------------- #
-# Routes                                                                       #
-# --------------------------------------------------------------------------- #
+# Routes
 
 
 @router.post("/agent/start", tags=["ai"])
@@ -302,8 +251,21 @@ async def agent_start(
       provider; session_id collision.
     """
 
+    # The local model can't drive the tool-calling planner (no function
+    # calling on a small CPU model). Reject it explicitly with a 422 that
+    # points at the right affordance — the frontend already never sends it,
+    # so this is defense-in-depth + a clear API error.
+    if body.provider == LOCAL_PROVIDER_ID:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "The local model can't run the agent (no tool-calling). "
+                "Use 'Generate flow' for one-shot building, or pick a "
+                "cloud provider for the agent."
+            ),
+        )
     _ensure_known_provider(body.provider)
-    flow = _resolve_flow(body.flow_id)
+    flow = _resolve_flow(body.flow_id, current_user.id)
 
     # Resolve the model with surface-aware routing **before** byok runs so the
     # explicit ``model=`` arg wins. Default behaviour (cred.default_model
@@ -358,19 +320,15 @@ async def agent_start(
         "provider_name": body.provider,
         "model_name": body.model,
         "snapshot": snapshot,
-        "max_steps": body.max_steps,
         "selected_node_ids": list(body.selected_node_ids or []),
     }
+    if body.max_steps is not None:
+        session_kwargs["max_steps"] = body.max_steps
+        session_kwargs["max_steps_explicit"] = True
     if body.session_id is not None:
         session_kwargs["session_id"] = body.session_id
-    # Auto-promote-from-chat sets ``skip_plan=True`` so the session
-    # jumps straight into ``classify``; the plan stage is redundant
-    # when a chat-mode plan already preceded the agent run.
     if body.skip_plan:
         session_kwargs["stage"] = "classify"
-    # Opt-in verify-completion mode. Default off; users opt in via the
-    # frontend toggle when they've seen the agent terminate prematurely
-    # on multi-step plans.
     if body.verify_plan_completion:
         session_kwargs["verify_plan_completion"] = True
     session = sessions.AgentSession(**session_kwargs)
@@ -448,7 +406,7 @@ async def agent_resume(
         return AgentDiscardResponse(session_id=session_id)
 
     # continue
-    flow = _resolve_flow(session.flow_id)
+    flow = _resolve_flow(session.flow_id, current_user.id)
     # Mirror /start's surface-aware model resolution: if the session was
     # opened without an explicit model, force ``surface_models[surface]`` so
     # the resumed run uses the same tool-capable model the original /start
@@ -534,7 +492,7 @@ async def agent_followup(
             ),
         )
 
-    flow = _resolve_flow(session.flow_id)
+    flow = _resolve_flow(session.flow_id, current_user.id)
 
     # Mirror /resume's surface-aware model resolution: if the session was
     # opened without an explicit model, force ``surface_models[surface]`` so

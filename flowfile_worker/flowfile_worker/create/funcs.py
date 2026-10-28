@@ -2,15 +2,28 @@ import os
 
 import polars as pl
 
+from flowfile_worker.configs import logger as _module_logger
 from flowfile_worker.create.models import (
+    InputAvroTable,
     InputCsvTable,
     InputExcelTable,
+    InputIpcStreamTable,
+    InputIpcTable,
     InputJsonTable,
+    InputNdjsonTable,
     InputParquetTable,
     ReceivedTable,
 )
-from flowfile_worker.create.read_excel_tables import df_from_calamine_xlsx, df_from_openpyxl
 from flowfile_worker.create.utils import create_fake_data
+from shared.excel_reader import read_excel_table
+from shared.path_utils import is_url, transcode_text_to_utf8
+
+INFER_SCHEMA_RUNGS = (10_000, 100_000)
+
+
+def _infer_schema_ladder(configured: int) -> list[int]:
+    """Inference lengths to try in order: the configured value first, then any higher ladder rungs."""
+    return [configured] + [rung for rung in INFER_SCHEMA_RUNGS if rung > configured]
 
 
 def create_from_path_json(received_table: ReceivedTable):
@@ -18,45 +31,59 @@ def create_from_path_json(received_table: ReceivedTable):
         raise ValueError("Received table settings are not of type InputJsonTable")
     input_table_settings: InputJsonTable = received_table.table_settings
     f = received_table.abs_file_path
-    gbs_to_load = os.path.getsize(f) / 1024 / 1000 / 1000
-    low_mem = gbs_to_load > 10
+    low_mem = False if is_url(f) else os.path.getsize(f) / 1024 / 1000 / 1000 > 10
+    fallback_infer = {"infer_schema_length": 0} if not input_table_settings.infer_schema else {}
     if input_table_settings.encoding.upper() == "UTF8" or input_table_settings.encoding.upper() == "UTF-8":
-        try:
-            df = pl.scan_csv(
+        if not input_table_settings.infer_schema:
+            return pl.scan_csv(
                 f,
                 low_memory=low_mem,
-                try_parse_dates=True,
                 separator=input_table_settings.delimiter,
                 has_header=input_table_settings.has_headers,
                 skip_rows=input_table_settings.starting_from_line,
                 encoding="utf8",
-                infer_schema_length=input_table_settings.infer_schema_length,
+                infer_schema_length=0,
             )
-            df.head(1).collect()
-            return df
-        except Exception:
+        for infer_len in _infer_schema_ladder(input_table_settings.infer_schema_length):
             try:
                 df = pl.scan_csv(
                     f,
                     low_memory=low_mem,
-                    separator=input_table_settings.delimiter,
-                    has_header=input_table_settings.has_headers,
-                    skip_rows=input_table_settings.starting_from_line,
-                    encoding="utf8-lossy",
-                    ignore_errors=True,
-                )
-                return df
-            except Exception:
-                df = pl.scan_csv(
-                    f,
-                    low_memory=low_mem,
+                    try_parse_dates=True,
                     separator=input_table_settings.delimiter,
                     has_header=input_table_settings.has_headers,
                     skip_rows=input_table_settings.starting_from_line,
                     encoding="utf8",
-                    ignore_errors=True,
+                    infer_schema_length=infer_len,
                 )
+                df.head(1).collect()
                 return df
+            except Exception:
+                continue
+        try:
+            df = pl.scan_csv(
+                f,
+                low_memory=low_mem,
+                separator=input_table_settings.delimiter,
+                has_header=input_table_settings.has_headers,
+                skip_rows=input_table_settings.starting_from_line,
+                encoding="utf8-lossy",
+                ignore_errors=True,
+                **fallback_infer,
+            )
+            return df
+        except Exception:
+            df = pl.scan_csv(
+                f,
+                low_memory=low_mem,
+                separator=input_table_settings.delimiter,
+                has_header=input_table_settings.has_headers,
+                skip_rows=input_table_settings.starting_from_line,
+                encoding="utf8",
+                ignore_errors=True,
+                **fallback_infer,
+            )
+            return df
     else:
         df = pl.read_csv(
             f,
@@ -66,6 +93,7 @@ def create_from_path_json(received_table: ReceivedTable):
             skip_rows=input_table_settings.starting_from_line,
             encoding=input_table_settings.encoding,
             ignore_errors=True,
+            **fallback_infer,
         )
         return df
 
@@ -75,54 +103,70 @@ def create_from_path_csv(received_table: ReceivedTable) -> pl.DataFrame:
     if not isinstance(received_table.table_settings, InputCsvTable):
         raise ValueError("Received table settings are not of type InputCsvTable")
     input_table_settings: InputCsvTable = received_table.table_settings
-    gbs_to_load = os.path.getsize(f) / 1024 / 1000 / 1000
-    low_mem = gbs_to_load > 10
+    low_mem = False if is_url(f) else os.path.getsize(f) / 1024 / 1000 / 1000 > 10
+    fallback_infer = {"infer_schema_length": 0} if not input_table_settings.infer_schema else {}
     if input_table_settings.encoding.upper() == "UTF8" or input_table_settings.encoding.upper() == "UTF-8":
-        try:
-            df = pl.scan_csv(
+        if not input_table_settings.infer_schema:
+            return pl.scan_csv(
                 f,
                 low_memory=low_mem,
-                try_parse_dates=True,
                 separator=input_table_settings.delimiter,
                 has_header=input_table_settings.has_headers,
                 skip_rows=input_table_settings.starting_from_line,
                 encoding="utf8",
-                infer_schema_length=input_table_settings.infer_schema_length,
+                infer_schema_length=0,
             )
-            df.head(1).collect()
-            return df
-        except Exception:
+        for infer_len in _infer_schema_ladder(input_table_settings.infer_schema_length):
             try:
                 df = pl.scan_csv(
                     f,
                     low_memory=low_mem,
-                    separator=input_table_settings.delimiter,
-                    has_header=input_table_settings.has_headers,
-                    skip_rows=input_table_settings.starting_from_line,
-                    encoding="utf8-lossy",
-                    ignore_errors=True,
-                )
-                return df
-            except Exception:
-                df = pl.scan_csv(
-                    f,
-                    low_memory=low_mem,
+                    try_parse_dates=True,
                     separator=input_table_settings.delimiter,
                     has_header=input_table_settings.has_headers,
                     skip_rows=input_table_settings.starting_from_line,
                     encoding="utf8",
-                    ignore_errors=True,
+                    infer_schema_length=infer_len,
                 )
+                df.head(1).collect()
                 return df
+            except Exception:
+                continue
+        try:
+            df = pl.scan_csv(
+                f,
+                low_memory=low_mem,
+                separator=input_table_settings.delimiter,
+                has_header=input_table_settings.has_headers,
+                skip_rows=input_table_settings.starting_from_line,
+                encoding="utf8-lossy",
+                ignore_errors=True,
+                **fallback_infer,
+            )
+            return df
+        except Exception:
+            df = pl.scan_csv(
+                f,
+                low_memory=low_mem,
+                separator=input_table_settings.delimiter,
+                has_header=input_table_settings.has_headers,
+                skip_rows=input_table_settings.starting_from_line,
+                encoding="utf8",
+                ignore_errors=True,
+                **fallback_infer,
+            )
+            return df
     else:
+        # Transcoded in memory: polars decodes raw gzip bytes as text when the encoding is not utf8.
         df = pl.read_csv(
-            f,
+            transcode_text_to_utf8(f, input_table_settings.encoding),
             low_memory=low_mem,
             separator=input_table_settings.delimiter,
             has_header=input_table_settings.has_headers,
             skip_rows=input_table_settings.starting_from_line,
-            encoding=input_table_settings.encoding,
+            encoding="utf8",
             ignore_errors=True,
+            **fallback_infer,
         )
         return df
 
@@ -134,63 +178,44 @@ def create_random(number_of_records: int = 1000) -> pl.LazyFrame:
 def create_from_path_parquet(received_table: ReceivedTable):
     if not isinstance(received_table.table_settings, InputParquetTable):
         raise ValueError("Received table settings are not of type InputParquetTable")
-    low_mem = (os.path.getsize(received_table.abs_file_path) / 1024 / 1000 / 1000) > 2
-    return pl.scan_parquet(source=received_table.abs_file_path, low_memory=low_mem)
+    f = received_table.abs_file_path
+    low_mem = False if is_url(f) else os.path.getsize(f) / 1024 / 1000 / 1000 > 2
+    return pl.scan_parquet(source=f, low_memory=low_mem)
 
 
-def create_from_path_excel(received_table: ReceivedTable):
+def create_from_path_ipc(received_table: ReceivedTable):
+    if not isinstance(received_table.table_settings, InputIpcTable):
+        raise ValueError("Received table settings are not of type InputIpcTable")
+    return pl.scan_ipc(received_table.abs_file_path)
+
+
+def create_from_path_ndjson(received_table: ReceivedTable):
+    if not isinstance(received_table.table_settings, InputNdjsonTable):
+        raise ValueError("Received table settings are not of type InputNdjsonTable")
+    f = received_table.abs_file_path
+    low_mem = False if is_url(f) else os.path.getsize(f) / 1024 / 1000 / 1000 > 10
+    return pl.scan_ndjson(f, low_memory=low_mem)
+
+
+def create_from_path_avro(received_table: ReceivedTable):
+    if not isinstance(received_table.table_settings, InputAvroTable):
+        raise ValueError("Received table settings are not of type InputAvroTable")
+    return pl.read_avro(received_table.abs_file_path)
+
+
+def create_from_path_ipc_stream(received_table: ReceivedTable):
+    if not isinstance(received_table.table_settings, InputIpcStreamTable):
+        raise ValueError("Received table settings are not of type InputIpcStreamTable")
+    return pl.read_ipc_stream(received_table.abs_file_path)
+
+
+def create_from_path_excel(received_table: ReceivedTable, logger=None):
+    """Read an Excel sheet; see ``shared.excel_reader`` for engine selection and the openpyxl fallback.
+
+    ``generic_task`` injects the node logger, so the engine used lands in the flow log.
+    """
     if not isinstance(received_table.table_settings, InputExcelTable):
         raise ValueError("Received table settings are not of type InputExcelTable")
-    input_table_settings: InputExcelTable = received_table.table_settings
-
-    if input_table_settings.type_inference:
-        engine = "openpyxl"
-    elif input_table_settings.start_row > 0 and input_table_settings.start_column == 0:
-        engine = "calamine" if input_table_settings.has_headers else "xlsx2csv"
-    elif input_table_settings.start_column > 0 or input_table_settings.start_row > 0:
-        engine = "openpyxl"
-    else:
-        engine = "calamine"
-
-    sheet_name = input_table_settings.sheet_name
-
-    if engine == "calamine":
-        df = df_from_calamine_xlsx(
-            file_path=received_table.abs_file_path,
-            sheet_name=sheet_name,
-            start_row=input_table_settings.start_row,
-            end_row=input_table_settings.end_row,
-        )
-        if input_table_settings.end_column > 0:
-            end_col_index = input_table_settings.end_column
-            cols_to_select = [df.columns[i] for i in range(input_table_settings.start_column, end_col_index)]
-            df = df.select(cols_to_select)
-
-    elif engine == "xlsx2csv":
-        csv_options = {"skip_rows": input_table_settings.start_row}
-        df = pl.read_excel(
-            source=received_table.abs_file_path,
-            read_options=csv_options,
-            engine="xlsx2csv",
-            sheet_name=input_table_settings.sheet_name,
-            has_header=input_table_settings.has_headers,
-        )
-        end_col_index = input_table_settings.end_column if input_table_settings.end_column > 0 else len(df.columns)
-        cols_to_select = [df.columns[i] for i in range(input_table_settings.start_column, end_col_index)]
-        df = df.select(cols_to_select)
-        if 0 < input_table_settings.end_row < len(df):
-            df = df.head(input_table_settings.end_row)
-
-    else:
-        max_col = input_table_settings.end_column if input_table_settings.end_column > 0 else None
-        max_row = input_table_settings.end_row + 1 if input_table_settings.end_row > 0 else None
-        df = df_from_openpyxl(
-            file_path=received_table.abs_file_path,
-            sheet_name=input_table_settings.sheet_name,
-            min_row=input_table_settings.start_row + 1,
-            min_col=input_table_settings.start_column + 1,
-            max_row=max_row,
-            max_col=max_col,
-            has_headers=input_table_settings.has_headers,
-        )
-    return df
+    return read_excel_table(
+        received_table.abs_file_path, received_table.table_settings, logger=logger or _module_logger
+    )

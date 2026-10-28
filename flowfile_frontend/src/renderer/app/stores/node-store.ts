@@ -9,8 +9,12 @@ import type {
   NodeDescriptionDictionary,
   NodeReferenceDictionary,
   ExpressionsOverview,
+  NodeInput,
+  GraphOperation,
+  OperationResponse,
 } from "../types";
-import { NodeApi, ExpressionsApi } from "../api";
+import { FlowApi, NodeApi, ExpressionsApi } from "../api";
+import { withExpectation } from "../api/settingsExpectation";
 import { useFlowStore } from "./flow-store";
 import { useResultsStore } from "./results-store";
 import { useEditorStore } from "./editor-store";
@@ -19,12 +23,12 @@ export const useNodeStore = defineStore("node", {
   state: () => ({
     nodeId: -1 as number,
     previousNodeId: -1 as number,
-    nodeValidateFuncs: new Map<number, () => void>(),
     nodeData: null as NodeData | null,
+    nodeDataFlowId: -1 as number,
     nodeExists: false,
     isLoaded: false,
     sizeDataPreview: 300 as number,
-    dataTypes: ["String", "Datetime", "Int64", "Int32", "Int16", "Float64", "Float32", "Boolean"],
+    dataTypes: ["String", "Date", "Datetime", "Time", "Int64", "Int32", "Int16", "Float64", "Float32", "Boolean"],
     nodeDescriptions: {} as NodeDescriptionDictionary,
     nodeReferences: {} as NodeReferenceDictionary,
     allExpressions: null as null | ExpressionsOverview[],
@@ -102,26 +106,73 @@ export const useNodeStore = defineStore("node", {
 
   actions: {
     // ========== Node Data Management ==========
-    async getNodeData(nodeId: number, useCache = true): Promise<NodeData | null> {
+    /**
+     * Fetch a node's data, serving the single-slot cache when it already holds
+     * this exact node's payload for the current flow.
+     *
+     * The cache is keyed on the payload actually stored (`nodeData.node_id` +
+     * `nodeDataFlowId`), never on `this.nodeId` — that field tracks the
+     * *selected* node (the open settings drawer) and says nothing about what
+     * the slot holds. Gating on the selection used to let a fetch for node B
+     * poison later cached reads for node A while A stayed selected.
+     */
+    async getNodeData(
+      nodeId: number,
+      useCache = true,
+      includeOutput = false,
+    ): Promise<NodeData | null> {
       const flowStore = useFlowStore();
+      const flowId = flowStore.flowId;
 
-      if (this.nodeId === nodeId && useCache) {
-        if (this.nodeData) {
-          this.isLoaded = true;
-          return this.nodeData;
-        }
+      if (
+        useCache &&
+        this.nodeData &&
+        Number(this.nodeData.node_id) === nodeId &&
+        this.nodeDataFlowId === flowId
+      ) {
+        this.isLoaded = true;
+        return this.nodeData;
       }
 
       try {
         console.log("Getting node data");
-        const data = await NodeApi.getNodeData(flowStore.flowId, nodeId);
+        const data = await NodeApi.getNodeData(flowId, nodeId, includeOutput);
         this.nodeData = data;
+        this.nodeDataFlowId = flowId;
         this.isLoaded = true;
         this.nodeExists = true;
         return this.nodeData;
       } catch (error) {
         console.error("Error fetching node data:", error);
         this.nodeData = null;
+        this.nodeDataFlowId = -1;
+        this.isLoaded = false;
+        this.nodeExists = false;
+        return null;
+      }
+    },
+
+    // Settings-open fast path: fetches without input schemas so the custom-node
+    // drawer renders before upstream schema prediction runs. Always fetches and
+    // writes the store's single nodeData slot so it stays pointed at the current
+    // node — but until the follow-up full fetch lands, main_input is unset, so
+    // cached readers may only rely on fields the light payload carries
+    // (e.g. setting_input).
+    async getNodeDataLight(nodeId: number): Promise<NodeData | null> {
+      const flowStore = useFlowStore();
+      const flowId = flowStore.flowId;
+
+      try {
+        const data = await NodeApi.getNodeData(flowId, nodeId, false, false);
+        this.nodeData = data;
+        this.nodeDataFlowId = flowId;
+        this.isLoaded = true;
+        this.nodeExists = true;
+        return this.nodeData;
+      } catch (error) {
+        console.error("Error fetching node data:", error);
+        this.nodeData = null;
+        this.nodeDataFlowId = -1;
         this.isLoaded = false;
         this.nodeExists = false;
         return null;
@@ -168,24 +219,6 @@ export const useNodeStore = defineStore("node", {
       this.isLoaded = false;
     },
 
-    // ========== Node Validation ==========
-    setNodeValidateFunc(nodeId: number | string, func: () => void) {
-      if (typeof nodeId === "string") {
-        nodeId = parseInt(nodeId);
-      }
-      this.nodeValidateFuncs.set(nodeId, func);
-    },
-
-    async validateNode(nodeId: number | string) {
-      if (typeof nodeId === "string") {
-        nodeId = parseInt(nodeId);
-      }
-      const func = this.nodeValidateFuncs.get(nodeId);
-      if (func) {
-        func();
-      }
-    },
-
     // ========== Node Descriptions ==========
     initializeDescriptionCache(flowId: number): void {
       if (!this.nodeDescriptions[flowId]) {
@@ -201,8 +234,27 @@ export const useNodeStore = defineStore("node", {
     ): void {
       this.initializeDescriptionCache(flowId);
       this.nodeDescriptions[flowId][nodeId] = { description, is_auto_generated: isAutoGenerated };
-      if (this.nodeData && this.nodeData.node_id === nodeId && this.nodeData.setting_input) {
+      if (
+        this.nodeData &&
+        this.nodeDataFlowId === flowId &&
+        this.nodeData.node_id === nodeId &&
+        this.nodeData.setting_input
+      ) {
         this.nodeData.setting_input.description = isAutoGenerated ? "" : description;
+      }
+    },
+
+    // Seeded from /flow_data/v2 before nodes mount so NodeWrapper reads hit the cache.
+    seedNodeDescriptions(flowId: number, nodeInputs: NodeInput[]): void {
+      this.nodeDescriptions[flowId] = {};
+      for (const input of nodeInputs) {
+        if (input.description === undefined) continue;
+        this.cacheNodeDescriptionDict(
+          flowId,
+          input.id,
+          input.description,
+          input.is_auto_generated ?? true,
+        );
       }
     },
 
@@ -257,7 +309,8 @@ export const useNodeStore = defineStore("node", {
         this.cacheNodeDescriptionDict(flowStore.flowId, nodeId, description, false);
         const result = await NodeApi.setNodeDescription(flowStore.flowId, nodeId, description);
 
-        if (result === true) {
+        if (result?.success) {
+          this.noteSettingsFingerprint(nodeId, result.settings_fingerprint);
           useEditorStore().bumpGraphVersion();
         } else {
           console.warn("Unexpected response:", result);
@@ -289,7 +342,12 @@ export const useNodeStore = defineStore("node", {
     cacheNodeReferenceDict(flowId: number, nodeId: number, reference: string): void {
       this.initializeReferenceCache(flowId);
       this.nodeReferences[flowId][nodeId] = reference;
-      if (this.nodeData && this.nodeData.node_id === nodeId && this.nodeData.setting_input) {
+      if (
+        this.nodeData &&
+        this.nodeDataFlowId === flowId &&
+        this.nodeData.node_id === nodeId &&
+        this.nodeData.setting_input
+      ) {
         this.nodeData.setting_input.node_reference = reference;
       }
     },
@@ -340,16 +398,15 @@ export const useNodeStore = defineStore("node", {
         this.cacheNodeReferenceDict(flowStore.flowId, nodeId, reference);
         const result = await NodeApi.setNodeReference(flowStore.flowId, nodeId, reference);
 
-        if (result === true) {
+        if (result?.success) {
+          this.noteSettingsFingerprint(nodeId, result.settings_fingerprint);
           editorStore.bumpGraphVersion();
-          // Update nodeReference on the VueFlow node data
           const vf = flowStore.vueFlowInstance;
           if (vf) {
             const node = vf.findNode(String(nodeId));
             if (node?.data) {
               node.data.nodeReference = reference;
             }
-            // Reactively update edge labels for outgoing edges
             if (editorStore.showEdgeLabels) {
               const nodeIdStr = String(nodeId);
               for (const edge of vf.getEdges.value) {
@@ -420,27 +477,19 @@ export const useNodeStore = defineStore("node", {
       }
     },
 
-    async updateSettingsDirectly(inputData: any): Promise<any> {
+    // Settings saves never send positions: the server keeps pos_x/pos_y/group_id of the live node.
+    async updateSettingsDirectly(inputData: any): Promise<OperationResponse> {
       const flowStore = useFlowStore();
 
       try {
         const node = flowStore.vueFlowInstance?.findNode(String(inputData.node_id)) as Node;
-        inputData.pos_x = node.position.x;
-        inputData.pos_y = node.position.y;
-
         const response = await NodeApi.updateSettingsDirectly(
           node.data.nodeTemplate.item,
           inputData,
         );
+        this.noteSettingsFingerprint(inputData.node_id, response.settings_fingerprint);
         useEditorStore().bumpGraphVersion();
-
-        const downstreamNodeIds = await NodeApi.getDownstreamNodeIds(
-          flowStore.flowId,
-          inputData.node_id,
-        );
-        downstreamNodeIds.map((nodeId) => {
-          this.validateNode(nodeId);
-        });
+        flowStore.fetchSettingsValidation();
 
         this.refreshAutoGeneratedDescription(inputData.node_id);
 
@@ -451,25 +500,23 @@ export const useNodeStore = defineStore("node", {
       }
     },
 
-    async updateUserDefinedSettings(inputData: any): Promise<any> {
+    async updateUserDefinedSettings(
+      inputData: any,
+      options?: { expectedFingerprint?: string },
+    ): Promise<OperationResponse> {
       const flowStore = useFlowStore();
 
       try {
         const node = flowStore.vueFlowInstance?.findNode(String(inputData.value.node_id)) as Node;
         const nodeType = node.data.nodeTemplate.item;
-        inputData.value.pos_x = node.position.x;
-        inputData.value.pos_y = node.position.y;
-
-        const response = await NodeApi.updateUserDefinedSettings(nodeType, inputData.value);
-        useEditorStore().bumpGraphVersion();
-
-        const downstreamNodeIds = await NodeApi.getDownstreamNodeIds(
-          flowStore.flowId,
-          inputData.value.node_id,
+        const response = await NodeApi.updateUserDefinedSettings(
+          nodeType,
+          inputData.value,
+          options?.expectedFingerprint,
         );
-        downstreamNodeIds.map((nodeId) => {
-          this.validateNode(nodeId);
-        });
+        this.noteSettingsFingerprint(inputData.value.node_id, response.settings_fingerprint);
+        useEditorStore().bumpGraphVersion();
+        flowStore.fetchSettingsValidation();
 
         this.refreshAutoGeneratedDescription(inputData.value.node_id);
 
@@ -480,26 +527,40 @@ export const useNodeStore = defineStore("node", {
       }
     },
 
-    async updateSettings(inputData: any, inputNodeType?: string): Promise<any> {
+    /**
+     * Save a node's settings. With `batch`, the save and the batch's operations are one
+     * atomic step (e.g. a settings change plus the edges it invalidates). With
+     * `expectedFingerprint` core refuses the save (409) when the node's settings moved since.
+     */
+    async updateSettings(
+      inputData: any,
+      inputNodeType?: string,
+      batch?: { label: string; operations: GraphOperation[] },
+      options?: { expectedFingerprint?: string },
+    ): Promise<OperationResponse> {
       const flowStore = useFlowStore();
 
       try {
         const node = flowStore.vueFlowInstance?.findNode(String(inputData.value.node_id)) as Node;
         const nodeType = inputNodeType ?? node.data.nodeTemplate.item;
 
-        inputData.value.pos_x = node.position.x;
-        inputData.value.pos_y = node.position.y;
-
-        const response = await NodeApi.updateSettingsDirectly(nodeType, inputData.value);
+        const response = batch
+          ? await FlowApi.applyOperations(Number(inputData.value.flow_id), batch.label, [
+              {
+                op: "update_settings",
+                node_type: nodeType,
+                settings: withExpectation(inputData.value, options?.expectedFingerprint),
+              },
+              ...batch.operations,
+            ])
+          : await NodeApi.updateSettingsDirectly(
+              nodeType,
+              inputData.value,
+              options?.expectedFingerprint,
+            );
+        this.noteSettingsFingerprint(inputData.value.node_id, response.settings_fingerprint);
         useEditorStore().bumpGraphVersion();
-
-        const downstreamNodeIds = await NodeApi.getDownstreamNodeIds(
-          flowStore.flowId,
-          inputData.value.node_id,
-        );
-        downstreamNodeIds.map((nodeId) => {
-          this.validateNode(nodeId);
-        });
+        flowStore.fetchSettingsValidation();
 
         this.refreshAutoGeneratedDescription(inputData.value.node_id);
 
@@ -508,6 +569,17 @@ export const useNodeStore = defineStore("node", {
         console.error("Error updating settings:", error.response?.data);
         throw error;
       }
+    },
+
+    /**
+     * A save of this node's settings landed: the cached node data now expects the fingerprint core
+     * handed back, so the drawer's next save in the same session is checked against that, not the
+     * one it loaded with. No fingerprint in the response (a batch over several nodes) drops the
+     * expectation: the next save is unconditional, as before.
+     */
+    noteSettingsFingerprint(nodeId: number | string, fingerprint: string | null | undefined): void {
+      if (!this.nodeData || Number(this.nodeData.node_id) !== Number(nodeId)) return;
+      this.nodeData.settings_fingerprint = fingerprint ?? null;
     },
 
     // ========== Expressions ==========
@@ -657,12 +729,6 @@ export const useNodeStore = defineStore("node", {
     pushNodeData() {
       const editorStore = useEditorStore();
       editorStore.pushNodeData();
-    },
-
-    /** @deprecated Use `useEditorStore().setCloseFunction()` directly instead. */
-    setCloseFunction(f: () => void) {
-      const editorStore = useEditorStore();
-      editorStore.setCloseFunction(f);
     },
 
     /** @deprecated Use `useEditorStore().executeDrawCloseFunction()` directly instead. */

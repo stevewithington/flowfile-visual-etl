@@ -6,7 +6,6 @@ import logging
 import os
 import signal
 from datetime import datetime, timezone
-from pathlib import Path
 
 from flowfile_core.catalog.exceptions import (
     FlowAlreadyRunningError,
@@ -23,6 +22,7 @@ from flowfile_core.schemas.catalog_schema import (
     FlowRunOut,
     PaginatedFlowRuns,
 )
+from shared.run_logs import SUBPROCESS_RUN_TYPES, run_log_path
 from shared.subprocess_utils import spawn_flow_subprocess
 
 logger = logging.getLogger(__name__)
@@ -37,12 +37,10 @@ class FlowRunService:
     @staticmethod
     def _resolve_log_path(run_id: int, run_type: str) -> str | None:
         """Return the log file path if it exists for subprocess-spawned runs."""
-        if run_type not in ("scheduled", "manual", "on_demand"):
+        if run_type not in SUBPROCESS_RUN_TYPES:
             return None
-        log_file = Path.home() / ".flowfile" / "logs" / f"scheduled_run_{run_id}.log"
-        if log_file.exists():
-            return str(log_file)
-        return None
+        log_file = run_log_path(run_id)
+        return str(log_file) if log_file.exists() else None
 
     def _display_names_for(self, runs: list[FlowRun]) -> dict[int, str]:
         """Bulk-resolve ``registration_id -> current registration name``.
@@ -72,6 +70,7 @@ class FlowRunService:
         run_type: RunType | None = None,
         limit: int = 50,
         offset: int = 0,
+        search: str | None = None,
     ) -> PaginatedFlowRuns:
         """List run summaries (without snapshots) with total count for pagination."""
         runs = self.repo.list_runs(
@@ -80,9 +79,10 @@ class FlowRunService:
             run_type=run_type,
             limit=limit,
             offset=offset,
+            search=search,
         )
         counts = self.repo.count_runs_by_status(
-            registration_id=registration_id, schedule_id=schedule_id, run_type=run_type
+            registration_id=registration_id, schedule_id=schedule_id, run_type=run_type, search=search
         )
         name_overrides = self._display_names_for(runs)
         return PaginatedFlowRuns(
@@ -244,12 +244,12 @@ class FlowRunService:
         return run.flow_snapshot
 
     @staticmethod
-    def _spawn_flow_subprocess(flow_path: str, run_id: int) -> int | None:
+    def _spawn_flow_subprocess(flow_path: str, run_id: int, *, suppress_telemetry: bool = False) -> int | None:
         """Fire-and-forget a ``flowfile run flow`` subprocess.
 
         Returns the child PID on success, or ``None`` on failure.
         """
-        return spawn_flow_subprocess(flow_path, run_id)
+        return spawn_flow_subprocess(flow_path, run_id, suppress_telemetry=suppress_telemetry)
 
     def spawn_flow_run(
         self,
@@ -257,10 +257,15 @@ class FlowRunService:
         user_id: int,
         run_type: RunType,
         schedule_id: int | None = None,
+        *,
+        suppress_telemetry: bool = False,
     ) -> FlowRun:
         """Create a FlowRun record and spawn the subprocess.
 
         On spawn failure the run is marked as failed immediately.
+
+        ``suppress_telemetry`` is forwarded to the child only (the demo seeder's
+        runs are ours, not the user's).
         """
         now = datetime.now(timezone.utc)
         run = FlowRun(
@@ -276,7 +281,7 @@ class FlowRunService:
         )
         run = self.repo.create_run(run)
 
-        pid = self._spawn_flow_subprocess(flow.flow_path, run.id)
+        pid = self._spawn_flow_subprocess(flow.flow_path, run.id, suppress_telemetry=suppress_telemetry)
         if pid is not None:
             run.pid = pid
         else:
@@ -312,6 +317,7 @@ class FlowRunService:
                 nodes_completed=r.nodes_completed,
                 number_of_nodes=r.number_of_nodes,
                 run_type=r.run_type,
+                schedule_id=r.schedule_id,
             )
             for r in runs
         ]
@@ -335,6 +341,8 @@ class FlowRunService:
         now = datetime.now(timezone.utc)
         run.ended_at = now
         run.success = False
+        # A user-initiated cancel is deliberate; alerting on it is noise.
+        run.notification_processed_at = now
         if run.started_at:
             started_utc = run.started_at.replace(tzinfo=None)
             now_utc = now.replace(tzinfo=None)

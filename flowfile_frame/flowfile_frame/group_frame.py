@@ -16,6 +16,23 @@ else:
     FlowFrame = None
 
 
+# Agg names the native group_by node runs via getattr(pl, agg); others fall back to polars-code.
+_NATIVE_AGG_FUNCS: set[str] = {
+    "sum",
+    "max",
+    "mean",
+    "median",
+    "min",
+    "count",
+    "n_unique",
+    "first",
+    "last",
+    "std",
+    "var",
+    "concat",
+}
+
+
 class GroupByFrame:
     """Represents a grouped DataFrame for aggregation operations."""
 
@@ -86,7 +103,6 @@ class GroupByFrame:
             can_be_converted = self._process_agg_expressions(agg_cols, agg_expressions)
         if can_be_converted:
             can_be_converted = self._process_named_agg_expressions(agg_cols, named_agg_exprs)
-        node_desc = self.description or f"Aggregate after grouping by {self.readable_group()}"
         return self._create_agg_node(
             self.node_id,
             can_be_converted,
@@ -94,7 +110,7 @@ class GroupByFrame:
             agg_expressions,
             named_agg_exprs,
             convertable_to_code=convertable_to_code,
-            description=node_desc,
+            description=self.description,
         )
 
     def _process_group_columns(self, agg_cols: list[transform_schema.AggColl]) -> bool:
@@ -105,7 +121,10 @@ class GroupByFrame:
             elif isinstance(col_expr, Expr):
                 if col_expr.is_complex:
                     return False
-                agg_cols.append(transform_schema.AggColl(old_name=col_expr.column_name, agg="groupby"))
+                old_name = getattr(col_expr, "_initial_column_name", col_expr.column_name) or col_expr.column_name
+                agg_cols.append(
+                    transform_schema.AggColl(old_name=old_name, agg="groupby", new_name=col_expr.column_name)
+                )
             elif isinstance(col_expr, Selector):
                 return False
             else:
@@ -120,6 +139,9 @@ class GroupByFrame:
                 if expr.is_complex:
                     return False
                 agg_func = getattr(expr, "agg_func", None)
+                if agg_func and agg_func not in _NATIVE_AGG_FUNCS:
+                    # expression-only aggregation → fall back to the polars-code path
+                    return False
                 old_name = getattr(expr, "_initial_column_name", expr.column_name) or expr.column_name
                 if agg_func:
                     agg_cols.append(
@@ -139,10 +161,13 @@ class GroupByFrame:
     def _process_named_agg_expressions(agg_cols: list[transform_schema.AggColl], named_agg_exprs: dict) -> bool:
         """Process named aggregation expressions for schema conversion."""
         for name, expr in named_agg_exprs.items():
-            if expr.is_complex:
-                return False
             if isinstance(expr, Expr):
+                if expr.is_complex:
+                    return False
                 agg_func = getattr(expr, "agg_func", "first")
+                if agg_func and agg_func not in _NATIVE_AGG_FUNCS:
+                    # expression-only aggregation → fall back to the polars-code path
+                    return False
                 old_name = getattr(expr, "_initial_column_name", expr.column_name) or expr.column_name
                 agg_cols.append(transform_schema.AggColl(old_name=old_name, agg=agg_func, new_name=name))
             elif isinstance(expr, str):
@@ -170,9 +195,9 @@ class GroupByFrame:
         agg_expressions,
         named_agg_exprs,
         convertable_to_code: bool,
-        description: str,
+        description: str | None,
     ):
-        """Create node for explicit aggregations via self.agg()."""
+        """Create node for explicit aggregations via self.agg(); only the Polars-code fallback gets a derived label."""
 
         if can_be_converted:
             precomputed = None
@@ -195,7 +220,7 @@ class GroupByFrame:
             precomputed = self.parent._add_polars_code(
                 new_node_id=node_id_to_use,
                 code=code,
-                description=description,
+                description=description or f"Aggregate after grouping by {self.readable_group()}",
                 method_name="group_by",
                 convertable_to_code=convertable_to_code,
                 polars_expr=pl_agg_expressions,

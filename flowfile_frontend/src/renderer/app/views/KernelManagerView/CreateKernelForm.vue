@@ -1,194 +1,143 @@
 <template>
-  <div class="card mb-3">
-    <div class="card-header" style="cursor: pointer" @click="isExpanded = !isExpanded">
-      <h3 class="card-title">
-        <i class="fa-solid fa-plus" style="margin-right: 6px"></i>
-        Create New Kernel
+  <div class="card km-form-card mb-3">
+    <button
+      type="button"
+      class="card-header km-form-card__header"
+      :class="{ 'km-form-card__header--expanded': isExpanded }"
+      :aria-expanded="isExpanded"
+      @click="isExpanded = !isExpanded"
+    >
+      <h3 class="card-title km-form-card__title">
+        <span class="km-form-card__title-icon" aria-hidden="true">
+          <i class="fa-solid fa-plus"></i>
+        </span>
+        Create new kernel
       </h3>
       <i
+        class="km-form-card__chevron"
         :class="isExpanded ? 'fa-solid fa-chevron-up' : 'fa-solid fa-chevron-down'"
-        style="color: var(--color-text-muted)"
       ></i>
-    </div>
-    <div v-if="isExpanded" class="card-content">
-      <form class="form" @submit.prevent="handleSubmit">
-        <div class="form-grid">
-          <div class="form-field">
-            <label for="kernel-id" class="form-label">Kernel ID</label>
-            <input
-              id="kernel-id"
-              v-model="form.id"
-              type="text"
-              class="form-input"
-              placeholder="my-kernel"
-              pattern="[a-zA-Z0-9_-]+"
-              title="Only letters, numbers, hyphens, and underscores"
-              required
-            />
-          </div>
-
-          <div class="form-field">
-            <label for="kernel-name" class="form-label">Display Name</label>
-            <input
-              id="kernel-name"
-              v-model="form.name"
-              type="text"
-              class="form-input"
-              placeholder="My Data Science Kernel"
-              required
-            />
-          </div>
-        </div>
-
-        <div class="form-field">
-          <label for="kernel-packages" class="form-label">
-            Python Packages
-            <span class="form-label-hint">(comma-separated)</span>
-          </label>
-          <input
-            id="kernel-packages"
-            v-model="packagesInput"
-            type="text"
-            class="form-input"
-            placeholder="pandas, scikit-learn, torch"
-          />
-        </div>
-
-        <div class="form-grid form-grid--3col">
-          <div class="form-field">
-            <label for="kernel-memory" class="form-label">Memory (GB)</label>
-            <input
-              id="kernel-memory"
-              v-model.number="form.memory_gb"
-              type="number"
-              class="form-input"
-              min="0.5"
-              max="64"
-              step="0.5"
-            />
-          </div>
-
-          <div class="form-field">
-            <label for="kernel-cpu" class="form-label">CPU Cores</label>
-            <input
-              id="kernel-cpu"
-              v-model.number="form.cpu_cores"
-              type="number"
-              class="form-input"
-              min="0.5"
-              max="32"
-              step="0.5"
-            />
-          </div>
-
-          <div class="form-field">
-            <label class="form-label">GPU</label>
-            <label class="toggle-label">
-              <input v-model="form.gpu" type="checkbox" class="toggle-checkbox" />
-              <span class="toggle-text">{{ form.gpu ? "Enabled" : "Disabled" }}</span>
-            </label>
-          </div>
-        </div>
-
-        <div class="form-actions">
-          <button type="submit" class="btn btn-primary" :disabled="!isValid || isSubmitting">
-            <i :class="isSubmitting ? 'fa-solid fa-spinner fa-spin' : 'fa-solid fa-plus'"></i>
-            {{ isSubmitting ? "Creating..." : "Create Kernel" }}
-          </button>
-        </div>
-      </form>
-    </div>
+    </button>
+    <transition name="km-collapse">
+      <div v-if="isExpanded" class="card-content card-content--relative">
+        <KernelCreateForm
+          :flavour-info="flavourInfo"
+          :image-statuses="imageStatuses"
+          :on-create="onCreate"
+          @success="isExpanded = false"
+        />
+      </div>
+    </transition>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from "vue";
-import type { KernelConfig } from "../../types";
+import { ref } from "vue";
+import KernelCreateForm from "../../components/kernel/KernelCreateForm.vue";
+import type { FlavourInfo, ImageFlavour, KernelConfig, KernelImageStatus } from "../../types";
 
-const emit = defineEmits(["create"]);
+defineProps<{
+  flavourInfo: Map<ImageFlavour, FlavourInfo>;
+  imageStatuses: KernelImageStatus[];
+  onCreate: (config: KernelConfig) => Promise<void>;
+}>();
 
-const isExpanded = ref(false);
-const isSubmitting = ref(false);
-const packagesInput = ref("");
-
-const form = ref({
-  id: "",
-  name: "",
-  memory_gb: 4.0,
-  cpu_cores: 2.0,
-  gpu: false,
-});
-
-const isValid = computed(() => {
-  return form.value.id.trim() !== "" && form.value.name.trim() !== "";
-});
-
-const parsePackages = (): string[] => {
-  if (!packagesInput.value.trim()) return [];
-  return packagesInput.value
-    .split(",")
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
-};
-
-const handleSubmit = async () => {
-  if (!isValid.value || isSubmitting.value) return;
-
-  isSubmitting.value = true;
-  try {
-    const config: KernelConfig = {
-      id: form.value.id.trim(),
-      name: form.value.name.trim(),
-      packages: parsePackages(),
-      memory_gb: form.value.memory_gb,
-      cpu_cores: form.value.cpu_cores,
-      gpu: form.value.gpu,
-    };
-    emit("create", config);
-    // Reset form on emit (parent handles success/error)
-    form.value = { id: "", name: "", memory_gb: 4.0, cpu_cores: 2.0, gpu: false };
-    packagesInput.value = "";
-    isExpanded.value = false;
-  } finally {
-    isSubmitting.value = false;
-  }
-};
+const isExpanded = ref(true);
 </script>
 
 <style scoped>
-.form-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--spacing-3);
+/* ─── Modern form-card header ────────────────────────────────────────── */
+.km-form-card {
+  border-radius: var(--border-radius-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+  transition: box-shadow var(--transition-base) var(--transition-timing);
 }
 
-.form-grid--3col {
-  grid-template-columns: 1fr 1fr 1fr;
+.km-form-card:hover {
+  box-shadow: var(--shadow-md);
 }
 
-.form-label-hint {
-  font-weight: var(--font-weight-normal);
-  color: var(--color-text-muted);
-  font-size: var(--font-size-xs);
+.km-form-card__header {
+  width: 100%;
+  cursor: pointer;
+  border: none;
+  text-align: left;
+  background: linear-gradient(135deg, rgba(8, 145, 178, 0.08) 0%, rgba(102, 126, 234, 0.06) 100%);
+  transition: background var(--transition-base) var(--transition-timing);
 }
 
-.toggle-label {
+[data-theme="dark"] .km-form-card__header {
+  background: linear-gradient(135deg, rgba(8, 145, 178, 0.18) 0%, rgba(102, 126, 234, 0.14) 100%);
+}
+
+.km-form-card__header:hover {
+  background: linear-gradient(135deg, rgba(8, 145, 178, 0.14) 0%, rgba(102, 126, 234, 0.1) 100%);
+}
+
+[data-theme="dark"] .km-form-card__header:hover {
+  background: linear-gradient(135deg, rgba(8, 145, 178, 0.24) 0%, rgba(102, 126, 234, 0.2) 100%);
+}
+
+.km-form-card__header--expanded {
+  background: var(--color-background-muted);
+}
+
+[data-theme="dark"] .km-form-card__header--expanded {
+  background: var(--color-background-secondary);
+}
+
+.km-form-card__title {
   display: flex;
   align-items: center;
   gap: var(--spacing-2);
-  cursor: pointer;
-  height: 36px;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
 }
 
-.toggle-checkbox {
-  width: 16px;
-  height: 16px;
-  accent-color: var(--color-accent);
-  cursor: pointer;
+.km-form-card__title-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--border-radius-md);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(
+    135deg,
+    var(--color-accent) 0%,
+    var(--color-gradient-purple-start) 100%
+  );
+  color: #fff;
+  font-size: var(--font-size-2xs);
 }
 
-.toggle-text {
-  font-size: var(--font-size-sm);
-  color: var(--color-text-secondary);
+.km-form-card__chevron {
+  color: var(--color-text-muted);
+  transition: transform var(--transition-base) var(--transition-timing);
+}
+
+/* Collapse transition */
+.km-collapse-enter-active,
+.km-collapse-leave-active {
+  transition:
+    max-height 0.25s var(--transition-timing),
+    opacity 0.2s var(--transition-timing);
+  overflow: hidden;
+}
+
+.km-collapse-enter-from,
+.km-collapse-leave-to {
+  max-height: 0;
+  opacity: 0;
+}
+
+.km-collapse-enter-to,
+.km-collapse-leave-from {
+  max-height: 2000px;
+  opacity: 1;
+}
+
+.card-content--relative {
+  position: relative;
 }
 </style>

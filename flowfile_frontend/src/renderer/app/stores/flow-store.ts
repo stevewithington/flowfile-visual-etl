@@ -2,13 +2,16 @@
 import { defineStore } from "pinia";
 import type { VueFlowStore } from "@vue-flow/core";
 import type { HistoryState, FlowArtifactData, NodeArtifactSummary } from "../types";
+import type { FlowParameter } from "../types/flow.types";
 import { FlowApi } from "../api";
 import { useEditorStore } from "./editor-store";
+import { useResultsStore } from "./results-store";
 
 export const FLOW_ID_STORAGE_KEY = "last_flow_id";
 
 // Default history state
 const defaultHistoryState: HistoryState = {
+  flow_id: null,
   can_undo: false,
   can_redo: false,
   undo_description: null,
@@ -34,6 +37,10 @@ export const useFlowStore = defineStore("flow", {
       historyState: { ...defaultHistoryState } as HistoryState,
       // Artifact visualization data
       artifactData: { ...defaultArtifactData } as FlowArtifactData,
+      // Flow-level parameters (${name} refs). Populated by the header when it
+      // loads/saves flow settings; read by the formula/filter editor for
+      // highlighting, autocomplete and hover.
+      parameters: [] as FlowParameter[],
       // Monotonic counter bumped by `requestReload()`. Components rendering
       // the canvas (e.g. `Canvas.vue`'s `loadFlow`) watch this and re-fetch
       // the graph on bump. Used when the backend mutates the flow without
@@ -51,6 +58,8 @@ export const useFlowStore = defineStore("flow", {
       // layout-reorganize prompt so the banner's [Reorganize] button
       // can call into the canvas without prop-drilling.
       pendingLayoutResetCounter: 0,
+      // A run started or ended elsewhere; HeaderButtons re-reads the run state on it.
+      pendingRunStateCounter: 0,
     };
   },
 
@@ -71,9 +80,24 @@ export const useFlowStore = defineStore("flow", {
       } catch (error) {
         console.warn("Failed to store flow ID in session storage:", error);
       }
-      // Reset history state when flow changes
       this.historyState = { ...defaultHistoryState };
       this.artifactData = { ...defaultArtifactData };
+      this.parameters = [];
+    },
+
+    setParameters(parameters: FlowParameter[]) {
+      this.parameters = parameters ?? [];
+    },
+
+    // Fallback loader for when the editor opens before the header has fetched
+    // flow settings. Pinned to a flowId so a late response for a stale flow is
+    // dropped.
+    async loadParameters(flowId?: number) {
+      const targetId = flowId ?? this.flowId;
+      if (targetId < 0) return;
+      const settings = await FlowApi.getFlowSettings(targetId);
+      if (this.flowId !== targetId) return;
+      this.parameters = settings?.parameters ?? [];
     },
 
     setVueFlowInstance(vueFlowInstance: VueFlowStore) {
@@ -84,18 +108,11 @@ export const useFlowStore = defineStore("flow", {
       return this.vueFlowInstance;
     },
 
-    // Update history state from API response.
-    // Every canvas-level mutation (add/delete/connect/disconnect/undo/redo)
-    // routes through here, so this is also the hook point for bumping the
-    // dirty-state counter.
+    // Fed by the axios mutation channel and loadFlow; a late state for another flow is dropped.
     updateHistoryState(historyState: HistoryState) {
+      if (historyState.flow_id != null && historyState.flow_id !== this.flowId) return;
       this.historyState = historyState;
       useEditorStore().bumpGraphVersion();
-    },
-
-    // Reset history state
-    resetHistoryState() {
-      this.historyState = { ...defaultHistoryState };
     },
 
     // Artifact actions. Caller may pass an explicit flowId to pin the request
@@ -118,6 +135,20 @@ export const useFlowStore = defineStore("flow", {
       return this.artifactData.nodes[String(nodeId)] ?? null;
     },
 
+    // Backend settings validation (missing-column warnings). Same staleness
+    // handling as fetchArtifacts; advisory, so failures never break the UI.
+    async fetchSettingsValidation(flowId?: number) {
+      const targetId = flowId ?? this.flowId;
+      if (targetId < 0) return;
+      try {
+        const data = await FlowApi.getSettingsValidation(targetId);
+        if (this.flowId !== targetId) return;
+        useResultsStore().applySettingsValidation(targetId, data);
+      } catch {
+        // Validation is advisory; don't break the UI
+      }
+    },
+
     // Signal "the backend mutated the flow; please re-fetch and re-render".
     // Canvas.vue watches `pendingReloadCounter` and calls its local
     // `loadFlow()` on bump. Safe to call multiple times — the watcher's
@@ -135,6 +166,12 @@ export const useFlowStore = defineStore("flow", {
     // prop-drilling. Safe to call multiple times.
     requestLayoutReset() {
       this.pendingLayoutResetCounter += 1;
+    },
+
+    // Signal "the flow's run state changed elsewhere; re-read it". Same
+    // counter pattern as `requestReload`.
+    requestRunStateRefresh() {
+      this.pendingRunStateCounter += 1;
     },
   },
 });

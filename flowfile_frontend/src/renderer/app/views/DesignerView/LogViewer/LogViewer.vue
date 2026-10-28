@@ -1,176 +1,36 @@
 <script setup lang="ts">
-import { ref, onUnmounted, nextTick, onMounted, watch } from "vue";
-import { useNodeStore } from "../../../stores/column-store";
-import { flowfileCorebaseURL } from "../../../../config/constants";
-import authService from "../../../services/auth.service";
+import { nextTick, ref, watch } from "vue";
+import { useLogStream } from "./useLogStream";
 
-// Store & Refs
-const nodeStore = useNodeStore();
-const logs = ref<string>("");
-const eventSourceRef = ref<EventSource | null>(null);
+const container = ref<HTMLElement | null>(null);
 const autoScroll = ref(true);
-const connectionRetries = ref(0);
-const maxRetries = 5;
-const connectionStatus = ref<"connected" | "disconnected" | "error">("disconnected");
-const errorMessage = ref<string | null>(null);
+const { logs, connectionStatus, errorMessage, startStreamingLogs, stopStreamingLogs, clearLogs } =
+  useLogStream();
 
 const scrollToBottom = () => {
   if (!autoScroll.value) return;
   nextTick(() => {
     requestAnimationFrame(() => {
-      const container = document.querySelector(".log-container");
-      if (container) container.scrollTop = container.scrollHeight;
+      const el = container.value;
+      if (el) el.scrollTop = el.scrollHeight;
     });
   });
 };
 
-watch(
-  () => nodeStore.isRunning,
-  (isRunning) => {
-    isRunning ? startStreamingLogs() : stopStreamingLogs();
-  },
-);
-
-const startStreamingLogs = async () => {
-  if (eventSourceRef.value) eventSourceRef.value.close();
-
-  logs.value = "";
-  connectionRetries.value = 0;
-  errorMessage.value = null;
-  connectionStatus.value = "disconnected";
-
-  try {
-    // Get the auth token
-    const token = await authService.getToken();
-    if (!token) {
-      console.error("No auth token available for log streaming");
-      errorMessage.value = "Authentication failed. Please log in again.";
-      connectionStatus.value = "error";
-      return;
-    }
-
-    // Create URL with token as query parameter
-    const url = new URL(`${flowfileCorebaseURL}logs/${nodeStore.flow_id}`, window.location.origin);
-    url.searchParams.append("access_token", token);
-
-    const eventSource = new EventSource(url.toString());
-    eventSourceRef.value = eventSource;
-
-    let hasReceivedMessage = false;
-
-    eventSource.onopen = () => {
-      connectionStatus.value = "connected";
-      console.log("Log connection established");
-    };
-
-    eventSource.onmessage = (event) => {
-      hasReceivedMessage = true;
-      try {
-        logs.value += JSON.parse(event.data) + "\n";
-        scrollToBottom();
-      } catch (error) {
-        console.error("Error parsing log data:", error);
-      }
-    };
-
-    eventSource.onerror = async (error) => {
-      console.error("EventSource error:", error);
-
-      if (!hasReceivedMessage && nodeStore.isRunning) {
-        if (connectionRetries.value < maxRetries) {
-          connectionRetries.value++;
-          errorMessage.value = `Connection failed. Retrying (${connectionRetries.value}/${maxRetries})...`;
-          connectionStatus.value = "error";
-          stopStreamingLogs();
-
-          // Check if token is still valid, refresh if needed
-          if (!authService.hasValidToken()) {
-            await authService.getToken();
-          }
-
-          setTimeout(startStreamingLogs, 1000 * connectionRetries.value); // Exponential backoff
-        } else {
-          console.error("Max retries reached for log connection");
-          errorMessage.value =
-            "Failed to connect after multiple attempts. Try refreshing the page.";
-          connectionStatus.value = "error";
-          stopStreamingLogs();
-        }
-      } else {
-        console.log("Log connection closed.");
-        stopStreamingLogs();
-      }
-    };
-  } catch (error) {
-    console.error("Failed to start log streaming:", error);
-    errorMessage.value = `Error: ${error instanceof Error ? error.message : "Unknown error"}`;
-    connectionStatus.value = "error";
-  }
-};
-
-const stopStreamingLogs = () => {
-  eventSourceRef.value?.close();
-  eventSourceRef.value = null;
-  if (connectionStatus.value === "connected") {
-    connectionStatus.value = "disconnected";
-  }
-};
-
-// UI Handlers
 const handleScroll = (event: Event) => {
   const element = event.target as HTMLElement;
   autoScroll.value = element.scrollHeight - element.scrollTop <= element.clientHeight + 50;
 };
 
-const clearLogs = () => (logs.value = "");
-
-// Handle token expiration
-let tokenRefreshInterval: number | null = null;
-
-const setupTokenRefresh = () => {
-  // Clear existing interval if any
-  if (tokenRefreshInterval) {
-    clearInterval(tokenRefreshInterval);
-  }
-
-  // Check token every 5 minutes
-  tokenRefreshInterval = window.setInterval(
-    async () => {
-      if (eventSourceRef.value && !authService.hasValidToken()) {
-        console.log("Token expired, reconnecting log stream");
-        stopStreamingLogs();
-        await authService.getToken();
-        startStreamingLogs();
-      }
-    },
-    5 * 60 * 1000,
-  );
-};
-
-// Lifecycle Hooks
-onMounted(() => {
-  startStreamingLogs();
-  setupTokenRefresh();
-});
-
-onUnmounted(() => {
-  stopStreamingLogs();
-  if (tokenRefreshInterval) {
-    clearInterval(tokenRefreshInterval);
-    tokenRefreshInterval = null;
-  }
-});
-
-// Expose functions to parent component
 defineExpose({ startStreamingLogs, stopStreamingLogs, clearLogs, logs });
 
-// Computed property to split logs into lines and identify errors
 const logLines = ref<string[]>([]);
 watch(logs, (newLogs) => {
   logLines.value = newLogs
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line !== "");
+  scrollToBottom();
 });
 
 const isErrorLine = (line: string): boolean => {
@@ -183,7 +43,7 @@ const isWarningLine = (line: string): boolean => {
 </script>
 
 <template>
-  <div class="log-container" @scroll="handleScroll">
+  <div ref="container" class="log-container" @scroll="handleScroll">
     <div class="log-header">
       <div class="log-status">
         <span
@@ -204,7 +64,7 @@ const isWarningLine = (line: string): boolean => {
         }}
       </div>
       <div class="log-controls">
-        <el-button size="small" @click="startStreamingLogs">Fetch logs</el-button>
+        <el-button size="small" @click="startStreamingLogs()">Fetch logs</el-button>
         <el-button size="small" :disabled="!logs || autoScroll" @click="scrollToBottom">
           Scroll to Bottom
         </el-button>

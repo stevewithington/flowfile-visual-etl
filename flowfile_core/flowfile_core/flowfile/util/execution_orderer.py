@@ -1,9 +1,9 @@
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from flowfile_core.configs import logger
 from flowfile_core.flowfile.flow_node.flow_node import FlowNode
-from flowfile_core.flowfile.util.node_skipper import determine_nodes_to_skip
+from flowfile_core.flowfile.util.skip_rules import NodeRunStatus, classify_graph
 
 
 @dataclass(frozen=True)
@@ -21,10 +21,18 @@ class ExecutionStage:
 
 @dataclass(frozen=True)
 class ExecutionPlan:
-    """Complete execution plan: nodes to skip and ordered stages of parallelizable nodes."""
+    """Complete execution plan: nodes to skip and ordered stages of parallelizable nodes.
+
+    ``skip_nodes`` holds the statically unrunnable nodes (misconfiguration and
+    its downstream) — the meaning it always had. ``deliberate_skip_nodes``
+    holds nodes gated off by design (closed gates' downstream): excluded from
+    the stages like skip nodes, but reported as skipped-and-green rather than
+    treated as unrunnable.
+    """
 
     skip_nodes: list[FlowNode]
     stages: list[ExecutionStage]
+    deliberate_skip_nodes: list[FlowNode] = field(default_factory=list)
 
     @property
     def all_nodes(self) -> list[FlowNode]:
@@ -36,21 +44,35 @@ class ExecutionPlan:
         return sum(len(stage) for stage in self.stages)
 
 
-def compute_execution_plan(nodes: list[FlowNode], flow_starts: list[FlowNode] = None) -> ExecutionPlan:
+def compute_execution_plan(
+    nodes: list[FlowNode],
+    flow_starts: list[FlowNode] = None,
+    closed_gate_handles: dict[str | int, frozenset[str]] | None = None,
+) -> ExecutionPlan:
     """Computes the execution plan: nodes to skip and parallelizable execution stages.
 
     Args:
         nodes: All nodes in the flow.
         flow_starts: Explicit starting nodes for the flow.
+        closed_gate_handles: Per-gate dead output handles from evaluated
+            parameter conditions; consumers on a dead handle are deliberately
+            skipped. Omitted by gate-blind callers (code export, fetch
+            validation), which therefore keep planning as if every gate were
+            fully open.
 
     Returns:
-        An ExecutionPlan containing skip_nodes and ordered execution stages.
+        An ExecutionPlan with skip_nodes, deliberate_skip_nodes and stages.
     """
-    skip_nodes = determine_nodes_to_skip(nodes=nodes)
+    status = classify_graph(nodes, closed_gate_handles=closed_gate_handles)
+    skip_nodes = [node for node in nodes if status.get(node.node_id) == NodeRunStatus.SKIPPED_ERROR]
+    deliberate_skip_nodes = [
+        node for node in nodes if status.get(node.node_id) == NodeRunStatus.SKIPPED_DELIBERATE
+    ]
+    excluded_ids = {node.node_id for node in skip_nodes} | {node.node_id for node in deliberate_skip_nodes}
     stages = determine_execution_order(
-        all_nodes=[node for node in nodes if node not in skip_nodes], flow_starts=flow_starts
+        all_nodes=[node for node in nodes if node.node_id not in excluded_ids], flow_starts=flow_starts
     )
-    return ExecutionPlan(skip_nodes=skip_nodes, stages=stages)
+    return ExecutionPlan(skip_nodes=skip_nodes, stages=stages, deliberate_skip_nodes=deliberate_skip_nodes)
 
 
 def determine_execution_order(all_nodes: list[FlowNode], flow_starts: list[FlowNode] = None) -> list[ExecutionStage]:
@@ -64,25 +86,53 @@ def determine_execution_order(all_nodes: list[FlowNode], flow_starts: list[FlowN
 
     Returns:
         A list of ExecutionStage objects in dependency order. Nodes within a stage have no
-        mutual dependencies and can run concurrently.
+        mutual dependencies and can run concurrently. Nodes unreachable from the flow
+        starts (e.g. after a connection was removed) are excluded with a warning.
 
     Raises:
         Exception: If a cycle is detected in the graph.
     """
     node_map = build_node_map(all_nodes)
     in_degree, adjacency_list = compute_in_degrees_and_adjacency_list(all_nodes, node_map)
+    raise_if_cycle(node_map, in_degree, adjacency_list)
 
     queue, visited_nodes = initialize_queue(flow_starts, all_nodes, in_degree)
 
     stages = perform_topological_sort(queue, node_map, in_degree, adjacency_list, visited_nodes)
     total_nodes = sum(len(stage) for stage in stages)
     if total_nodes != len(node_map):
-        raise Exception("Cycle detected in the graph. Execution order cannot be determined.")
+        unreachable = sorted(str(node_id) for node_id in node_map if node_id not in visited_nodes)
+        logger.warning(
+            f"{len(unreachable)} node(s) unreachable from the flow starts and excluded "
+            f"from execution: {', '.join(unreachable)}"
+        )
 
     all_nodes_flat = [node for stage in stages for node in stage if node.is_correct]
     logger.info(f"execution order: \n {all_nodes_flat}")
 
     return stages
+
+
+def raise_if_cycle(
+    node_map: dict[str, FlowNode], in_degree: dict[str, int], adjacency_list: dict[str, list[str]]
+) -> None:
+    """Raises when the graph contains a genuine cycle.
+
+    Runs Kahn's algorithm seeded from every zero-in-degree node, independent of
+    flow starts, so unreachable-but-acyclic subgraphs are not mistaken for cycles.
+    """
+    remaining_degree = {node_id: in_degree.get(node_id, 0) for node_id in node_map}
+    queue = deque(node_id for node_id, degree in remaining_degree.items() if degree == 0)
+    visited_count = 0
+    while queue:
+        node_id = queue.popleft()
+        visited_count += 1
+        for next_node_id in adjacency_list.get(node_id, []):
+            remaining_degree[next_node_id] -= 1
+            if remaining_degree[next_node_id] == 0:
+                queue.append(next_node_id)
+    if visited_count != len(node_map):
+        raise Exception("Cycle detected in the graph. Execution order cannot be determined.")
 
 
 def build_node_map(all_nodes: list[FlowNode]) -> dict[str, FlowNode]:
@@ -118,10 +168,13 @@ def compute_in_degrees_and_adjacency_list(
 
     for node in all_nodes:
         for next_node in node.leads_to_nodes:
+            # Edges into nodes the caller filtered out (e.g. skip nodes) are ignored;
+            # re-adding them here would leak skipped nodes into the stages and inflate
+            # ExecutionPlan.node_count (the run-progress denominator).
+            if next_node.node_id not in node_map:
+                continue
             adjacency_list[node.node_id].append(next_node.node_id)
             in_degree[next_node.node_id] += 1
-            if next_node.node_id not in node_map:
-                node_map[next_node.node_id] = next_node
 
     return in_degree, adjacency_list
 

@@ -11,7 +11,13 @@ Tests cover:
 - Edge cases and type inference
 """
 
+import datetime as dt
+import time
+from decimal import Decimal
+
+import polars as pl
 import pytest
+from polars_expr_transformer import simple_function_to_expr
 
 from flowfile_core.flowfile.filter_expressions import (
     _build_between_expression,
@@ -34,13 +40,14 @@ from flowfile_core.flowfile.filter_expressions import (
     _is_numeric_string,
     _should_quote_value,
     build_filter_expression,
+    resolve_filter_field_type,
+    supports_native_membership,
 )
+from flowfile_core.flowfile.flow_data_engine.flow_file_column.main import FlowfileColumn
 from flowfile_core.schemas.transform_schema import BasicFilter, FilterOperator
 
 
-# =============================================================================
 # Helper Function Tests
-# =============================================================================
 
 
 class TestIsNumericString:
@@ -138,9 +145,7 @@ class TestFormatField:
         assert _format_field("col-name") == "[col-name]"
 
 
-# =============================================================================
 # Comparison Expression Builder Tests
-# =============================================================================
 
 
 class TestComparisonExpressionBuilders:
@@ -197,9 +202,7 @@ class TestComparisonExpressionBuilders:
         assert _build_less_than_or_equals_expression("[score]", "50", True) == '[score]<="50"'
 
 
-# =============================================================================
 # String Function Expression Builder Tests
-# =============================================================================
 
 
 class TestStringFunctionExpressionBuilders:
@@ -236,9 +239,7 @@ class TestStringFunctionExpressionBuilders:
         assert result == 'right([email], 12) = "@example.com"'
 
 
-# =============================================================================
 # Null Check Expression Builder Tests
-# =============================================================================
 
 
 class TestNullCheckExpressionBuilders:
@@ -255,9 +256,7 @@ class TestNullCheckExpressionBuilders:
         assert result == "is_not_empty([name])"
 
 
-# =============================================================================
 # IN/NOT_IN Expression Builder Tests
-# =============================================================================
 
 
 class TestInExpressionBuilders:
@@ -291,7 +290,6 @@ class TestInExpressionBuilders:
     def test_in_mixed_values_with_non_numeric(self):
         """Test IN where some values are not numeric."""
         result = _build_in_expression("[code]", "A, B, 1", None)
-        # A and B are not numeric so quoted, 1 is numeric so not quoted
         assert result == '([code]="A") | ([code]="B") | ([code]=1)'
 
     def test_not_in_single_value_string(self):
@@ -317,7 +315,6 @@ class TestInExpressionBuilders:
     def test_not_in_numeric_without_field_type(self):
         """Test NOT_IN with numeric values and no field type - the original bug case."""
         result = _build_not_in_expression("[id]", "1, 2", None)
-        # Each value is checked individually, not the whole "1, 2" string
         assert result == "([id]!=1) & ([id]!=2)"
 
     def test_in_whitespace_handling(self):
@@ -326,9 +323,7 @@ class TestInExpressionBuilders:
         assert result == "([id]=1) | ([id]=2) | ([id]=3)"
 
 
-# =============================================================================
 # BETWEEN Expression Builder Tests
-# =============================================================================
 
 
 class TestBetweenExpressionBuilder:
@@ -360,9 +355,7 @@ class TestBetweenExpressionBuilder:
             _build_between_expression("[age]", "18", None, "numeric")
 
 
-# =============================================================================
 # Main build_filter_expression Function Tests
-# =============================================================================
 
 
 class TestBuildFilterExpression:
@@ -486,7 +479,6 @@ class TestBuildFilterExpression:
         """Test NOT_IN with numeric values but no field type - the original bug case."""
         bf = BasicFilter(field="id", operator=FilterOperator.NOT_IN, value="1, 2")
         result = build_filter_expression(bf, None)
-        # Should NOT quote numeric values, even when type is not specified
         assert result == "([id]!=1) & ([id]!=2)"
 
     def test_between(self):
@@ -514,9 +506,7 @@ class TestBuildFilterExpression:
         assert result == '[name]="John"'
 
 
-# =============================================================================
 # Edge Case and Regression Tests
-# =============================================================================
 
 
 class TestEdgeCases:
@@ -589,8 +579,241 @@ class TestEdgeCases:
             field="id", operator=FilterOperator.NOT_IN, value="1, 2", value2=None
         )
         result = build_filter_expression(bf, None)
-        # Should produce unquoted numeric values
         assert result == "([id]!=1) & ([id]!=2)"
-        # Should NOT produce quoted strings
         assert '"1"' not in result
         assert '"2"' not in result
+
+
+class TestTemporalFields:
+    """Date / datetime columns wrap the value in ``to_date`` / ``to_datetime``.
+
+    Polars refuses to compare a temporal column with a string literal, so the
+    expression must parse the value first; the frontend date picker emits
+    ``YYYY-MM-DD`` for Date and ``YYYY-MM-DD HH:mm:ss`` for Datetime columns.
+    """
+
+    class _Column:
+        def __init__(self, data_type: str, generic: str = "str"):
+            self.data_type = data_type
+            self._generic = generic
+
+        def generic_datatype(self):
+            return self._generic
+
+    def test_resolve_date(self):
+        assert resolve_filter_field_type(self._Column("Date", "date")) == "date"
+
+    def test_resolve_datetime_parametrized(self):
+        # generic_datatype() misses the parametrized form; the resolver must not.
+        col = self._Column("Datetime(time_unit='us', time_zone=None)", "str")
+        assert resolve_filter_field_type(col) == "datetime"
+
+    def test_resolve_falls_back_to_generic(self):
+        assert resolve_filter_field_type(self._Column("Int64", "numeric")) == "numeric"
+        assert resolve_filter_field_type(self._Column("Time", "date")) == "date"
+
+    def test_date_comparison(self):
+        bf = BasicFilter(field="d", operator=FilterOperator.GREATER_THAN, value="2024-03-01")
+        assert build_filter_expression(bf, "date") == '[d]>to_date("2024-03-01")'
+
+    def test_datetime_comparison(self):
+        bf = BasicFilter(field="ts", operator=FilterOperator.EQUALS, value="2024-03-01 12:30:00")
+        assert build_filter_expression(bf, "datetime") == '[ts]=to_datetime("2024-03-01 12:30:00")'
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("2024-03-01", "2024-03-01 00:00:00"),
+            ("2024-03-01T12:30:00", "2024-03-01 12:30:00"),
+            ("2024-03-01 12:30", "2024-03-01 12:30:00"),
+        ],
+    )
+    def test_datetime_value_is_normalized(self, value, expected):
+        bf = BasicFilter(field="ts", operator=FilterOperator.LESS_THAN, value=value)
+        assert build_filter_expression(bf, "datetime") == f'[ts]<to_datetime("{expected}")'
+
+    def test_date_between(self):
+        bf = BasicFilter(field="d", operator=FilterOperator.BETWEEN, value="2024-01-01", value2="2024-06-30")
+        assert build_filter_expression(bf, "date") == '([d]>=to_date("2024-01-01")) & ([d]<=to_date("2024-06-30"))'
+
+    def test_date_in(self):
+        bf = BasicFilter(field="d", operator=FilterOperator.IN, value="2024-01-01, 2024-02-01")
+        assert build_filter_expression(bf, "date") == '([d]=to_date("2024-01-01")) | ([d]=to_date("2024-02-01"))'
+
+    def test_date_not_in_single(self):
+        bf = BasicFilter(field="d", operator=FilterOperator.NOT_IN, value="2024-01-01")
+        assert build_filter_expression(bf, "date") == '[d]!=to_date("2024-01-01")'
+
+    def test_string_operators_unchanged_on_date(self):
+        bf = BasicFilter(field="d", operator=FilterOperator.IS_NULL, value="")
+        assert build_filter_expression(bf, "date") == "is_empty([d])"
+
+    def test_none_type_still_quotes_a_date_string(self):
+        bf = BasicFilter(field="d", operator=FilterOperator.EQUALS, value="2024-01-01")
+        assert build_filter_expression(bf, None) == '[d]="2024-01-01"'
+
+
+class TestNativeMembership:
+    """``native=True`` renders a multi-value IN / NOT_IN as ``[field] in (...)`` / ``not in (...)``."""
+
+    def test_in_numeric(self):
+        assert _build_in_expression("[id]", "1, 2, 3", "numeric", native=True) == "[id] in (1, 2, 3)"
+
+    def test_not_in_numeric(self):
+        assert _build_not_in_expression("[id]", "1, 2", "numeric", native=True) == "[id] not in (1, 2)"
+
+    def test_in_string(self):
+        result = _build_in_expression("[city]", "New York, Boston", "str", native=True)
+        assert result == '[city] in ("New York", "Boston")'
+
+    def test_not_in_date(self):
+        result = _build_not_in_expression("[d]", "2024-01-01, 2024-02-01", "date", native=True)
+        assert result == '[d] not in (to_date("2024-01-01"), to_date("2024-02-01"))'
+
+    def test_in_datetime(self):
+        result = _build_in_expression("[ts]", "2024-01-01, 2024-02-01 12:30", "datetime", native=True)
+        assert result == '[ts] in (to_datetime("2024-01-01 00:00:00"), to_datetime("2024-02-01 12:30:00"))'
+
+    def test_single_value_keeps_comparison(self):
+        assert _build_in_expression("[id]", "1", "numeric", native=True) == "[id]=1"
+        assert _build_not_in_expression("[id]", "1", "numeric", native=True) == "[id]!=1"
+
+    def test_whitespace_handling(self):
+        assert _build_in_expression("[id]", "  1  ,  2  ", "numeric", native=True) == "[id] in (1, 2)"
+
+    def test_empty_bare_member_keeps_chain(self):
+        # polars-expr-transformer silently ends an in (...) list at an empty bare member.
+        assert _build_not_in_expression("[id]", "1, , 3", "numeric", native=True) == "([id]!=1) & ([id]!=) & ([id]!=3)"
+        assert _build_in_expression("[id]", "1, ", "numeric", native=True) == "([id]=1) | ([id]=)"
+
+    def test_empty_string_member_stays_native(self):
+        assert _build_in_expression("[s]", "a, ", "str", native=True) == '[s] in ("a", "")'
+
+    def test_build_filter_expression_passes_flag(self):
+        bf = BasicFilter(field="user_id", operator=FilterOperator.NOT_IN, value="19, 33, 35")
+        assert build_filter_expression(bf, "numeric", native_membership=True) == "[user_id] not in (19, 33, 35)"
+        assert build_filter_expression(bf, "numeric") == "([user_id]!=19) & ([user_id]!=33) & ([user_id]!=35)"
+
+
+def _column(dtype: pl.DataType) -> FlowfileColumn:
+    return FlowfileColumn.create_from_polars_dtype("x", dtype)
+
+
+class TestSupportsNativeMembership:
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            pl.Int8,
+            pl.Int64,
+            pl.Int128,
+            pl.Float64,
+            pl.String,
+            pl.Categorical,
+            pl.Date,
+            pl.Datetime("us"),
+        ],
+    )
+    def test_supported(self, dtype):
+        assert supports_native_membership(_column(dtype)) is True
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            pl.UInt8,
+            pl.UInt64,
+            pl.Float32,
+            pl.Boolean,
+            pl.Decimal(10, 2),
+            pl.Enum(["a", "b"]),
+            pl.Datetime("ns"),
+            pl.Datetime("ms"),
+            pl.Datetime("us", "UTC"),
+            pl.Time,
+            pl.Null,
+        ],
+    )
+    def test_keeps_chain(self, dtype):
+        assert supports_native_membership(_column(dtype)) is False
+
+
+_D = dt.date
+_DT = dt.datetime
+
+# (dtype, column values incl. a null, basic-filter value, whether the native form is used)
+_MEMBERSHIP_CASES = [
+    (pl.Int64, [19, 33, 7, None], "19, 33, 35", True),
+    (pl.Int32, [1, 2, 3, None], "1, 3", True),
+    (pl.Int64, [-1, 2, -3, None], "-1, -3", True),
+    (pl.Int64, [1, 2, 3, None], "1, 2.5", True),
+    (pl.Float64, [0.1, 2.5, 3.0, None], "0.1, 2.5", True),
+    (pl.Decimal(10, 2), [Decimal("0.10"), Decimal("1.50"), Decimal("2.00"), None], "0.1, 2", False),
+    (pl.String, ["a", "b", "c", None], "a, c", True),
+    (pl.Categorical, ["a", "b", "c", None], "a, z", True),
+    (pl.Boolean, [True, False, None], "1, 0", False),
+    (pl.Date, [_D(2024, 1, 1), _D(2024, 2, 1), None], "2024-01-01, 2024-03-01", True),
+    (
+        pl.Datetime("us"),
+        [_DT(2024, 1, 1, 12), _DT(2024, 2, 1), None],
+        "2024-01-01 12:00:00, 2024-03-01",
+        True,
+    ),
+    (pl.Datetime("ns"), [_DT(2024, 1, 1, 12), _DT(2024, 2, 1), None], "2024-01-01 12:00:00, 2024-03-01", False),
+    (pl.Datetime("ms"), [_DT(2024, 1, 1, 12), _DT(2024, 2, 1), None], "2024-01-01 12:00:00, 2024-03-01", False),
+    (pl.Float32, [0.1, 2.0, None], "0.1, 3.5", False),
+    (pl.Enum(["a", "b"]), ["a", "b", None], "a, z", False),
+    (pl.UInt8, [1, 2, 3, None], "1, -3", False),
+]
+
+
+class TestMembershipMatchesChain:
+    """The runtime's IN / NOT_IN expression keeps the rows the ``=`` / ``!=`` chain keeps, nulls included."""
+
+    @pytest.mark.parametrize("operator", [FilterOperator.IN, FilterOperator.NOT_IN])
+    @pytest.mark.parametrize("dtype,values,filter_value,native", _MEMBERSHIP_CASES)
+    def test_same_rows_as_chain(self, operator, dtype, values, filter_value, native):
+        df = pl.DataFrame({"x": pl.Series(values, dtype=dtype)})
+        column = _column(dtype)
+        field_type = resolve_filter_field_type(column)
+        bf = BasicFilter(field="x", operator=operator, value=filter_value)
+
+        chain = build_filter_expression(bf, field_type)
+        runtime = build_filter_expression(bf, field_type, supports_native_membership(column))
+
+        assert (" in (" in runtime) is native
+        expected = df.filter(simple_function_to_expr(chain))
+        result = df.filter(simple_function_to_expr(runtime))
+        assert result.equals(expected)
+        assert result["x"].null_count() == 0
+
+
+def _best_compile_ms(expression: str, runs: int = 3) -> float:
+    best = float("inf")
+    for _ in range(runs):
+        start = time.perf_counter()
+        simple_function_to_expr(expression)
+        best = min(best, (time.perf_counter() - start) * 1000)
+    return best
+
+
+class TestCompileTime:
+    """Guards against polars-expr-transformer's exponential compile on long chains (fixed in 0.6.4)."""
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize("operator", [FilterOperator.IN, FilterOperator.NOT_IN])
+    @pytest.mark.parametrize(
+        "field_type,values",
+        [
+            ("numeric", [str(i) for i in range(200)]),
+            ("str", [f"value_{i}" for i in range(200)]),
+        ],
+    )
+    def test_200_value_membership_filter(self, operator, field_type, values):
+        bf = BasicFilter(field="x", operator=operator, value=", ".join(values))
+        expression = build_filter_expression(bf, field_type, native_membership=True)
+        assert _best_compile_ms(expression) < 50
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize("joiner,comparison", [(" & ", "!="), (" | ", "=")])
+    def test_50_term_hand_written_chain(self, joiner, comparison):
+        expression = joiner.join(f"([x]{comparison}{i})" for i in range(50))
+        assert _best_compile_ms(expression) < 100

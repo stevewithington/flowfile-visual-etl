@@ -7,6 +7,7 @@ object type.
 Supported formats:
 - parquet: For Polars and Pandas DataFrames
 - joblib: For scikit-learn models and numpy arrays
+- json: For JSON-serializable objects (e.g. ML model envelopes)
 - pickle: For general Python objects
 """
 
@@ -45,7 +46,6 @@ def _make_unpickleable_error(obj: Any, original_error: Exception) -> Unpickleabl
     obj_type = f"{type(obj).__module__}.{type(obj).__name__}"
     error_str = str(original_error).lower()
 
-    # Provide specific guidance based on error type
     if "local object" in error_str or "local class" in error_str:
         hint = "Classes defined inside functions cannot be pickled. " "Move the class definition to module level."
     elif "lambda" in error_str:
@@ -90,30 +90,24 @@ def check_pickleable(obj: Any) -> None:
     - Objects with open file handles or network connections
     - Objects containing ctypes or other C extensions
     """
-    # Try to estimate size - skip pre-check for large objects to avoid
-    # double-serialization overhead (error will be caught during actual serialization)
     try:
         import sys
 
         estimated_size = sys.getsizeof(obj)
         # For containers, getsizeof only returns shallow size, so we use a heuristic
-        # If it has __len__ and is large, skip the check
         if hasattr(obj, "__len__"):
             try:
                 length = len(obj)
-                # Rough heuristic: if many elements, likely large
                 if length > 10000:
-                    return  # Skip pre-check for large collections
+                    return
             except TypeError:
                 pass
         if estimated_size > _CHECK_PICKLEABLE_SIZE_THRESHOLD:
-            return  # Skip pre-check for obviously large objects
+            return
     except (TypeError, OverflowError):
-        pass  # Can't estimate size, proceed with check
+        pass
 
     try:
-        # Use cloudpickle.dumps to test pickleability without writing to disk
-        # cloudpickle can handle classes defined in exec() code
         cloudpickle.dumps(obj)
     except (TypeError, AttributeError) as e:
         raise _make_unpickleable_error(obj, e) from e
@@ -130,15 +124,12 @@ def detect_format(obj: Any) -> str:
     """
     module = type(obj).__module__.split(".")[0]
 
-    # DataFrames -> parquet
     if module in ("polars", "pandas"):
         return "parquet"
 
-    # ML objects and numpy arrays -> joblib
     if module in JOBLIB_MODULES:
         return "joblib"
 
-    # Everything else -> pickle
     return "pickle"
 
 
@@ -156,13 +147,14 @@ def serialize_to_file(obj: Any, path: str, format: str | None = None) -> str:
     format = format or detect_format(obj)
     path = Path(path)
 
-    # Ensure parent directory exists
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if format == "parquet":
         _serialize_parquet(obj, path)
     elif format == "joblib":
         _serialize_joblib(obj, path)
+    elif format == "json":
+        _serialize_json(obj, path)
     else:
         _serialize_pickle(obj, path)
 
@@ -188,6 +180,10 @@ def serialize_to_bytes(obj: Any, format: str | None = None) -> tuple[bytes, str]
         import joblib
 
         joblib.dump(obj, buf)
+    elif format == "json":
+        import json
+
+        buf.write(json.dumps(obj).encode("utf-8"))
     else:
         cloudpickle.dump(obj, buf)
 
@@ -222,6 +218,11 @@ def deserialize_from_file(path: str, format: str) -> Any:
         import joblib
 
         return joblib.load(path)
+    elif format == "json":
+        import json
+
+        with open(path, "rb") as f:
+            return json.load(f)
     else:
         import pickle  # cloudpickle files are compatible with standard pickle.load
 
@@ -249,6 +250,10 @@ def deserialize_from_bytes(blob: bytes, format: str) -> Any:
         import joblib
 
         return joblib.load(buf)
+    elif format == "json":
+        import json
+
+        return json.loads(blob)
     else:
         import pickle  # cloudpickle files are compatible with standard pickle.load
 
@@ -285,9 +290,7 @@ def compute_sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-# --------------------------------------------------------------------------
 # Private helpers
-# --------------------------------------------------------------------------
 
 
 def _serialize_parquet(obj: Any, path: Path) -> None:
@@ -345,6 +348,14 @@ def _serialize_joblib(obj: Any, path: Path) -> None:
     joblib.dump(obj, path)
 
 
+def _serialize_json(obj: Any, path: Path) -> None:
+    """Serialize a JSON-serializable object to a UTF-8 JSON file."""
+    import json
+
+    with open(path, "wb") as f:
+        f.write(json.dumps(obj).encode("utf-8"))
+
+
 def _serialize_pickle(obj: Any, path: Path) -> None:
     """Serialize object using cloudpickle.
 
@@ -354,5 +365,4 @@ def _serialize_pickle(obj: Any, path: Path) -> None:
         with open(path, "wb") as f:
             cloudpickle.dump(obj, f)
     except (TypeError, AttributeError) as e:
-        # Translate to UnpickleableObjectError with helpful message
         raise _make_unpickleable_error(obj, e) from e

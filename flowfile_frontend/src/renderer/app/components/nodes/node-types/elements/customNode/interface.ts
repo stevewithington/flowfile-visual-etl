@@ -17,9 +17,43 @@ export interface TextInputComponent extends BaseComponent {
   placeholder?: string;
 }
 
+export interface FilePickerComponent extends BaseComponent {
+  component_type: "FilePicker";
+  placeholder?: string;
+  mode?: "open" | "create";
+  file_types?: string[];
+  allow_directory?: boolean;
+}
+
+// Marker for artifact-populated selects; scope/type_filter omitted at defaults.
+export interface AvailableArtifactsMarker {
+  __type__: "AvailableArtifacts";
+  scope?: "upstream" | "global" | "all";
+  type_filter?: string[];
+}
+
+// One upstream (lineage) artifact option surfaced by /flow/node_available_artifacts.
+export interface ArtifactOption {
+  name: string;
+  type_name?: string;
+  module?: string;
+  status?: "published" | "declared";
+}
+
+// One global (catalog) artifact option surfaced by /artifacts/?latest_only=true.
+// namespace_path ("catalog.schema") is what makes a value unambiguous; older cores
+// omit it, in which case the bare name is still used.
+export interface GlobalArtifactOption {
+  name: string;
+  python_type?: string | null;
+  namespace_id?: number | null;
+  namespace_path?: string | null;
+  version: number;
+}
+
 export interface MultiSelectComponent extends BaseComponent {
   component_type: "MultiSelect";
-  options: { __type__: "IncomingColumns" } | { __type__: "AvailableArtifacts" } | string[];
+  options: { __type__: "IncomingColumns" } | AvailableArtifactsMarker | string[];
 }
 
 export interface ToggleSwitchComponent extends BaseComponent {
@@ -42,7 +76,7 @@ export interface SliderInputComponent extends BaseComponent {
 
 export interface SingleSelectComponent extends BaseComponent {
   component_type: "SingleSelect";
-  options: { __type__: "IncomingColumns" } | { __type__: "AvailableArtifacts" } | string[];
+  options: { __type__: "IncomingColumns" } | AvailableArtifactsMarker | string[];
 }
 
 export interface ColumnSelectorComponent extends BaseComponent {
@@ -60,20 +94,17 @@ export interface SecretSelectorComponent extends BaseComponent {
   name_prefix?: string;
 }
 
-// Generic column action row structure
 export interface ColumnActionRow {
   column: string;
   action: string;
   output_name: string;
 }
 
-// Action option structure from backend
 export interface ActionOption {
   value: string;
   label: string;
 }
 
-// Generic column action input value structure
 export interface ColumnActionValue {
   rows: ColumnActionRow[];
   group_by_columns: string[];
@@ -91,12 +122,19 @@ export interface ColumnActionInputComponent extends BaseComponent {
 
 // --- Section Component Type ---
 
+export interface VisibleWhen {
+  field: string; // dotted "<section>.<toggle>" reference
+  equals?: boolean; // defaults to true
+}
+
 export interface SectionComponent {
   component_type: "Section";
   title?: string;
   description?: string;
   hidden?: boolean;
-  components: Record<string, UIComponent>; // Sections contain other UI components
+  visible_when?: VisibleWhen;
+  layout?: "vertical" | "horizontal";
+  components: Record<string, UIComponent>;
 }
 
 export interface SettingsSchema {
@@ -105,6 +143,7 @@ export interface SettingsSchema {
 
 export type UIComponent =
   | TextInputComponent
+  | FilePickerComponent
   | MultiSelectComponent
   | ToggleSwitchComponent
   | NumericInputComponent
@@ -117,7 +156,13 @@ export type UIComponent =
 export type NodeTypeLiteral = "process" | "input" | "output";
 export type TransformTypeLiteral = "wide" | "long" | "explode";
 
-// The final, top-level schema for a custom node
+// Drift info surfaced when saved settings contain keys the current schema no
+// longer defines (populate_values silently drops them otherwise).
+export interface SchemaDrift {
+  unknown_sections: string[];
+  unknown_components: string[];
+}
+
 export interface CustomNodeSchema {
   node_name: string;
   node_category: string;
@@ -125,6 +170,8 @@ export interface CustomNodeSchema {
   settings_schema: SettingsSchema;
   number_of_inputs: number;
   number_of_outputs: number;
+  environment?: "local" | "kernel";
+  dependencies?: string[];
   requires_kernel?: boolean;
   kernel_id?: string | null;
   output_names?: string[];
@@ -133,23 +180,70 @@ export interface CustomNodeSchema {
   intro?: string;
   node_type: NodeTypeLiteral;
   transform_type: TransformTypeLiteral;
+  drift?: SchemaDrift | null;
+}
+
+// Structured error thrown when the schema fetch fails with a known surface:
+//   - "missing" (404 with {node_item}): node type not installed on this machine
+//   - "broken"  (409 with {node_item}): registered but failed to load
+//   - "unknown": anything else (network, 500, node-not-in-flow)
+export type CustomNodeSchemaErrorKind = "missing" | "broken" | "unknown";
+
+export class CustomNodeSchemaError extends Error {
+  kind: CustomNodeSchemaErrorKind;
+  nodeItem?: string;
+  detail?: string;
+  constructor(
+    kind: CustomNodeSchemaErrorKind,
+    message: string,
+    nodeItem?: string,
+    detail?: string,
+  ) {
+    super(message);
+    this.name = "CustomNodeSchemaError";
+    this.kind = kind;
+    this.nodeItem = nodeItem;
+    this.detail = detail;
+  }
 }
 
 // --- API function to fetch the schema ---
 /**
  * Fetches the complete UI definition for a custom node from the backend.
+ * Throws {@link CustomNodeSchemaError} on the missing/broken node surfaces so
+ * the drawer can render the right card instead of a generic error string.
  */
 export async function getCustomNodeSchema(
   flowId: number,
   nodeId: number,
 ): Promise<CustomNodeSchema> {
-  const response = await axios.get<CustomNodeSchema>(
-    `/user_defined_components/custom-node-schema`,
-    {
-      params: { flow_id: flowId, node_id: nodeId },
-      headers: { accept: "application/json" },
-    },
-  );
-
-  return response.data;
+  try {
+    const response = await axios.get<CustomNodeSchema>(
+      `/user_defined_components/custom-node-schema`,
+      {
+        params: { flow_id: flowId, node_id: nodeId },
+        headers: { accept: "application/json" },
+      },
+    );
+    return response.data;
+  } catch (err) {
+    if (axios.isAxiosError(err) && err.response) {
+      const status = err.response.status;
+      const detail = err.response.data?.detail;
+      const nodeItem = typeof detail === "object" ? detail?.node_item : undefined;
+      const errorText = typeof detail === "object" ? (detail?.error ?? detail?.message) : detail;
+      if (status === 404 && nodeItem) {
+        throw new CustomNodeSchemaError("missing", errorText ?? "Node not installed", nodeItem);
+      }
+      if (status === 409 && nodeItem) {
+        throw new CustomNodeSchemaError(
+          "broken",
+          errorText ?? "Node failed to load",
+          nodeItem,
+          errorText,
+        );
+      }
+    }
+    throw err;
+  }
 }

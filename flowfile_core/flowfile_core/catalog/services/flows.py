@@ -5,14 +5,20 @@ from __future__ import annotations
 import logging
 import os
 
+from flowfile_core.catalog.constants import (
+    LOCAL_FLOWS,
+    PYTHON_EDITOR_FLOWS,
+    ROOT_CATALOG,
+    UNNAMED_FLOWS,
+)
 from flowfile_core.catalog.exceptions import (
+    FlowExistsError,
     FlowHasArtifactsError,
     FlowNotFoundError,
     NamespaceNotFoundError,
 )
 from flowfile_core.catalog.repository import CatalogRepository
-from flowfile_core.catalog.serializers import artifact_to_out
-from flowfile_core.catalog.services.namespaces import NamespaceService
+from flowfile_core.catalog.services.namespaces import NamespaceService, bulk_enrich_artifacts
 from flowfile_core.database.models import CatalogNamespace, FlowRegistration
 from flowfile_core.schemas.catalog_schema import (
     CatalogTableSummary,
@@ -21,6 +27,21 @@ from flowfile_core.schemas.catalog_schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _project_sync_flow_deleted(flow_uuid: str, owner_id: int) -> None:
+    """Mirror a flow deletion into the active project folder (no-op when none active)."""
+    from flowfile_core.project import project_sync
+
+    project_sync.flow_deleted(flow_uuid, owner_id)
+
+
+def _project_sync_flow_saved(flow_path: str, owner_id: int) -> None:
+    """Re-project a flow file (e.g. after a namespace move) into the active project (no-op when none)."""
+    from flowfile_core.project import project_sync
+
+    project_sync.flow_saved(flow_path, owner_id)
+
 
 # Process-local memo of (registration_id, flow_path) tuples we've already
 # warned about. The first sighting of a missing file is genuinely useful (it
@@ -81,6 +102,7 @@ class FlowRegistrationService:
             last_run_at=last_run.started_at if last_run else None,
             last_run_success=last_run.success if last_run else None,
             file_exists=file_exists,
+            is_api_compatible=flow.is_api_compatible,
             artifact_count=artifact_count,
             tables_produced=[
                 CatalogTableSummary(id=t.id, name=t.name, namespace_id=t.namespace_id) for t in produced_tables
@@ -129,6 +151,7 @@ class FlowRegistrationService:
                     last_run_at=last_run.started_at if last_run else None,
                     last_run_success=last_run.success if last_run else None,
                     file_exists=file_exists,
+                    is_api_compatible=flow.is_api_compatible,
                     artifact_count=artifact_counts.get(flow.id, 0),
                     tables_produced=[
                         CatalogTableSummary(id=t.id, name=t.name, namespace_id=t.namespace_id) for t in produced
@@ -173,6 +196,19 @@ class FlowRegistrationService:
         flow = self.repo.get_flow(registration_id)
         if flow is None:
             raise FlowNotFoundError(registration_id=registration_id)
+        name_changed = name is not None and flow.name != name
+        desc_changed = description is not None and flow.description != description
+        ns_changed = namespace_id is not None and flow.namespace_id != namespace_id
+        if name_changed or ns_changed:
+            # Two same-named flows in one namespace render ambiguously in the
+            # catalog picker — same doctrine as registration-time collisions.
+            target_name = name if name is not None else flow.name
+            target_ns = namespace_id if namespace_id is not None else flow.namespace_id
+            if target_ns is not None:
+                clash = self.repo.get_flow_by_name(target_name, target_ns)
+                if clash is not None and clash.id != registration_id:
+                    raise FlowExistsError(target_name, target_ns)
+        moved_path, moved_owner = flow.flow_path, flow.owner_id
         if name is not None:
             flow.name = name
         if description is not None:
@@ -180,10 +216,16 @@ class FlowRegistrationService:
         if namespace_id is not None:
             flow.namespace_id = namespace_id
         flow = self.repo.update_flow(flow)
+        if (name_changed or desc_changed or ns_changed) and moved_path:
+            _project_sync_flow_saved(moved_path, moved_owner)
         return self.enrich_flow_registration(flow, requesting_user_id)
 
-    def delete_flow(self, registration_id: int) -> None:
-        """Delete a flow and its related favourites/follows."""
+    def delete_flow(self, registration_id: int, delete_file: bool = False) -> None:
+        """Delete a flow and its related favourites/follows.
+
+        When ``delete_file`` is set, also remove the flow file from disk — but
+        only once no other registration still points at the same path.
+        """
         flow = self.repo.get_flow(registration_id)
         if flow is None:
             raise FlowNotFoundError(registration_id=registration_id)
@@ -192,7 +234,19 @@ class FlowRegistrationService:
         if artifact_count > 0:
             raise FlowHasArtifactsError(registration_id, artifact_count)
 
+        flow_path = flow.flow_path
+        flow_uuid, owner_id = flow.flow_uuid, flow.owner_id
         self.repo.delete_flow(registration_id)
+
+        if delete_file and flow_path and self.repo.count_flows_by_path(flow_path) == 0:
+            try:
+                os.remove(flow_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("Failed to delete flow file %s", flow_path, exc_info=True)
+
+        _project_sync_flow_deleted(flow_uuid, owner_id)
 
     def get_flow(self, registration_id: int, user_id: int) -> FlowRegistrationOut:
         """Get an enriched flow registration."""
@@ -212,13 +266,37 @@ class FlowRegistrationService:
         if flow is None:
             raise FlowNotFoundError(registration_id=registration_id)
         artifacts = self.repo.list_artifacts_for_flow(registration_id)
-        return [artifact_to_out(a) for a in artifacts]
+        return bulk_enrich_artifacts(artifacts)
+
+    def ensure_root_catalog(self, owner_id: int) -> CatalogNamespace | None:
+        """Return the ``General`` root namespace, re-creating it if it has gone missing.
+
+        A missing root used to turn auto-registration into a silent no-op: the flow
+        existed on disk with no catalog row while downstream code assumed one, and the
+        damage depended on which code path had wiped the seed. Healing here is
+        idempotent and is the only safe option — the callers that need a registration
+        run mid-flow-run and inside project import, where raising is not allowed.
+        """
+        general = self.repo.get_namespace_by_name(ROOT_CATALOG.name, parent_id=None)
+        if general is not None:
+            return general
+        logger.warning("Catalog root namespace '%s' was missing; re-creating it", ROOT_CATALOG.name)
+        return self.repo.create_namespace(
+            CatalogNamespace(
+                name=ROOT_CATALOG.name,
+                parent_id=None,
+                level=0,
+                description=ROOT_CATALOG.description,
+                owner_id=owner_id,
+                is_public=True,
+            )
+        )
 
     def _ensure_general_child(self, name: str, description: str) -> CatalogNamespace | None:
         """Ensure 'General > {name}' namespace exists, creating it if needed."""
-        general = self.repo.get_namespace_by_name("General", parent_id=None)
+        general = self.repo.get_namespace_by_name(ROOT_CATALOG.name, parent_id=None)
         if general is None:
-            logger.info(f"Cannot ensure '{name}' namespace: parent 'General' not found")
+            logger.info(f"Cannot ensure '{name}' namespace: parent '{ROOT_CATALOG.name}' not found")
             return None
         existing = self.repo.get_namespace_by_name(name, parent_id=general.id)
         if existing is not None:
@@ -229,20 +307,21 @@ class FlowRegistrationService:
             level=1,
             description=description,
             owner_id=general.owner_id,
+            # App-managed containers are public like their seeded siblings in
+            # init_db: without this a lazily-created schema (Python Editor) is
+            # invisible to every user but General's owner in multi-user mode.
+            is_public=True,
         )
         return self.repo.create_namespace(namespace)
 
     def ensure_unnamed_flows_namespace(self) -> CatalogNamespace | None:
-        return self._ensure_general_child("Unnamed Flows", "Quick-created flows that have not yet been named")
+        return self._ensure_general_child(UNNAMED_FLOWS.name, UNNAMED_FLOWS.description)
 
     def ensure_local_flows_namespace(self) -> CatalogNamespace | None:
-        return self._ensure_general_child("Local Flows", "Flows saved to disk at user-chosen paths")
+        return self._ensure_general_child(LOCAL_FLOWS.name, LOCAL_FLOWS.description)
 
     def ensure_python_editor_flows_namespace(self) -> CatalogNamespace | None:
-        return self._ensure_general_child(
-            "Python Editor",
-            "Flows authored programmatically via the FlowFrame Python API",
-        )
+        return self._ensure_general_child(PYTHON_EDITOR_FLOWS.name, PYTHON_EDITOR_FLOWS.description)
 
     def resolve_registration_id(self, flow_path: str) -> int | None:
         """Look up the registration ID for a flow by its file path."""

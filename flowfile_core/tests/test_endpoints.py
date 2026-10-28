@@ -17,14 +17,15 @@ from flowfile_core.flowfile.database_connection_manager.db_connections import (
     get_local_cloud_connection,
 )
 from flowfile_core.flowfile.flow_graph import FlowGraph, add_connection
+from flowfile_core.auth.models import User
+from flowfile_core.routes import routes
 from flowfile_core.routes.routes import (
-    add_node,
-    connect_node,
     flow_file_handler,
     input_schema,
     output_model,
 )
 from flowfile_core.schemas import cloud_storage_schemas as cloud_ss
+from flowfile_core.schemas import transform_schema
 from flowfile_core.schemas.transform_schema import SelectInput
 from flowfile_core.secret_manager.secret_manager import get_encrypted_secret
 from shared.storage_config import storage
@@ -63,6 +64,17 @@ except ModuleNotFoundError:
 
 FlowId = int
 
+# The electron-mode user every test client authenticates as; flows are scoped to their session.
+LOCAL_USER = User(id=1, username="local_user")
+
+
+def add_node(*args, **kwargs):
+    return routes.add_node(*args, current_user=LOCAL_USER, **kwargs)
+
+
+def connect_node(*args, **kwargs):
+    return routes.connect_node(*args, current_user=LOCAL_USER, **kwargs)
+
 
 def get_auth_token():
     """Get authentication token for testing"""
@@ -78,7 +90,6 @@ def ensure_no_database_connections():
             delete_database_connection(db, connection.connection_name, 1)
 
 
-# Create an authenticated test client
 def get_test_client():
     """Get an authenticated test client"""
     token = get_auth_token()
@@ -188,7 +199,7 @@ def ensure_clean_flow() -> FlowId:
     flow_path: str = str(
         find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp/sample_flow_path.yaml"
     )
-    remove_flow(flow_path)  # Remove the flow if it exists
+    remove_flow(flow_path)
     sleep(0.1)
     r = client.post("editor/create_flow", params={"flow_path": flow_path})
     if r.status_code != 200:
@@ -218,7 +229,7 @@ def create_flow_with_manual_input_and_select() -> FlowId:
     flow_id = create_flow_with_manual_input()
     add_node(flow_id, 2, node_type="select", pos_x=0, pos_y=0)
     connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
-    client.post("/editor/connect_node/", data=connection.model_dump_json(), params={"flow_id": flow_id})
+    client.post("/editor/connect_node/", data=connection.model_dump_json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id})
     flow = flow_file_handler.get_flow(flow_id)
     select_settings = input_schema.NodeSelect(
         flow_id=flow_id, node_id=2, select_input=[SelectInput(old_name="name")], keep_missing=False
@@ -230,7 +241,7 @@ def create_flow_with_manual_input_and_select() -> FlowId:
 def add_select_node(node_id: int, flow_id: int, node_input_id: int):
     add_node(flow_id, node_id, node_type="select", pos_x=0, pos_y=0)
     connection = input_schema.NodeConnection.create_from_simple_input(node_input_id, node_id)
-    client.post("/editor/connect_node/", data=connection.json(), params={"flow_id": flow_id})
+    client.post("/editor/connect_node/", data=connection.json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id})
     flow = flow_file_handler.get_flow(flow_id)
     select_settings = input_schema.NodeSelect(
         flow_id=1, node_id=node_id, select_input=[SelectInput(old_name="name")], keep_missing=False
@@ -278,6 +289,479 @@ def test_get_flow():
     assert response.json()["flow_id"] == flow_id, "Flow not retrieved"
 
 
+def test_close_flow_idempotent_for_unknown_flow():
+    """Closing a flow that isn't in the user's session (e.g. a stale tab after a restore pruned it)
+    must be a no-op (200), not a 500."""
+    response = client.post("/editor/close_flow/", params={"flow_id": 999999999})
+    assert response.status_code == 200
+
+
+def _ensure_namespace(name: str) -> dict:
+    """Create-or-fetch a root namespace so tests survive re-runs against a persistent DB."""
+    resp = client.post("/catalog/namespaces", json={"name": name})
+    if resp.status_code == 201:
+        return resp.json()
+    listing = client.get("/catalog/namespaces").json()
+    return next(n for n in listing if n["name"] == name)
+
+
+def test_rename_flow_updates_catalog_registration_and_display_name():
+    from flowfile_core.database.models import FlowRegistration
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    src_path = str(base_dir / "rename_endpoint_src.yaml")
+    remove_flow(src_path)
+    ns = _ensure_namespace("NsRenameEndpoint")
+
+    flow_id = client.post("editor/create_flow", params={"flow_path": src_path}).json()
+    expected_file = storage.flows_directory / f"{flow_id}_rename_ep_before.yaml"
+    if expected_file.exists():
+        expected_file.unlink()
+    try:
+        resp = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": flow_id, "flow_name": "rename_ep_before", "namespace_id": ns["id"]},
+        )
+        assert resp.status_code == 200, resp.text
+        flow_id = resp.json()
+
+        r = client.post("/editor/rename_flow/", json={"flow_id": flow_id, "name": "rename_ep_after"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["name"] == "rename_ep_after"
+        assert body["display_name"] == "rename_ep_after"
+
+        sessions = client.get("/active_flowfile_sessions/").json()
+        session = next(s for s in sessions if s["flow_id"] == flow_id)
+        assert session["display_name"] == "rename_ep_after"
+
+        with get_db_context() as db:
+            reg = db.query(FlowRegistration).filter(FlowRegistration.flow_path == str(expected_file)).one()
+            assert reg.name == "rename_ep_after"
+    finally:
+        remove_flow(src_path)
+        if expected_file.exists():
+            expected_file.unlink()
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == str(expected_file)).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def test_rename_flow_scratch_flow_in_memory_only():
+    """Renaming an unregistered scratch flow updates only the in-memory session:
+    no catalog registration appears and nothing is written to disk.
+
+    An ephemeral flow now needs both switches off — ``register_in_catalog`` no longer
+    doubles as "don't touch the disk".
+    """
+    from flowfile_core.database.models import FlowRegistration
+
+    flow_id = client.post(
+        "editor/create_flow", params={"register_in_catalog": False, "persist": False}
+    ).json()
+    try:
+        r = client.post("/editor/rename_flow/", json={"flow_id": flow_id, "name": "My scratch name"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["name"] == "My scratch name"
+        assert body["display_name"] is None
+
+        flow = flow_file_handler.get_flow(flow_id)
+        assert flow.flow_settings.name == "My scratch name"
+        assert not os.path.exists(flow.flow_settings.path), "Rename must not persist a scratch flow"
+        with get_db_context() as db:
+            count = db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow.flow_settings.path).count()
+            assert count == 0, "Rename must not register a scratch flow in the catalog"
+    finally:
+        client.post("/editor/close_flow/", params={"flow_id": flow_id})
+
+
+def test_rename_of_unregistered_draft_survives_reopen():
+    """A draft's name lives in its YAML, because it has no registration to hold it.
+
+    ``open_flow`` stamped the filename stem over whatever the file said, so renaming a
+    quick-created flow was silently lost the moment the tab was closed — and its stem is
+    machine-generated ("Unnamed_flow_20260730_181546_493427479"), so there was nothing
+    readable to fall back to.
+    """
+    created_id = client.post("editor/create_flow", params={"register_in_catalog": False}).json()
+    flow_path = flow_file_handler.get_flow(created_id).flow_settings.path
+    assert storage.is_scratch_flow_path(flow_path), "Precondition: quick-create lands in a scratch dir"
+    try:
+        r = client.post("/editor/rename_flow/", json={"flow_id": created_id, "name": "My analysis"})
+        assert r.status_code == 200, r.text
+        client.post("/editor/close_flow/", params={"flow_id": created_id})
+
+        reopened_id = client.get("/import_flow/", params={"flow_path": flow_path}).json()
+        reopened = flow_file_handler.get_flow(reopened_id)
+        assert reopened.flow_settings.name == "My analysis", "Reopen reverted the name to the file stem"
+        assert reopened.__name__ == "My analysis"
+    finally:
+        remove_flow(flow_path)
+
+
+def test_user_chosen_filename_still_wins_over_the_stored_name():
+    """Outside the scratch dirs the stem stays authoritative.
+
+    A path the user picked is a good name, and renaming or copying a flow file must keep
+    renaming the flow — the durable-name rule is scoped to app-generated filenames.
+    """
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    flow_path = str(base_dir / "user_named_flow.yaml")
+    renamed_path = str(base_dir / "user_renamed_flow.yaml")
+    remove_flow(flow_path)
+    remove_flow(renamed_path)
+
+    created_id = client.post(
+        "editor/create_flow", params={"flow_path": flow_path, "register_in_catalog": False}
+    ).json()
+    try:
+        client.post("/editor/close_flow/", params={"flow_id": created_id})
+        os.rename(flow_path, renamed_path)
+
+        reopened_id = client.get("/import_flow/", params={"flow_path": renamed_path}).json()
+        assert flow_file_handler.get_flow(reopened_id).flow_settings.name == "user_renamed_flow"
+    finally:
+        remove_flow(flow_path)
+        remove_flow(renamed_path)
+
+
+def test_rename_does_not_commit_unsaved_canvas_edits():
+    """The rename write-back is scoped to clean flows: it must not silently save edits."""
+    flow_id = client.post("editor/create_flow", params={"register_in_catalog": False}).json()
+    flow_path = flow_file_handler.get_flow(flow_id).flow_settings.path
+    try:
+        add_node_placeholder("manual_input", node_id=1, flow_id=flow_id)
+        flow = flow_file_handler.get_flow(flow_id)
+        assert flow.has_unsaved_changes(), "Precondition: adding a node leaves the flow dirty"
+
+        r = client.post("/editor/rename_flow/", json={"flow_id": flow_id, "name": "Dirty rename"})
+        assert r.status_code == 200, r.text
+        assert flow.has_unsaved_changes(), "Rename must not have saved the flow"
+
+        reopened_id = client.get("/import_flow/", params={"flow_path": flow_path}).json()
+        assert len(flow_file_handler.get_flow(reopened_id).nodes) == 0, "The unsaved node must not be on disk"
+    finally:
+        remove_flow(flow_path)
+
+
+def test_rename_flow_unknown_flow_404():
+    r = client.post("/editor/rename_flow/", json={"flow_id": 999999999, "name": "x"})
+    assert r.status_code == 404
+
+
+def test_rename_flow_empty_name_422():
+    flow_id = ensure_clean_flow()
+    r = client.post("/editor/rename_flow/", json={"flow_id": flow_id, "name": "   "})
+    assert r.status_code == 422
+
+
+def test_rename_flow_does_not_mark_dirty():
+    flow_id = ensure_clean_flow()
+    settings = client.get("editor/flow", params={"flow_id": flow_id}).json()
+    assert settings["has_unsaved_changes"] is False
+    r = client.post("/editor/rename_flow/", json={"flow_id": flow_id, "name": "renamed_clean"})
+    assert r.status_code == 200, r.text
+    settings = client.get("editor/flow", params={"flow_id": flow_id}).json()
+    assert settings["has_unsaved_changes"] is False
+
+
+def test_rename_flow_collision_with_sibling_409():
+    """Renaming to a name already used by another flow in the same namespace is rejected,
+    and the failed rename leaves the session name untouched."""
+    from flowfile_core.database.models import FlowRegistration
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    src_a = str(base_dir / "rename_col_src_a.yaml")
+    src_b = str(base_dir / "rename_col_src_b.yaml")
+    remove_flow(src_a)
+    remove_flow(src_b)
+    ns = _ensure_namespace("NsRenameCollision")
+
+    flow_id_a = client.post("editor/create_flow", params={"flow_path": src_a}).json()
+    flow_id_b = client.post("editor/create_flow", params={"flow_path": src_b}).json()
+    file_a = storage.flows_directory / f"{flow_id_a}_rn_col_a.yaml"
+    file_b = storage.flows_directory / f"{flow_id_b}_rn_col_b.yaml"
+    for p in (file_a, file_b):
+        if p.exists():
+            p.unlink()
+    try:
+        resp_a = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": flow_id_a, "flow_name": "rn_col_a", "namespace_id": ns["id"]},
+        )
+        assert resp_a.status_code == 200, resp_a.text
+        resp_b = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": flow_id_b, "flow_name": "rn_col_b", "namespace_id": ns["id"]},
+        )
+        assert resp_b.status_code == 200, resp_b.text
+        flow_id_b = resp_b.json()
+
+        r = client.post("/editor/rename_flow/", json={"flow_id": flow_id_b, "name": "rn_col_a"})
+        assert r.status_code == 409, r.text
+
+        # A failed rename must not leave a half-renamed session.
+        flow_b = flow_file_handler.get_flow(flow_id_b)
+        assert flow_b.flow_settings.name != "rn_col_a"
+        with get_db_context() as db:
+            reg_b = db.query(FlowRegistration).filter(FlowRegistration.flow_path == str(file_b)).one()
+            assert reg_b.name == "rn_col_b"
+    finally:
+        for p in (src_a, src_b):
+            remove_flow(p)
+        for p in (file_a, file_b):
+            if p.exists():
+                p.unlink()
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(
+                FlowRegistration.flow_path.in_([str(file_a), str(file_b)])
+            ).delete(synchronize_session=False)
+            db.commit()
+
+
+def test_flow_settings_exposes_catalog_display_name():
+    """The catalog registration is the naming authority, so every settings read exposes it.
+
+    Regression: only /active_flowfile_sessions/ resolved display_name, so the save
+    dialog (which reads /editor/flow) fell back to the file stem and re-registered
+    the flow under its pre-rename name.
+    """
+    from flowfile_core.database.models import FlowRegistration
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    src_path = str(base_dir / "disp_name_src.yaml")
+    remove_flow(src_path)
+    ns = _ensure_namespace("NsDisplayName")
+
+    flow_id = client.post("editor/create_flow", params={"flow_path": src_path}).json()
+    expected_file = storage.flows_directory / f"{flow_id}_disp_before.yaml"
+    if expected_file.exists():
+        expected_file.unlink()
+    try:
+        resp = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": flow_id, "flow_name": "disp_before", "namespace_id": ns["id"]},
+        )
+        assert resp.status_code == 200, resp.text
+        flow_id = resp.json()
+
+        r = client.post("/editor/rename_flow/", json={"flow_id": flow_id, "name": "disp_after"})
+        assert r.status_code == 200, r.text
+
+        editor = client.get("editor/flow", params={"flow_id": flow_id}).json()
+        assert editor["display_name"] == "disp_after"
+        manager = client.get("/flow_settings", params={"flow_id": flow_id}).json()
+        assert manager["display_name"] == "disp_after"
+    finally:
+        remove_flow(src_path)
+        if expected_file.exists():
+            expected_file.unlink()
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == str(expected_file)).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def test_flow_settings_display_name_none_for_unregistered_flow():
+    """An unregistered scratch flow has no catalog name to resolve."""
+    flow_id = client.post("editor/create_flow", params={"register_in_catalog": False}).json()
+    try:
+        settings = client.get("editor/flow", params={"flow_id": flow_id}).json()
+        assert settings["display_name"] is None
+    finally:
+        client.post("/editor/close_flow/", params={"flow_id": flow_id})
+
+
+def test_silent_save_of_opened_flow_preserves_rename():
+    """Saving a flow opened from disk must not revert a rename to the file stem.
+
+    Uses /import_flow/ rather than create_flow because only an opened flow has an
+    unset save_location, which is what makes save_flow reach its back-fill branch.
+    Display-name exposure is covered separately, by a test that owns its own catalog
+    registration — opening a flow deliberately creates none.
+    """
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    src_path = str(base_dir / "reopen_rename_src.yaml")
+    remove_flow(src_path)
+
+    created_id = client.post("editor/create_flow", params={"flow_path": src_path}).json()
+    client.post("/editor/close_flow/", params={"flow_id": created_id})
+    try:
+        flow_id = client.get("/import_flow/", params={"flow_path": src_path}).json()
+        flow = flow_file_handler.get_flow(flow_id)
+        assert flow.flow_settings.save_location is None, "Precondition: opened flows have no save_location"
+
+        r = client.post("/editor/rename_flow/", json={"flow_id": flow_id, "name": "renamed_after_open"})
+        assert r.status_code == 200, r.text
+
+        save = client.post("/save_flow", params={"flow_id": flow_id})
+        assert save.status_code == 200, save.text
+
+        flow = flow_file_handler.get_flow(flow_id)
+        assert flow.flow_settings.name == "renamed_after_open", "Save reverted the rename to the file stem"
+        assert flow.flow_settings.save_location, "Save should still back-fill save_location"
+    finally:
+        remove_flow(src_path)
+
+
+def test_discard_relocated_scratch_file_only_unlinks_scratch_paths(tmp_path):
+    """Save-As cleanup deletes only throwaway scratch files, never a real flow's file.
+
+    This is the destructive half of the recents-prune contract behind the designer's
+    ``recordRelocatedFlowAsRecent``: the old file must go so its surviving registration
+    reports ``file_exists=False`` — but a wrong predicate here destroys user data.
+    """
+    from uuid import uuid4
+
+    from flowfile_core.routes.routes import _discard_relocated_scratch_file
+
+    def make(directory: Path) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"scratch_prune_{uuid4().hex[:8]}.yaml"
+        path.write_text("flow: {}")
+        return path
+
+    target = str(tmp_path / "relocated_to.yaml")
+    quick_create = python_editor = same_path = real_flow = None
+    try:
+        quick_create = make(Path(storage.unnamed_flows_directory))
+        _discard_relocated_scratch_file(str(quick_create), target)
+        assert not quick_create.exists(), "quick-create scratch files must be unlinked"
+
+        python_editor = make(Path(storage.python_editor_flows_directory))
+        _discard_relocated_scratch_file(str(python_editor), target)
+        assert not python_editor.exists(), "python-editor scratch files must be unlinked"
+
+        same_path = make(Path(storage.unnamed_flows_directory))
+        _discard_relocated_scratch_file(str(same_path), str(same_path))
+        assert same_path.exists(), "a same-path save must not delete the file just saved"
+
+        real_flow = make(tmp_path)
+        _discard_relocated_scratch_file(str(real_flow), target)
+        assert real_flow.exists(), "a flow outside the scratch dirs must never be deleted"
+
+        _discard_relocated_scratch_file(None, target)
+        _discard_relocated_scratch_file(str(quick_create), target)  # already gone: no error
+    finally:
+        for leftover in (quick_create, python_editor, same_path, real_flow):
+            if leftover is not None:
+                leftover.unlink(missing_ok=True)
+
+
+def test_catalog_flow_listing_reports_missing_file():
+    """A registration whose file is gone stays listed with ``file_exists=False``.
+
+    The designer prunes stale recent-flow entries off exactly this signal
+    (``recordRelocatedFlowAsRecent``), so the listing must report dangling
+    registrations rather than hide or garbage-collect them.
+    """
+    from flowfile_core.database.models import FlowRegistration
+
+    ns = _ensure_namespace("NsFileExistsSignal")
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    src_path = str(base_dir / "file_exists_signal_src.yaml")
+    remove_flow(src_path)
+
+    flow_id = client.post("editor/create_flow", params={"flow_path": src_path}).json()
+    registered_path = None
+    try:
+        resp = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": flow_id, "flow_name": "file_exists_signal_flow", "namespace_id": ns["id"]},
+        )
+        assert resp.status_code == 200, resp.text
+        flow_id = resp.json()
+
+        with get_db_context() as db:
+            reg = db.query(FlowRegistration).filter(FlowRegistration.name == "file_exists_signal_flow").first()
+            assert reg is not None, "Precondition: save_flow_to_catalog registers the flow"
+            registered_path = reg.flow_path
+
+        listing = client.get("/catalog/flows").json()
+        entry = next((f for f in listing if f["flow_path"] == registered_path), None)
+        assert entry is not None and entry["file_exists"] is True
+
+        os.unlink(registered_path)
+        listing = client.get("/catalog/flows").json()
+        entry = next((f for f in listing if f["flow_path"] == registered_path), None)
+        assert entry is not None, "A registration must outlive its file"
+        assert entry["file_exists"] is False
+    finally:
+        client.post("/editor/close_flow/", params={"flow_id": flow_id})
+        remove_flow(src_path)
+        if registered_path:
+            remove_flow(registered_path)
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(
+                FlowRegistration.flow_path.in_([p for p in (src_path, registered_path) if p])
+            ).delete(synchronize_session=False)
+            db.query(FlowRegistration).filter(FlowRegistration.name == "file_exists_signal_flow").delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def test_catalog_resave_under_own_name_is_idempotent():
+    """Saving an already-registered flow to the catalog under its own name overwrites in place.
+
+    Regression: the target filename was always re-derived as ``{flow_id}_{stem}.yaml``,
+    which resolves to a new path after a Save-As minted a fresh flow_id — so the
+    re-save wrote a YAML and then 409'd on its own registration's name, leaving an
+    orphan file behind.
+    """
+    from flowfile_core.database.models import FlowRegistration
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    src_path = str(base_dir / "resave_src.yaml")
+    remove_flow(src_path)
+    ns = _ensure_namespace("NsResaveIdempotent")
+
+    flow_id = client.post("editor/create_flow", params={"flow_path": src_path}).json()
+    expected_file = storage.flows_directory / f"{flow_id}_resave_flow.yaml"
+    if expected_file.exists():
+        expected_file.unlink()
+    try:
+        resp = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": flow_id, "flow_name": "resave_flow", "namespace_id": ns["id"]},
+        )
+        assert resp.status_code == 200, resp.text
+        flow_id = resp.json()
+
+        again = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": flow_id, "flow_name": "resave_flow", "namespace_id": ns["id"]},
+        )
+        assert again.status_code == 200, again.text
+        assert again.json() == flow_id, "A re-save under the same name must not mint a new flow id"
+
+        with get_db_context() as db:
+            regs = (
+                db.query(FlowRegistration)
+                .filter(FlowRegistration.name == "resave_flow", FlowRegistration.namespace_id == ns["id"])
+                .all()
+            )
+            assert len(regs) == 1, "Re-save must not create a second registration"
+            assert regs[0].flow_path == str(expected_file)
+        second_file = storage.flows_directory / f"{flow_id}_resave_flow.yaml"
+        if second_file != expected_file:
+            assert not second_file.exists(), "Re-save must not leave an orphan file"
+    finally:
+        remove_flow(src_path)
+        for p in (expected_file, storage.flows_directory / f"{flow_id}_resave_flow.yaml"):
+            if p.exists():
+                p.unlink()
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.name == "resave_flow").delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
 def test_add_node():
     flow_id = ensure_clean_flow()
     response = client.post(
@@ -310,12 +794,64 @@ def test_add_generic_settings():
     ), "Settings not set"
 
 
+def test_update_settings_list_files():
+    """Covers the string-convention dispatch: node_type -> add_list_files + NodeListFiles."""
+    import tempfile
+
+    directory = tempfile.mkdtemp()
+    (Path(directory) / "a.csv").write_text("x\n1\n")
+    (Path(directory) / "b.parquet").write_bytes(b"PAR1")
+
+    flow_id = ensure_clean_flow()
+    add_node_placeholder("list_files", node_id=1, flow_id=flow_id)
+    settings = input_schema.NodeListFiles(flow_id=flow_id, node_id=1, path=directory, file_types=["csv"])
+    r = client.post("/update_settings/", json=settings.model_dump(), params={"node_type": "list_files"})
+    assert r.status_code == 200, r.text
+
+    flow = flow_file_handler.get_flow(flow_id)
+    node = flow.get_node(1)
+    assert node.node_type == "list_files"
+    assert [c.column_name for c in node.get_predicted_schema()][:2] == ["file_name", "file_path"]
+
+    flow.run_graph()
+    data = node.get_resulting_data().collect()
+    assert data["file_name"].to_list() == ["a.csv"]
+
+
+def test_update_settings_invalid_identifier_returns_422():
+    flow_id = ensure_clean_flow()
+    add_node_placeholder("database_writer", flow_id=flow_id)
+    bad_settings = {
+        "flow_id": flow_id,
+        "node_id": 1,
+        "database_write_settings": {
+            "connection_mode": "inline",
+            "table_name": "tesst-2",
+            "if_exists": "append",
+        },
+    }
+    r = client.post("/update_settings/", json=bad_settings, params={"node_type": "database_writer"})
+    assert r.status_code == 422, f"Validation errors should be 422, got {r.status_code}"
+    detail = r.json()["detail"]
+    assert "Invalid SQL identifier" in detail, detail
+    assert "table_name" in detail, detail
+
+
+def test_update_settings_unknown_flow_returns_404():
+    missing_flow_id = 987_654_321
+    assert flow_file_handler.get_flow(missing_flow_id) is None
+    settings = {"flow_id": missing_flow_id, "node_id": 1, "raw_data_format": {"columns": [], "data": []}}
+    r = client.post("/update_settings/", json=settings, params={"node_type": "manual_input"})
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == "could not find the flow"
+
+
 def test_connect_node():
     flow_id = ensure_clean_flow()
     add_node(flow_id, 1, node_type="manual_input", pos_x=0, pos_y=0)
     add_node(flow_id, 2, node_type="select", pos_x=0, pos_y=0)
     connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
-    r = client.post("/editor/connect_node/", data=connection.json(), params={"flow_id": flow_id})
+    r = client.post("/editor/connect_node/", data=connection.json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id})
     assert r.status_code == 200, "Node not connected"
     assert flow_file_handler.get_node(flow_id, 1).leads_to_nodes[0].node_id == 2, "Node from to not connected"
     assert flow_file_handler.get_node(flow_id, 2).all_inputs[0].node_id == 1, "Node to from not connected"
@@ -339,7 +875,7 @@ def test_delete_main_connection():
     client.post("/update_settings/", json=data, params={"node_type": "join"})
     node_connection: input_schema.NodeConnection = input_schema.NodeConnection.create_from_simple_input(1, 3)
     response = client.post(
-        "/editor/delete_connection", data=node_connection.model_dump_json(), params={"flow_id": flow_id}
+        "/editor/delete_connection", data=node_connection.model_dump_json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id}
     )
     assert response.status_code == 200, "Connection not deleted"
     assert flow.get_node(1).leads_to_nodes == [], "Connection not deleted"
@@ -354,7 +890,7 @@ def test_delete_right_connection():
     right_connection: input_schema.NodeConnection = input_schema.NodeConnection.create_from_simple_input(2, 3)
     right_connection.input_connection.connection_class = "input-1"
     response = client.post(
-        "/editor/delete_connection", data=right_connection.model_dump_json(), params={"flow_id": flow_id}
+        "/editor/delete_connection", data=right_connection.model_dump_json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id}
     )
     assert response.status_code == 200, "Connection not deleted"
     assert flow.get_node(2).leads_to_nodes == [], "Connection not deleted"
@@ -368,7 +904,7 @@ def test_delete_connection_with_wrong_input():
     client.post("/update_settings/", json=data, params={"node_type": "join"})
     right_connection: input_schema.NodeConnection = input_schema.NodeConnection.create_from_simple_input(2, 3)
     response = client.post(
-        "/editor/delete_connection", data=right_connection.model_dump_json(), params={"flow_id": flow_id}
+        "/editor/delete_connection", data=right_connection.model_dump_json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id}
     )
     assert response.status_code == 422, "Connection should not be able to delete"
     assert flow.get_node(2).leads_to_nodes != [], "Connection should not be deleted"
@@ -383,7 +919,7 @@ def test_run_error_flow_with_join():
     right_connection: input_schema.NodeConnection = input_schema.NodeConnection.create_from_simple_input(2, 3)
     right_connection.input_connection.connection_class = "input-1"
     response = client.post(
-        "/editor/delete_connection", data=right_connection.model_dump_json(), params={"flow_id": flow_id}
+        "/editor/delete_connection", data=right_connection.model_dump_json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id}
     )
     assert response.status_code == 200, "Connection not deleted, breaking off test"
     response = client.post("/flow/run/", params={"flow_id": flow_id})
@@ -402,13 +938,119 @@ def test_import_flow():
     assert flow_file_handler.get_flow(flow_id).flow_settings.path == flow_path, "Flow path not set"
 
 
+def test_import_flow_does_not_register():
+    """Opening a .yaml is browsing: it must not mint a catalog row."""
+    from flowfile_core.database.models import FlowRegistration
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    flow_path = str(base_dir / "import_no_register.yaml")
+    remove_flow(flow_path)
+    with get_db_context() as db:
+        db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).delete(synchronize_session=False)
+        db.commit()
+
+    # Build the file through create_flow with registration off, so only the open is measured.
+    resp = client.post("editor/create_flow", params={"flow_path": flow_path, "register_in_catalog": False})
+    assert resp.status_code == 200, f"Create failed: {resp.text}"
+    flow_file_handler.get_flow(resp.json()).save_flow(flow_path)
+    assert os.path.exists(flow_path), "Fixture flow file should exist before the import"
+
+    try:
+        response = client.get("/import_flow", params={"flow_path": flow_path})
+        assert response.status_code == 200, f"Import failed: {response.text}"
+
+        with get_db_context() as db:
+            assert (
+                db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).count() == 0
+            ), "Opening a flow must not create a catalog registration"
+    finally:
+        remove_flow(flow_path)
+
+
+def test_create_from_template_does_not_register():
+    """Instantiating a template creates a session, not a catalog row.
+
+    It used to register ``flows_dir/{stem}.yaml`` — a path the route's own ``finally``
+    had just unlinked — so every instantiation minted a permanently dangling row.
+    """
+    from shared.storage_config import storage
+
+    from flowfile_core.database.models import FlowRegistration
+
+    templates = client.get("/templates/")
+    assert templates.status_code == 200, f"Template listing failed: {templates.text}"
+    metas = templates.json()
+    if not metas:
+        pytest.skip("No template flow YAMLs available in this checkout")
+    template_id = metas[0]["template_id"]
+
+    before = _registration_paths()
+    resp = client.post(f"/templates/{template_id}/create")
+    if resp.status_code == 502:
+        pytest.skip(f"Template data unavailable offline: {resp.text}")
+    assert resp.status_code == 200, f"Template instantiation failed: {resp.text}"
+    flow_id = resp.json()
+
+    try:
+        assert _registration_paths() == before, "Instantiating a template must not create a registration"
+        stem = flow_file_handler.get_flow(flow_id).flow_settings.name
+        with get_db_context() as db:
+            dangling = (
+                db.query(FlowRegistration)
+                .filter(FlowRegistration.flow_path.like(f"{storage.flows_directory}%"))
+                .filter(FlowRegistration.name == stem)
+                .count()
+            )
+            assert dangling == 0, "No dangling registration should be left behind"
+    finally:
+        flow_file_handler.delete_flow(flow_id)
+
+
+def _registration_paths() -> set[str]:
+    """Snapshot of every registered flow_path, for before/after comparisons."""
+    from flowfile_core.database.models import FlowRegistration
+
+    with get_db_context() as db:
+        return {row[0] for row in db.query(FlowRegistration.flow_path).all()}
+
+
+def test_import_flow_of_registered_flow_still_resolves_registration():
+    """Guards the surviving half of the import path: an existing row is still adopted."""
+    from flowfile_core.database.models import FlowRegistration
+
+    ns = client.post("/catalog/namespaces", json={"name": "ImportAdoptRegistration"}).json()
+    assert "id" in ns, "Namespace not created"
+
+    create = client.post("editor/create_flow", params={"name": "adopt_me", "namespace_id": ns["id"]})
+    assert create.status_code == 200, f"Create failed: {create.text}"
+    original_id = create.json()
+    flow_path = flow_file_handler.get_flow(original_id).flow_settings.path
+    flow_file_handler.delete_flow(original_id)
+
+    try:
+        with get_db_context() as db:
+            reg_id = db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).one().id
+
+        response = client.get("/import_flow", params={"flow_path": flow_path})
+        assert response.status_code == 200, f"Import failed: {response.text}"
+        reopened = flow_file_handler.get_flow(response.json())
+        assert reopened.flow_settings.source_registration_id == reg_id
+    finally:
+        remove_flow(flow_path)
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
 def test_delete_connection():
     flow_id = create_flow_with_manual_input_and_select()
     if not flow_file_handler.get_node(flow_id, 1).leads_to_nodes:
         raise Exception("Node not connected, breaking off test")
     node_connection: input_schema.NodeConnection = input_schema.NodeConnection.create_from_simple_input(1, 2)
     response = client.post(
-        "/editor/delete_connection", data=node_connection.model_dump_json(), params={"flow_id": flow_id}
+        "/editor/delete_connection", data=node_connection.model_dump_json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id}
     )
     assert response.status_code == 200, "Connection not deleted"
     assert 2 not in flow_file_handler.get_node(flow_id, 1).leads_to_nodes, "Connection not deleted"
@@ -424,7 +1066,7 @@ def test_run_invalid_flow():
         raise Exception("Node not connected, breaking off test")
     node_connection: input_schema.NodeConnection = input_schema.NodeConnection.create_from_simple_input(1, 2)
     response = client.post(
-        "/editor/delete_connection", data=node_connection.model_dump_json(), params={"flow_id": flow_id}
+        "/editor/delete_connection", data=node_connection.model_dump_json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id}
     )
     assert response.status_code == 200, "Connection not deleted, breaking off test"
     response = client.post("/flow/run/", params={"flow_id": flow_id})
@@ -534,6 +1176,76 @@ def test_save_flow_to_catalog_prefixes_filename():
             db.commit()
 
 
+def test_undo_preserves_catalog_display_name_and_path():
+    """Regression: undo must keep a catalog flow's clean display_name + path.
+
+    Previously undo dropped ``flow_settings.path``, so the session's display-name
+    lookup failed (the UI reverted to the raw ``{flow_id}_`` file stem) and a silent
+    save could no longer relink to the original catalog registration.
+    """
+    from flowfile_core.database.models import FlowRegistration
+    from flowfile_core.flowfile.history_manager import HistoryConfig
+    from flowfile_core.schemas.history_schema import HistoryActionType
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    src_path = str(base_dir / "undo_display_src.yaml")
+    remove_flow(src_path)
+    ns = client.post("/catalog/namespaces", json={"name": "NsUndoDisplay"}).json()
+    assert "id" in ns, "Namespace not created"
+
+    src_flow_id = client.post("editor/create_flow", params={"flow_path": src_path}).json()
+    expected_file = storage.flows_directory / f"{src_flow_id}_undo_disp.yaml"
+    if expected_file.exists():
+        expected_file.unlink()
+    try:
+        resp = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": src_flow_id, "flow_name": "undo_disp", "namespace_id": ns["id"]},
+        )
+        assert resp.status_code == 200, resp.text
+        flow_id = resp.json()
+        assert isinstance(flow_id, int)
+
+        def _session():
+            sessions = client.get("/active_flowfile_sessions/").json()
+            return next((s for s in sessions if s["flow_id"] == flow_id), None)
+
+        # Baseline: the clean display_name is resolved from the registration by path.
+        before = _session()
+        assert before is not None, "Saved flow has no active session"
+        assert before["display_name"] == "undo_disp"
+        assert before["path"], "Saved flow should have a path"
+
+        # Make an undoable change on the live flow, then undo via the route.
+        flow = flow_file_handler.get_flow(flow_id)
+        flow.flow_settings.track_history = False
+        flow._history_manager._config = HistoryConfig(enabled=True)
+        flow.capture_history_snapshot(HistoryActionType.ADD_NODE, "before add")
+        flow.add_node_promise(input_schema.NodePromise(flow_id=flow_id, node_id=1, node_type="manual_input"))
+
+        undo = client.post("/editor/undo/", params={"flow_id": flow_id})
+        assert undo.status_code == 200 and undo.json()["success"], undo.text
+
+        # Regression assertions: identity survived the undo.
+        after = _session()
+        assert after is not None
+        assert after["display_name"] == "undo_disp", "Undo must not drop the catalog display name"
+        assert after["path"], "Undo must not wipe the flow path"
+
+        # A silent same-path save still works (it needs the preserved path).
+        save = client.post("/save_flow", params={"flow_id": flow_id})
+        assert save.status_code == 200, save.text
+    finally:
+        remove_flow(src_path)
+        if expected_file.exists():
+            expected_file.unlink()
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(
+                FlowRegistration.flow_path == str(expected_file)
+            ).delete(synchronize_session=False)
+            db.commit()
+
+
 def test_save_flow_to_catalog_refuses_overwrite_of_foreign_file():
     """A pre-existing file with no catalog registration must not be overwritten."""
     from flowfile_core.database.models import FlowRegistration
@@ -574,8 +1286,9 @@ def test_save_flow_to_catalog_refuses_overwrite_of_foreign_file():
             db.commit()
 
 
-def test_save_flow_to_catalog_unlinks_old_file_on_rename():
-    """Renaming a catalog-saved flow removes the previous managed yaml."""
+def test_save_flow_to_catalog_keeps_old_file_on_rename():
+    """Saving a catalog flow under a new name is a copy, not a move: the previous
+    managed yaml survives so Save-As never destroys the original."""
     from flowfile_core.database.models import FlowRegistration
 
     first_name = "rename_before"
@@ -612,8 +1325,8 @@ def test_save_flow_to_catalog_unlinks_old_file_on_rename():
         )
         assert resp_second.status_code == 200, f"Second save failed: {resp_second.text}"
         assert second_expected.exists(), "Second-name file should exist after rename save"
-        assert not first_expected.exists(), (
-            f"Old managed file {first_expected} should have been unlinked on rename"
+        assert first_expected.exists(), (
+            f"Save-As under a new name must not delete the original file {first_expected}"
         )
     finally:
         for p in (first_expected, locals().get("second_expected")):
@@ -683,24 +1396,388 @@ def test_save_flow_to_catalog_rejects_duplicate_name_in_namespace():
             db.commit()
 
 
-def test_save_flow_to_catalog_rejects_filename_with_separators():
-    """A flow_name containing path separators must be rejected with 403."""
+def test_save_flow_to_catalog_slugifies_separators_no_traversal():
+    """A flow_name containing path separators is slugified into a safe filename
+    under the managed dir — never used to traverse out of it."""
+    from flowfile_core.database.models import FlowRegistration
+
     base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
-    source_path = str(base_dir / "separator_rejection_source.yaml")
+    source_path = str(base_dir / "separator_slug_source.yaml")
     remove_flow(source_path)
 
-    ns = client.post("/catalog/namespaces", json={"name": "NsSeparatorReject_endpoint"}).json()
+    ns = client.post("/catalog/namespaces", json={"name": "NsSeparatorSlug_endpoint"}).json()
     assert "id" in ns, "Namespace not created"
 
     flow_id = client.post("editor/create_flow", params={"flow_path": source_path}).json()
+    # "../evil" slugifies to "evil"; the only legitimate target is under the managed dir.
+    expected = storage.flows_directory / f"{flow_id}_evil.yaml"
+    traversal_target = storage.flows_directory.parent / "evil.yaml"
+    for p in (expected, traversal_target):
+        if p.exists():
+            p.unlink()
     try:
         resp = client.post(
             "/save_flow_to_catalog",
             params={"flow_id": flow_id, "flow_name": "../evil", "namespace_id": ns["id"]},
         )
-        assert resp.status_code == 403, f"Expected 403, got {resp.status_code}: {resp.text}"
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+        assert expected.exists(), f"Slugified file missing under managed dir: {expected}"
+        assert not traversal_target.exists(), "Save must not escape the managed flows directory"
+
+        # The raw name is preserved as the display label; only the filename is slugified.
+        with get_db_context() as db:
+            reg = db.query(FlowRegistration).filter(FlowRegistration.flow_path == str(expected)).one()
+            assert reg.name == "../evil"
     finally:
         remove_flow(source_path)
+        for p in (expected, traversal_target):
+            if p.exists():
+                p.unlink()
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == str(expected)).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def test_save_flow_to_catalog_allows_name_with_spaces():
+    """Regression: a friendly flow name with spaces saves successfully — the name
+    is a free-form display label and only the on-disk filename is slugified."""
+    from flowfile_core.database.models import FlowRegistration
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    source_path = str(base_dir / "spaced_name_source.yaml")
+    remove_flow(source_path)
+
+    ns = client.post("/catalog/namespaces", json={"name": "NsSpacedName_endpoint"}).json()
+    assert "id" in ns, "Namespace not created"
+
+    flow_id = client.post("editor/create_flow", params={"flow_path": source_path}).json()
+    expected = storage.flows_directory / f"{flow_id}_market_analytics.yaml"
+    if expected.exists():
+        expected.unlink()
+    try:
+        resp = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": flow_id, "flow_name": "market analytics", "namespace_id": ns["id"]},
+        )
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+        assert expected.exists(), f"Slugified file missing: {expected}"
+
+        with get_db_context() as db:
+            reg = db.query(FlowRegistration).filter(FlowRegistration.flow_path == str(expected)).one()
+            assert reg.name == "market analytics", "Display name should preserve the spaces"
+    finally:
+        remove_flow(source_path)
+        if expected.exists():
+            expected.unlink()
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == str(expected)).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def test_create_flow_registers_in_selected_namespace():
+    """create_flow with namespace_id registers directly in that namespace, not Local Flows."""
+    from flowfile_core.database.models import FlowRegistration
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    flow_path = str(base_dir / "ns_create_target.yaml")
+    remove_flow(flow_path)
+
+    ns = client.post("/catalog/namespaces", json={"name": "NsCreateFlow_endpoint"}).json()
+    assert "id" in ns, "Namespace not created"
+
+    try:
+        resp = client.post("editor/create_flow", params={"flow_path": flow_path, "namespace_id": ns["id"]})
+        assert resp.status_code == 200, f"Create failed: {resp.text}"
+        assert os.path.exists(flow_path), "Flow file should exist after create"
+
+        with get_db_context() as db:
+            reg = db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).one()
+            assert reg.namespace_id == ns["id"]
+            assert reg.name == "ns_create_target"
+    finally:
+        remove_flow(flow_path)
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def test_create_flow_without_namespace_auto_registers_local_flows():
+    """Regression guard: create_flow without namespace_id keeps auto-registering under Local Flows."""
+    from flowfile_core.database.init_db import init_db
+    from flowfile_core.database.models import CatalogNamespace, FlowRegistration
+
+    # Earlier catalog test files wipe all CatalogNamespace rows via autouse fixtures,
+    # so the seeded "General > Local Flows" may be gone by the time this runs. Re-seed
+    # (idempotent) so auto-registration has a namespace to land in.
+    init_db()
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    flow_path = str(base_dir / "ns_create_default.yaml")
+    remove_flow(flow_path)
+
+    try:
+        resp = client.post("editor/create_flow", params={"flow_path": flow_path})
+        assert resp.status_code == 200, f"Create failed: {resp.text}"
+
+        with get_db_context() as db:
+            reg = db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).one()
+            ns = db.get(CatalogNamespace, reg.namespace_id)
+            assert ns.name == "Local Flows"
+    finally:
+        remove_flow(flow_path)
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def test_create_flow_skip_catalog_registration():
+    """``register_in_catalog=False`` opens a session and still writes the YAML.
+
+    The two switches are deliberately independent: fusing them is what made the
+    designer's "Also register in catalog" checkbox unable to express "on disk, not
+    in the catalog". Registration off must not silently also mean "no file".
+    """
+    from flowfile_core.database.init_db import init_db
+    from flowfile_core.database.models import FlowRegistration
+
+    # Re-seed namespaces (autouse catalog fixtures may have wiped them) so that a
+    # regression where the flag is ignored would actually have somewhere to register.
+    init_db()
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    flow_path = str(base_dir / "ns_create_unregistered.yaml")
+    remove_flow(flow_path)
+
+    try:
+        resp = client.post(
+            "editor/create_flow",
+            params={"flow_path": flow_path, "register_in_catalog": False},
+        )
+        assert resp.status_code == 200, f"Create failed: {resp.text}"
+        flow_id = resp.json()
+        assert isinstance(flow_id, int), "create_flow should still return a session flow_id"
+
+        assert os.path.exists(flow_path), "register_in_catalog=False must still persist the flow file"
+
+        flow = flow_file_handler.get_flow(flow_id)
+        assert flow is not None, "the unregistered flow should still be a live in-memory session"
+        assert flow.flow_settings.source_registration_id is None
+
+        with get_db_context() as db:
+            reg = db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).one_or_none()
+            assert reg is None, "register_in_catalog=False must not create a catalog registration"
+    finally:
+        remove_flow(flow_path)
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def test_create_flow_persist_false_writes_no_yaml():
+    """``persist=False`` defers the YAML write to the first explicit save or run.
+
+    Registration is unaffected — it is the other switch — so this create still lands
+    a catalog row, just one whose file does not exist yet.
+    """
+    from flowfile_core.database.init_db import init_db
+    from flowfile_core.database.models import FlowRegistration
+
+    init_db()
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    flow_path = str(base_dir / "ns_create_ephemeral.yaml")
+    remove_flow(flow_path)
+
+    try:
+        resp = client.post(
+            "editor/create_flow",
+            params={"flow_path": flow_path, "persist": False},
+        )
+        assert resp.status_code == 200, f"Create failed: {resp.text}"
+        flow_id = resp.json()
+
+        assert not os.path.exists(flow_path), "persist=False must not write the YAML to disk"
+
+        flow = flow_file_handler.get_flow(flow_id)
+        assert flow is not None, "the deferred flow should still be a live in-memory session"
+        assert flow.has_unsaved_changes() is False, "a fresh deferred flow should have a clean dirty baseline"
+
+        with get_db_context() as db:
+            reg = db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).one_or_none()
+            assert reg is not None, "persist only controls the file, never the registration"
+    finally:
+        remove_flow(flow_path)
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def test_create_flow_default_persists_to_disk():
+    """A default create still writes the flow YAML to disk.
+
+    Guards the split between ``persist`` and ``register_in_catalog``: neither flag's
+    default may drift, and neither may start implying the other.
+    """
+    from flowfile_core.database.init_db import init_db
+    from flowfile_core.database.models import FlowRegistration
+
+    init_db()
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    flow_path = str(base_dir / "default_create_persist.yaml")
+    remove_flow(flow_path)
+
+    try:
+        resp = client.post("editor/create_flow", params={"flow_path": flow_path})
+        assert resp.status_code == 200, f"Create failed: {resp.text}"
+        assert os.path.exists(flow_path), "a default create must persist the flow YAML to disk"
+    finally:
+        remove_flow(flow_path)
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def test_save_as_register_in_catalog_false_creates_no_registration():
+    """Unchecking "Also register in catalog" on Save As must actually opt out.
+
+    A null namespace alone routes into auto-registration on the backend, which is
+    exactly the checkbox lie this flag closes. The default save-as (flag omitted)
+    must keep auto-registering under General > Local Flows.
+    """
+    from flowfile_core.database.models import CatalogNamespace, FlowRegistration
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    path_a = str(base_dir / "save_as_optout_a.yaml")
+    path_b = str(base_dir / "save_as_optout_b.yaml")
+    path_c = str(base_dir / "save_as_optout_c.yaml")
+
+    def _drop_registrations():
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path.in_([path_a, path_b, path_c])).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+    for p in (path_a, path_b, path_c):
+        remove_flow(p)
+    _drop_registrations()
+
+    try:
+        created_id = client.post(
+            "editor/create_flow", params={"flow_path": path_a, "register_in_catalog": False}
+        ).json()
+
+        opted_out = client.post(
+            "/save_flow", params={"flow_id": created_id, "flow_path": path_b, "register_in_catalog": False}
+        )
+        assert opted_out.status_code == 200, f"Save As failed: {opted_out.text}"
+        saved_id = opted_out.json()
+        assert os.path.exists(path_b), "Opting out of registration must still write the file"
+        with get_db_context() as db:
+            assert (
+                db.query(FlowRegistration).filter(FlowRegistration.flow_path == path_b).count() == 0
+            ), "register_in_catalog=False must not mint a registration on Save As"
+
+        default_save = client.post("/save_flow", params={"flow_id": saved_id, "flow_path": path_c})
+        assert default_save.status_code == 200, f"Default Save As failed: {default_save.text}"
+        with get_db_context() as db:
+            reg = db.query(FlowRegistration).filter(FlowRegistration.flow_path == path_c).one_or_none()
+            assert reg is not None, "A default Save As must keep auto-registering"
+            assert db.get(CatalogNamespace, reg.namespace_id).name == "Local Flows"
+    finally:
+        for p in (path_a, path_b, path_c):
+            remove_flow(p)
+        _drop_registrations()
+
+
+def test_namespace_with_register_off_is_rejected():
+    """namespace_id + register_in_catalog=False is contradictory: 422, before any
+    namespace lookup (a bogus id must not turn it into a 404)."""
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    flow_path = str(base_dir / "ns_contradiction.yaml")
+    remove_flow(flow_path)
+
+    resp = client.post(
+        "editor/create_flow",
+        params={"flow_path": flow_path, "namespace_id": 999_999, "register_in_catalog": False},
+    )
+    assert resp.status_code == 422, resp.text
+    assert not os.path.exists(flow_path), "a rejected create must not leave a file behind"
+
+    flow_id = client.post("editor/create_flow", params={"flow_path": flow_path, "register_in_catalog": False}).json()
+    try:
+        resp = client.post(
+            "/save_flow",
+            params={
+                "flow_id": flow_id,
+                "flow_path": flow_path,
+                "namespace_id": 999_999,
+                "register_in_catalog": False,
+            },
+        )
+        assert resp.status_code == 422, resp.text
+    finally:
+        remove_flow(flow_path)
+
+
+def test_create_flow_name_collision_in_namespace_409():
+    """A second create with the same name in the same namespace is rejected before any file is written."""
+    from flowfile_core.database.models import FlowRegistration
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    other_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows"
+    path_a = str(base_dir / "ns_create_collision.yaml")
+    path_b = str(other_dir / "ns_create_collision.yaml")
+    remove_flow(path_a)
+    remove_flow(path_b)
+
+    ns = client.post("/catalog/namespaces", json={"name": "NsCreateCollision_endpoint"}).json()
+    assert "id" in ns, "Namespace not created"
+
+    try:
+        resp_a = client.post("editor/create_flow", params={"flow_path": path_a, "namespace_id": ns["id"]})
+        assert resp_a.status_code == 200, f"First create failed: {resp_a.text}"
+
+        resp_b = client.post("editor/create_flow", params={"flow_path": path_b, "namespace_id": ns["id"]})
+        assert resp_b.status_code == 409, f"Expected 409, got {resp_b.status_code}: {resp_b.text}"
+        assert not os.path.exists(path_b), "Rejected create must not leave a file behind"
+    finally:
+        remove_flow(path_a)
+        remove_flow(path_b)
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path.in_([path_a, path_b])).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def test_create_flow_nonexistent_namespace_404():
+    """create_flow with a namespace_id that does not exist is rejected before any file is written."""
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    flow_path = str(base_dir / "ns_create_missing_ns.yaml")
+    remove_flow(flow_path)
+
+    try:
+        resp = client.post("editor/create_flow", params={"flow_path": flow_path, "namespace_id": 99999999})
+        assert resp.status_code == 404, f"Expected 404, got {resp.status_code}: {resp.text}"
+        assert not os.path.exists(flow_path), "Rejected create must not leave a file behind"
+    finally:
+        remove_flow(flow_path)
 
 
 def test_overwrite_flow_in_catalog_preserves_metadata():
@@ -936,9 +2013,31 @@ def test_get_flow_data_v2():
     add_node(flow_id, 1, node_type="manual_input", pos_x=0, pos_y=0)
     add_node(flow_id, 2, node_type="select", pos_x=0, pos_y=0)
     connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
-    client.post("/editor/connect_node/", data=connection.json(), params={"flow_id": flow_id})
+    client.post("/editor/connect_node/", data=connection.json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id})
     response = client.get("/flow_data/v2", params={"flow_id": flow_id})
     assert response.status_code == 200, "Flow data not retrieved"
+
+
+def test_flow_data_v2_carries_node_descriptions():
+    """The canvas seeds its description cache from this payload."""
+    flow_id = create_flow_with_manual_input_and_select()
+    response = client.post(
+        "/node/description/", json="Load the people", params={"flow_id": flow_id, "node_id": 1}
+    )
+    assert response.status_code == 200, response.text
+
+    nodes = {n["id"]: n for n in client.get("/flow_data/v2", params={"flow_id": flow_id}).json()["node_inputs"]}
+    assert nodes[1]["description"] == "Load the people"
+    assert nodes[1]["is_auto_generated"] is False
+    assert nodes[2]["is_auto_generated"] is True
+
+    # Bulk payload and per-node GET must agree.
+    for node_id in (1, 2):
+        single = client.get("/node/description", params={"flow_id": flow_id, "node_id": node_id}).json()
+        assert single == {
+            "description": nodes[node_id]["description"],
+            "is_auto_generated": nodes[node_id]["is_auto_generated"],
+        }
 
 
 def create_flow_with_graphic_walker_input() -> FlowId:
@@ -991,13 +2090,11 @@ def test_update_flow_with_settings_polars_code():
 
 
 def test_instant_function_result():
-    # Setup nodes
     flow_id = create_flow_with_manual_input()
     add_node(flow_id=flow_id, node_id=2, node_type="formula", pos_x=0, pos_y=0)
 
     connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
     connect_node(flow_id, connection)
-    # Await the result
     response = client.get(
         "/custom_functions/instant_result", params={"flow_id": flow_id, "node_id": 2, "func_string": "[name]"}
     )
@@ -1011,7 +2108,6 @@ def test_instant_function_result_fail():
     connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
     connect_node(flow_id, connection)
 
-    # Await the result
     response = client.get(
         "/custom_functions/instant_result", params={"flow_id": flow_id, "node_id": 2, "func_string": "name"}
     )
@@ -1019,11 +2115,286 @@ def test_instant_function_result_fail():
     assert not response.json().get("success"), "Instant function result did not fail"
 
 
+def _chain_entry(name: str, function: str, data_type: str | None = None) -> dict:
+    return {"field": {"name": name, "data_type": data_type}, "function": function}
+
+
+def _formula_chain_flow() -> FlowId:
+    """manual_input(name, city) -> formula node 2, wired but with no settings saved yet."""
+    flow_id = create_flow_with_manual_input()
+    add_node(flow_id=flow_id, node_id=2, node_type="formula", pos_x=0, pos_y=0)
+    connect_node(flow_id, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    return flow_id
+
+
+def test_formula_chain_check_accumulates_columns():
+    flow_id = _formula_chain_flow()
+    response = client.post(
+        "/custom_functions/formula_chain_check",
+        json={
+            "flow_id": flow_id,
+            "node_id": 2,
+            "entries": [
+                _chain_entry("greeting", '"hi " + [name]'),
+                _chain_entry("shout", "[greeting] + \"!\""),
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["available"] is True
+    assert [c["name"] for c in body["base_columns"]] == ["name", "city"]
+    assert [e["issue"] for e in body["entries"]] == [None, None]
+    assert [c["name"] for c in body["entries"][0]["columns"]] == ["name", "city", "greeting"]
+    assert [c["name"] for c in body["entries"][1]["columns"]] == ["name", "city", "greeting", "shout"]
+    assert {c["data_type"] for c in body["entries"][1]["columns"]} == {"String"}
+
+
+def test_formula_chain_check_flags_a_forward_reference():
+    flow_id = _formula_chain_flow()
+    response = client.post(
+        "/custom_functions/formula_chain_check",
+        json={
+            "flow_id": flow_id,
+            "node_id": 2,
+            "entries": [_chain_entry("early", '"x" + [late]'), _chain_entry("late", "[name]")],
+        },
+    )
+    assert response.status_code == 200, response.text
+    entries = response.json()["entries"]
+    assert entries[0]["issue"]["kind"] == "missing_column"
+    assert entries[0]["issue"]["message"] == "column 'late' not found"
+    assert entries[0]["issue"]["suggestion"] is None
+    assert entries[1]["issue"] is None
+    # cascade suppression: the broken entry still contributes its column
+    assert "early" in [c["name"] for c in entries[0]["columns"]]
+
+
+def test_formula_chain_check_suggests_a_near_match():
+    flow_id = _formula_chain_flow()
+    response = client.post(
+        "/custom_functions/formula_chain_check",
+        json={"flow_id": flow_id, "node_id": 2, "entries": [_chain_entry("x", "[nam] + \"!\""), _chain_entry("y", "[cty")]},
+    )
+    assert response.status_code == 200, response.text
+    entries = response.json()["entries"]
+    assert entries[0]["issue"] == {
+        "message": "column 'nam' not found, did you mean 'name'?",
+        "kind": "missing_column",
+        "suggestion": {"kind": "replace_column", "from": "nam", "to": "name"},
+    }
+    assert entries[1]["issue"] == {
+        "message": "column reference is not closed, add ]",
+        "kind": "parse",
+        "suggestion": None,
+    }
+
+
+def test_formula_chain_check_is_unavailable_without_an_upstream():
+    flow_id = ensure_clean_flow()
+    add_node(flow_id=flow_id, node_id=2, node_type="formula", pos_x=0, pos_y=0)
+    response = client.post(
+        "/custom_functions/formula_chain_check",
+        json={"flow_id": flow_id, "node_id": 2, "entries": [_chain_entry("x", "[name]")]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["available"] is False
+    assert body["base_columns"] == []
+    assert body["entries"] == [{"issue": None, "columns": []}]
+
+
+def test_formula_chain_instant_result_evaluates_the_chained_entry():
+    """Entry 1's column must exist while entry 2 is evaluated; the plain route is the control."""
+    flow_id = _formula_chain_flow()
+    entries = [_chain_entry("greeting", '"hi " + [name]'), _chain_entry("shout", "[greeting] + \"!\"")]
+    response = client.post(
+        "/custom_functions/formula_chain_instant_result",
+        json={"flow_id": flow_id, "node_id": 2, "entries": entries, "index": 1},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["success"] is not False, response.json()
+
+    unchained = client.get(
+        "/custom_functions/instant_result",
+        params={"flow_id": flow_id, "node_id": 2, "func_string": '[greeting] + "!"'},
+    )
+    assert unchained.json()["success"] is False, "control: without the chain 'greeting' does not exist"
+
+
+def test_formula_chain_instant_result_blank_entry_is_neutral():
+    """A whitespace-only expression (an empty editor with stray newlines) is skipped, not an error."""
+    flow_id = _formula_chain_flow()
+    entries = [_chain_entry("greeting", '"hi " + [name]'), _chain_entry("blank", "\n\n  \n")]
+    response = client.post(
+        "/custom_functions/formula_chain_instant_result",
+        json={"flow_id": flow_id, "node_id": 2, "entries": entries, "index": 1},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"result": "", "success": None}
+
+
+def test_formula_chain_instant_result_returns_the_chained_value_after_a_run():
+    flow_id = _formula_chain_flow()
+    flow = flow_file_handler.get_flow(flow_id)
+    flow.flow_settings.execution_mode = "Development"
+    # The after-run branch reads the run's sampled artifact, which only worker-backed paths produce.
+    flow.execution_location = "remote"
+    flow.run_graph()
+    entries = [_chain_entry("greeting", '"hi " + [name]'), _chain_entry("shout", "[greeting] + \"!\"")]
+    response = client.post(
+        "/custom_functions/formula_chain_instant_result",
+        json={"flow_id": flow_id, "node_id": 2, "entries": entries, "index": 1},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"success": True, "result": "hi John!"}
+
+
+def test_formula_chain_instant_result_uses_the_chain_checks_words_for_the_active_row():
+    flow_id = _formula_chain_flow()
+    for expression, detail in [
+        ("[nam]", "column 'nam' not found, did you mean 'name'?"),
+        ("[name", "column reference is not closed, add ]"),
+    ]:
+        response = client.post(
+            "/custom_functions/formula_chain_instant_result",
+            json={"flow_id": flow_id, "node_id": 2, "entries": [_chain_entry("x", expression)], "index": 0},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"result": detail, "success": False}
+
+
+def test_formula_chain_instant_result_attributes_an_earlier_failure():
+    flow_id = _formula_chain_flow()
+    entries = [_chain_entry("broken", "[nope] + 1"), _chain_entry("uses", "[broken]")]
+    response = client.post(
+        "/custom_functions/formula_chain_instant_result",
+        json={"flow_id": flow_id, "node_id": 2, "entries": entries, "index": 1},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["success"] is False
+    assert body["result"].startswith('Formula 1 ("broken"): ')
+
+
 def test_flow_run():
     flow_id = create_flow_with_manual_input()
     response = client.post("/flow/run/", params={"flow_id": flow_id})
     assert response.status_code in (200, 202), "Flow not Started"
     assert flow_file_handler.get_flow(flow_id).get_run_info().start_time is not None, "Flow did not run"
+
+
+def test_first_run_registers_ephemeral_scratch_flow():
+    """A scratch flow created with register_in_catalog=False stays out of the catalog
+    until its first run, which promotes it into the catalog."""
+    from flowfile_core.database.init_db import init_db
+    from flowfile_core.database.models import FlowRegistration
+
+    init_db()  # ensure default namespaces exist for auto-registration
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    flow_path = str(base_dir / "scratch_first_run.yaml")
+
+    def _drop_registration():
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+    remove_flow(flow_path)
+    _drop_registration()
+
+    try:
+        # Both switches off: ephemeral means neither a catalog row nor a file yet.
+        resp = client.post(
+            "editor/create_flow",
+            params={"flow_path": flow_path, "register_in_catalog": False, "persist": False},
+        )
+        assert resp.status_code == 200, f"Create failed: {resp.text}"
+        flow_id = resp.json()
+
+        assert not os.path.exists(flow_path), "scratch flow YAML must not be written before its first run"
+
+        with get_db_context() as db:
+            assert (
+                db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).one_or_none() is None
+            ), "Scratch flow must not be catalogued before its first run"
+
+        add_node_placeholder("manual_input", node_id=1, flow_id=flow_id)
+        manual_input = input_schema.NodeManualInput(
+            flow_id=flow_id,
+            node_id=1,
+            raw_data_format=input_schema.RawData.from_pylist([{"name": "John"}, {"name": "Jane"}]),
+        )
+        client.post("/update_settings/", json=manual_input.model_dump(), params={"node_type": "manual_input"})
+
+        run_resp = client.post("/flow/run/", params={"flow_id": flow_id})
+        assert run_resp.status_code in (200, 202), f"Run failed: {run_resp.text}"
+
+        assert os.path.exists(flow_path), "first run must persist the scratch flow YAML to disk"
+
+        with get_db_context() as db:
+            reg = db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).one_or_none()
+            assert reg is not None, "First run must register the scratch flow in the catalog"
+    finally:
+        remove_flow(flow_path)
+        _drop_registration()
+
+
+def test_run_does_not_rewrite_opened_flow_file():
+    """First-run promotion registers an opened flow without rewriting its file.
+
+    With import-time registration gone, every browsed .yaml takes this path on its
+    first run — the promotion's save_flow is scoped to files that don't exist yet
+    (ephemeral flows), so a run never silently commits unsaved canvas edits to disk.
+    """
+    from flowfile_core.database.init_db import init_db
+    from flowfile_core.database.models import FlowRegistration
+
+    init_db()
+
+    base_dir = find_parent_directory("Flowfile") / "flowfile_core/tests/support_files/flows/tmp"
+    flow_path = str(base_dir / "run_no_rewrite.yaml")
+
+    def _drop_registration():
+        with get_db_context() as db:
+            db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+    remove_flow(flow_path)
+    _drop_registration()
+
+    try:
+        created_id = client.post(
+            "editor/create_flow", params={"flow_path": flow_path, "register_in_catalog": False}
+        ).json()
+        client.post("/editor/close_flow/", params={"flow_id": created_id})
+        with open(flow_path, "rb") as f:
+            on_disk_before = f.read()
+
+        flow_id = client.get("/import_flow/", params={"flow_path": flow_path}).json()
+        add_node_placeholder("manual_input", node_id=1, flow_id=flow_id)
+        manual_input = input_schema.NodeManualInput(
+            flow_id=flow_id,
+            node_id=1,
+            raw_data_format=input_schema.RawData.from_pylist([{"name": "John"}]),
+        )
+        client.post("/update_settings/", json=manual_input.model_dump(), params={"node_type": "manual_input"})
+
+        run_resp = client.post("/flow/run/", params={"flow_id": flow_id})
+        assert run_resp.status_code in (200, 202), f"Run failed: {run_resp.text}"
+
+        with open(flow_path, "rb") as f:
+            assert f.read() == on_disk_before, "Running must not rewrite the opened flow's file"
+        with get_db_context() as db:
+            reg = db.query(FlowRegistration).filter(FlowRegistration.flow_path == flow_path).one_or_none()
+            assert reg is not None, "First run must still register the opened flow"
+    finally:
+        remove_flow(flow_path)
+        _drop_registration()
 
 
 def test_instant_function_result_after_run():
@@ -1034,6 +2405,9 @@ def test_instant_function_result_after_run():
     flow = flow_file_handler.get_flow(flow_id)
     _ = flow._flow_starts
     flow.flow_settings.execution_mode = "Development"
+    # The after-run branch reads the run's sampled artifact (results.example_data_path),
+    # which only the worker-backed paths produce — a local run has no artifact to serve.
+    flow.execution_location = "remote"
     flow.run_graph()
     response = client.get(
         "/custom_functions/instant_result", params={"flow_id": flow_id, "node_id": 2, "func_string": "[name]"}
@@ -1072,12 +2446,10 @@ def test_python_script_node_data_before_run():
     with a predicted schema from the input, not trigger execution."""
     flow_id = create_flow_with_manual_input()  # node 1: manual_input with columns ['name', 'city']
 
-    # Add python_script node
     add_node(flow_id, 2, node_type="python_script", pos_x=200, pos_y=0)
     connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
     connect_node(flow_id, connection)
 
-    # Configure python_script with some code
     settings = input_schema.NodePythonScript(
         flow_id=flow_id,
         node_id=2,
@@ -1085,24 +2457,139 @@ def test_python_script_node_data_before_run():
         pos_y=0,
         depending_on_ids=[1],
         python_script_input=input_schema.PythonScriptInput(
-            code="df = flowfile.read_input()\nflowfile.publish_output(df)",
+            code="df = flowfile_ctx.read_input()\nflowfile_ctx.publish_output(df)",
             kernel_id="some-kernel",
         ),
     )
     r = client.post("/update_settings/", json=settings.model_dump(), params={"node_type": "python_script"})
     assert r.status_code == 200
 
-    # Request node data — this is what the frontend does when you click the node
     response = client.get("/node", params={"flow_id": flow_id, "node_id": 2})
     assert response.status_code == 200
 
     node_data = output_model.NodeData(**response.json())
 
-    # The predicted schema should include the input columns (name, city)
     assert node_data.main_output is not None
     assert node_data.main_output.columns == ["name", "city"], "Predicted schema should pass through input columns"
-    # Data should be empty since node hasn't run
     assert node_data.main_output.data == [], "Node data should be empty before run"
+
+
+def test_get_node_skips_output_schema_when_not_requested():
+    """Opening node settings can skip the node's own output preview (`main_output`).
+
+    For data-dependent nodes like pivot, predicting the output columns requires
+    materializing data — work the settings panel never needs, since it only uses
+    the input schemas. `include_output=false` must skip it; the default and an
+    explicit `include_output=true` must still compute it.
+    """
+    flow_id = create_flow_with_manual_input()  # node 1: manual_input with columns ['name', 'city']
+
+    add_node(flow_id, 2, node_type="pivot", pos_x=200, pos_y=0)
+    connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
+    connect_node(flow_id, connection)
+
+    pivot_settings = input_schema.NodePivot(
+        flow_id=flow_id,
+        node_id=2,
+        pos_x=200,
+        pos_y=0,
+        depending_on_ids=[1],
+        pivot_input=transform_schema.PivotInput(
+            index_columns=["city"],
+            pivot_column="name",
+            value_col="name",
+            aggregations=["count"],
+        ),
+    )
+    r = client.post("/update_settings/", json=pivot_settings.model_dump(), params={"node_type": "pivot"})
+    assert r.status_code == 200
+
+    # Without include_output the expensive pivot output prediction is skipped,
+    # but the input schema the settings panel needs is still returned.
+    response = client.get("/node", params={"flow_id": flow_id, "node_id": 2, "include_output": False})
+    assert response.status_code == 200
+    node_data = output_model.NodeData(**response.json())
+    assert node_data.main_output is None, "main_output should be skipped when include_output=false"
+    assert node_data.main_input is not None, "input schema is still needed by the settings panel"
+    assert node_data.main_input.columns == ["name", "city"]
+    assert node_data.setting_input is not None
+
+    # The default and an explicit include_output=true still compute the pivoted output.
+    for params in (
+        {"flow_id": flow_id, "node_id": 2},
+        {"flow_id": flow_id, "node_id": 2, "include_output": True},
+    ):
+        response = client.get("/node", params=params)
+        assert response.status_code == 200
+        node_data = output_model.NodeData(**response.json())
+        assert node_data.main_output is not None, f"main_output should be computed for params={params}"
+        # The single 'count' pivot widens unique 'name' values into columns.
+        assert "city" in node_data.main_output.columns
+        assert "John" in node_data.main_output.columns
+
+
+def test_get_node_skips_input_schemas_when_not_requested():
+    """The custom-node drawer's stage-1 fetch must not execute upstream nodes.
+
+    Resolving input schemas for a node downstream of an un-run custom node runs
+    that node's real function (a kernel container or worker round-trip in
+    production). `include_inputs=false` must skip that entirely; the default
+    full fetch still predicts through it (and proves the rig detects execution).
+    """
+    from flowfile_core.configs import node_store
+    from flowfile_core.flowfile.node_designer import CustomNodeBase, NodeSettings, Section, TextInput
+
+    calls: list[str] = []
+
+    class RecordingPassthrough(CustomNodeBase):
+        node_name: str = "Recording Passthrough"
+        node_category: str = "Testing"
+
+        settings_schema: NodeSettings = NodeSettings(
+            main_section=Section(title="Configuration", note=TextInput(label="Note")),
+        )
+
+        def process(self, *inputs):
+            calls.append("ran")
+            return inputs[0]
+
+    node_store.add_to_custom_node_store(RecordingPassthrough)
+    try:
+        flow_id = create_flow_with_manual_input()  # node 1: manual_input with columns ['name', 'city']
+        flow = flow_file_handler.get_flow(flow_id)
+
+        for node_id, source_id in ((2, 1), (3, 2)):
+            flow.add_node_promise(
+                input_schema.NodePromise(flow_id=flow_id, node_id=node_id, node_type="recording_passthrough")
+            )
+            add_connection(flow, input_schema.NodeConnection.create_from_simple_input(source_id, node_id))
+            flow.add_user_defined_node(
+                custom_node=RecordingPassthrough.from_settings({}),
+                user_defined_node_settings=input_schema.UserDefinedNode(
+                    flow_id=flow_id, node_id=node_id, settings={}, is_user_defined=True
+                ),
+            )
+
+        # Fast path: no input schemas, no upstream execution — the drawer renders on this.
+        response = client.get(
+            "/node",
+            params={"flow_id": flow_id, "node_id": 3, "include_output": False, "include_inputs": False},
+        )
+        assert response.status_code == 200
+        node_data = output_model.NodeData(**response.json())
+        assert node_data.main_input is None, "input schemas must be skipped when include_inputs=false"
+        assert node_data.setting_input is not None
+        assert calls == [], "the un-run upstream custom node must not execute on the settings fast path"
+
+        # Control arm: the default fetch still predicts through the upstream node.
+        response = client.get("/node", params={"flow_id": flow_id, "node_id": 3, "include_output": False})
+        assert response.status_code == 200
+        node_data = output_model.NodeData(**response.json())
+        assert node_data.main_input is not None
+        assert node_data.main_input.columns == ["name", "city"]
+        assert calls, "the control fetch proves the rig detects upstream execution"
+    finally:
+        node_store.remove_from_custom_node_store("recording_passthrough")
 
 
 def test_get_node_data_after_run():
@@ -1154,17 +2641,14 @@ def test_node_upstream_ids_two_independent_chains():
     add_node(flow_id, 4, node_type="select", pos_x=400, pos_y=0)
     connect_node(flow_id, input_schema.NodeConnection.create_from_simple_input(3, 4))
 
-    # Node 2 should only see node 1 as upstream
     r = client.get("/flow/node_upstream_ids", params={"flow_id": flow_id, "node_id": 2})
     assert r.status_code == 200
     assert set(r.json()["upstream_node_ids"]) == {1}
 
-    # Node 4 should only see node 3 as upstream
     r = client.get("/flow/node_upstream_ids", params={"flow_id": flow_id, "node_id": 4})
     assert r.status_code == 200
     assert set(r.json()["upstream_node_ids"]) == {3}
 
-    # Start node (node 1) has no upstream
     r = client.get("/flow/node_upstream_ids", params={"flow_id": flow_id, "node_id": 1})
     assert r.status_code == 200
     assert r.json()["upstream_node_ids"] == []
@@ -1199,13 +2683,12 @@ def test_flow_cancel():
     sleep(0.5)
     while flow.latest_run_info is not None and 2 not in [n.node_id for n in flow.latest_run_info.node_step_result]:
         sleep(0.5)
-    sleep(2)  # give it some time to start up
-    # actual start of the test
+    sleep(2)
     response = client.post("/flow/cancel/", params={"flow_id": flow_id})
     assert response.status_code == 200, "Flow not canceled"
     assert flow.flow_settings.is_canceled, "Flow not requested to cancel"
     assert flow.flow_settings.is_running, "Flow stopped running to early, without waiting for all processes to cancel"
-    thread.join()  # Wait for the thread to finish
+    thread.join()
     assert flow.get_run_info().node_step_result[1].success is None, "Flow not canceled"
     assert flow.get_run_info().node_step_result[0].success, "Cancel should not reset nodes that ran before cancel"
     assert flow.flow_settings.is_running is False, "Indicator not set to false"
@@ -1265,6 +2748,9 @@ def test_add_database_input():
     )
     assert r.status_code == 200, "Settings not added"
     flow_file_handler.get_flow(flow_id).flow_settings.execution_mode = "Development"
+    # needs_run defaults to the remote branch, which clears only once the worker holds a
+    # completed result for the node hash — so the run that fills it has to be remote too.
+    flow_file_handler.get_flow(flow_id).execution_location = "remote"
     flow_file_handler.get_flow(flow_id).run_graph()
     assert not flow_file_handler.get_flow(flow_id).get_node(1).needs_run(False), "Node should not need to run"
 
@@ -1452,6 +2938,70 @@ def test_editor_code_to_polars():
     assert result.columns == ["name"], "Colum name should name"
 
 
+def test_editor_code_to_project():
+    flow_id = create_flow_with_manual_input_and_select()
+    v = client.get("/editor/code_to_project", params={"flow_id": flow_id})
+    assert v.status_code == 200, "Request should be successful"
+    manifest = v.json()
+    paths = {f["path"] for f in manifest["files"]}
+    assert {"pipeline.py", "main.py", "pyproject.toml", "README.md"} <= paths
+    assert manifest["project_name"]
+
+
+def test_editor_code_to_project_unknown_flow():
+    v = client.get("/editor/code_to_project", params={"flow_id": 999999})
+    assert v.status_code == 404, "Unknown flow should return 404"
+
+
+def test_editor_code_to_project_zip():
+    import io
+    import zipfile
+
+    flow_id = create_flow_with_manual_input_and_select()
+    v = client.get("/editor/code_to_project/zip", params={"flow_id": flow_id})
+    assert v.status_code == 200, "Request should be successful"
+    assert v.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(v.content)) as archive:
+        assert any(name.endswith("pipeline.py") for name in archive.namelist())
+
+
+def test_editor_code_to_project_save(tmp_path):
+    flow_id = create_flow_with_manual_input_and_select()
+    body = {"flow_id": flow_id, "target_directory": str(tmp_path), "overwrite": False}
+    v = client.post("/editor/code_to_project/save", json=body)
+    assert v.status_code == 200, "Save should succeed"
+    saved_to = Path(v.json()["saved_to"])
+    assert (saved_to / "pipeline.py").exists()
+    assert (saved_to / "main.py").exists()
+
+    conflict = client.post("/editor/code_to_project/save", json=body)
+    assert conflict.status_code == 409, "Existing project dir without overwrite should conflict"
+
+    overwrite = client.post("/editor/code_to_project/save", json={**body, "overwrite": True})
+    assert overwrite.status_code == 200, "Overwrite should succeed"
+
+
+def test_editor_code_to_project_save_missing_directory():
+    flow_id = create_flow_with_manual_input_and_select()
+    v = client.post(
+        "/editor/code_to_project/save",
+        json={"flow_id": flow_id, "target_directory": "/nonexistent/dir/for/project", "overwrite": False},
+    )
+    assert v.status_code == 404, "Missing target directory should return 404"
+
+
+def test_editor_code_to_project_save_name_taken_by_file(tmp_path):
+    """A file occupying the project name must yield a 409, not a 500 — even with overwrite."""
+    flow_id = create_flow_with_manual_input_and_select()
+    manifest = client.get("/editor/code_to_project", params={"flow_id": flow_id}).json()
+    (tmp_path / manifest["project_name"]).write_text("not a directory")
+
+    body = {"flow_id": flow_id, "target_directory": str(tmp_path), "overwrite": True}
+    v = client.post("/editor/code_to_project/save", json=body)
+    assert v.status_code == 409, "Project name occupied by a file should conflict"
+    assert "not a directory" in v.json()["detail"]
+
+
 def test_copy_node_not_run():
     flow_id = create_flow_with_manual_input_and_select()
     flow = flow_file_handler.get_flow(flow_id)
@@ -1464,7 +3014,7 @@ def test_copy_node_not_run():
     assert r.status_code == 200, "Node not copied"
     copied_node = flow.get_node(3)
     connection = input_schema.NodeConnection.create_from_simple_input(1, 3)
-    client.post("/editor/connect_node/", data=connection.model_dump_json(), params={"flow_id": flow_id})
+    client.post("/editor/connect_node/", data=connection.model_dump_json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id})
 
     assert copied_node is not None, "Node not copied"
     assert copied_node.node_type == "select", "Node type not copied"
@@ -1483,7 +3033,7 @@ def test_from_other_flow():
     assert r.status_code == 200, "Node not copied"
     assert flow_file_handler.get_node(flow_id_to_copy_to, 34) is not None, "Node not copied"
     connection = input_schema.NodeConnection.create_from_simple_input(1, 34)
-    client.post("/editor/connect_node/", data=connection.model_dump_json(), params={"flow_id": flow_id_to_copy_to})
+    client.post("/editor/connect_node/", data=connection.model_dump_json(), headers={"Content-Type": "application/json"}, params={"flow_id": flow_id_to_copy_to})
     r = flow_file_handler.get_flow(flow_id_to_copy_to).run_graph()
     assert r.success, "Flow not run"
 
@@ -1503,7 +3053,7 @@ def test_copy_node_run():
     connection = input_schema.NodeConnection.create_from_simple_input(1, 3)
     client.post(
         "/editor/connect_node/",
-        data=connection.model_dump_json(),
+        data=connection.model_dump_json(), headers={"Content-Type": "application/json"},
         params={"flow_id": flow_id},
     )
 
@@ -1525,6 +3075,91 @@ def test_copy_placeholder_node():
         "/editor/copy_node", params={"node_id_to_copy_from": 1, "flow_id_to_copy_from": flow_id}, json=new_node
     )
     assert r.status_code == 200, "Node not copied"
+
+
+def test_copy_flow_output_generates_unique_name():
+    """Copying a flow_output must not fail on the duplicate output_name; it auto-renames."""
+    flow_id = create_flow_with_manual_input()
+    flow = flow_file_handler.get_flow(flow_id)
+    flow.add_node_promise(input_schema.NodePromise(flow_id=flow_id, node_id=2, node_type="flow_output"))
+    flow.add_flow_output(
+        input_schema.NodeFlowOutput(flow_id=flow_id, node_id=2, output_name="output", depending_on_id=1)
+    )
+
+    new_node = {"flow_id": flow_id, "node_id": 3, "node_type": "flow_output", "pos_x": 10, "pos_y": 10}
+    r = client.post(
+        "/editor/copy_node", params={"node_id_to_copy_from": 2, "flow_id_to_copy_from": flow_id}, json=new_node
+    )
+    assert r.status_code == 200, r.text
+    assert flow.get_node(2).setting_input.output_name == "output", "Source output must be untouched"
+    copied = flow.get_node(3)
+    assert copied is not None, "Copied flow_output not added"
+    assert copied.node_type == "flow_output"
+    assert copied.setting_input.output_name == "output_1", "Copy must get a unique output_name"
+
+    # Copying again keeps incrementing the base rather than colliding.
+    new_node_2 = {"flow_id": flow_id, "node_id": 4, "node_type": "flow_output", "pos_x": 20, "pos_y": 20}
+    r2 = client.post(
+        "/editor/copy_node", params={"node_id_to_copy_from": 2, "flow_id_to_copy_from": flow_id}, json=new_node_2
+    )
+    assert r2.status_code == 200, r2.text
+    assert flow.get_node(4).setting_input.output_name == "output_2"
+
+
+def test_add_flow_output_assigns_unique_default_name():
+    """Dragging a second flow_output must not collide on the default 'output' name."""
+    flow_id = create_flow_with_manual_input()
+    flow = flow_file_handler.get_flow(flow_id)
+    for nid in (2, 3, 4):
+        r = client.post(
+            "/editor/add_node",
+            params={"flow_id": flow_id, "node_id": nid, "node_type": "flow_output", "pos_x": 0, "pos_y": 0},
+        )
+        assert r.status_code == 200, r.text
+    assert flow.get_node(2).setting_input.output_name == "output"
+    assert flow.get_node(3).setting_input.output_name == "output_1"
+    assert flow.get_node(4).setting_input.output_name == "output_2"
+
+    # Saving a node with its auto-assigned unique name (the drawer-close path) must succeed...
+    keep = input_schema.NodeFlowOutput(flow_id=flow_id, node_id=3, output_name="output_1", depending_on_id=-1)
+    r_keep = client.post("/update_settings/", json=keep.model_dump(), params={"node_type": "flow_output"})
+    assert r_keep.status_code == 200, r_keep.text
+    # ...but explicitly renaming it to collide with another port is still rejected.
+    clash = input_schema.NodeFlowOutput(flow_id=flow_id, node_id=3, output_name="output", depending_on_id=-1)
+    r_clash = client.post("/update_settings/", json=clash.model_dump(), params={"node_type": "flow_output"})
+    assert r_clash.status_code == 419, r_clash.text
+
+
+def test_add_flow_input_assigns_unique_default_name():
+    """Dragging a second flow_input must not collide on the default 'input' name."""
+    flow_id = ensure_clean_flow()
+    flow = flow_file_handler.get_flow(flow_id)
+    for nid in (1, 2):
+        r = client.post(
+            "/editor/add_node",
+            params={"flow_id": flow_id, "node_id": nid, "node_type": "flow_input", "pos_x": 0, "pos_y": 0},
+        )
+        assert r.status_code == 200, r.text
+    assert flow.get_node(1).setting_input.input_name == "input"
+    assert flow.get_node(2).setting_input.input_name == "input_1"
+
+
+def test_copy_flow_input_generates_unique_name():
+    """Copying a flow_input must not fail on the duplicate input_name; it auto-renames."""
+    flow_id = ensure_clean_flow()
+    flow = flow_file_handler.get_flow(flow_id)
+    flow.add_node_promise(input_schema.NodePromise(flow_id=flow_id, node_id=1, node_type="flow_input"))
+    flow.add_flow_input(input_schema.NodeFlowInput(flow_id=flow_id, node_id=1, input_name="input"))
+
+    new_node = {"flow_id": flow_id, "node_id": 2, "node_type": "flow_input", "pos_x": 10, "pos_y": 10}
+    r = client.post(
+        "/editor/copy_node", params={"node_id_to_copy_from": 1, "flow_id_to_copy_from": flow_id}, json=new_node
+    )
+    assert r.status_code == 200, r.text
+    assert flow.get_node(1).setting_input.input_name == "input", "Source input must be untouched"
+    copied = flow.get_node(2)
+    assert copied is not None, "Copied flow_input not added"
+    assert copied.setting_input.input_name == "input_1", "Copy must get a unique input_name"
 
 
 def test_create_db_connection():
@@ -1729,7 +3364,7 @@ def test_editor_create_flow_only_name():
     response = client.post("/editor/create_flow/", params={"name": "test_flow_1"})
     assert response.status_code == 200, "Flow not created"
     flow_info = flow_file_handler.get_flow_info(response.json())
-    assert "flows/unnamed_flows/test_flow_1.yaml" in flow_info.path
+    assert "flows/unnamed_flows/test_flow_1.yaml" in Path(flow_info.path).as_posix()
     assert Path(flow_info.path).exists()
 
 
@@ -1737,7 +3372,7 @@ def test_editor_create_flow_no_params():
     response = client.post("/editor/create_flow/")
     assert response.status_code == 200, "Flow not created"
     flow_info = flow_file_handler.get_flow_info(response.json())
-    assert "flows/unnamed_flows/" in flow_info.path
+    assert "flows/unnamed_flows/" in Path(flow_info.path).as_posix()
     assert Path(flow_info.path).exists()
 
 
@@ -1790,6 +3425,187 @@ def test_fetch_node_data():
     assert response.json()["has_run_with_current_setup"], "Node should have run"
 
 
+def test_get_table_example_row_count():
+    flow_id = create_flow_with_manual_input_and_select()
+    response = client.get("/node/data", params={"flow_id": flow_id, "node_id": 2})
+    assert response.json()["number_of_records"] is None, "Count is unknown before the run"
+
+    client.post("/node/trigger_fetch_data", params={"flow_id": flow_id, "node_id": 2})
+    response = client.get("/node/data", params={"flow_id": flow_id, "node_id": 2})
+    assert response.status_code == 200
+    assert response.json()["number_of_records"] == 4, "Real count, not the old 999 sentinel"
+
+
+def test_get_node_column_stats():
+    flow_id = create_flow_with_manual_input_and_select()
+    flow_file_handler.get_flow(flow_id).flow_settings.execution_mode = "Development"
+    params = {"flow_id": flow_id, "node_id": 2, "column_name": "name"}
+    response = client.get("/node/column_stats", params=params)
+    assert response.status_code == 409, "Stats are unavailable before the node has run"
+
+    client.post("/node/trigger_fetch_data", params={"flow_id": flow_id, "node_id": 2})
+    response = client.get("/node/column_stats", params=params)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "name"
+    assert body["number_of_empty_values"] == 0
+    assert body["number_of_filled_values"] == 4
+    assert body["number_of_unique_values"] == 4
+    assert body["is_unique"] is True
+
+
+def test_get_node_column_stats_offload_decision():
+    """Whenever offloading is on the stats collect goes to the worker, whatever
+    the flow's execution location — core must not run pipeline compute.
+    In-process only when no worker exists (offloading disabled)."""
+    from unittest.mock import patch
+
+    from flowfile_core.flowfile.flow_node.flow_node import FlowNode
+    from flowfile_core.routes import routes as routes_module
+    from flowfile_core.schemas.output_model import FileColumn
+
+    flow_id = create_flow_with_manual_input_and_select()
+    flow = flow_file_handler.get_flow(flow_id)
+    flow.flow_settings.execution_mode = "Development"
+    dummy = FileColumn(name="name", data_type="String")
+    params = {"flow_id": flow_id, "node_id": 2, "column_name": "name"}
+    offload_was_on = bool(routes_module.OFFLOAD_TO_WORKER)
+    try:
+        routes_module.OFFLOAD_TO_WORKER.set(True)
+        with patch.object(FlowNode, "get_column_stats", return_value=dummy) as mock_stats:
+            for location in ("local", "remote"):
+                flow.flow_settings.execution_location = location
+                assert client.get("/node/column_stats", params=params).status_code == 200
+                assert mock_stats.call_args.kwargs["offload_to_worker"] is True
+
+            routes_module.OFFLOAD_TO_WORKER.set(False)
+            assert client.get("/node/column_stats", params=params).status_code == 200
+            assert mock_stats.call_args.kwargs["offload_to_worker"] is False, (
+                "no worker exists when offloading is disabled"
+            )
+    finally:
+        routes_module.OFFLOAD_TO_WORKER.set(offload_was_on)
+
+
+def test_get_node_column_stats_blocked_in_performance_mode():
+    """Performance mode computes nothing extra — stats included."""
+    flow_id = create_flow_with_manual_input_and_select()
+    flow = flow_file_handler.get_flow(flow_id)
+    client.post("/node/trigger_fetch_data", params={"flow_id": flow_id, "node_id": 2})
+
+    flow.flow_settings.execution_mode = "Performance"
+    response = client.get(
+        "/node/column_stats", params={"flow_id": flow_id, "node_id": 2, "column_name": "name"}
+    )
+    assert response.status_code == 409
+    assert "Performance mode" in response.json()["detail"]
+
+
+def test_get_node_column_stats_unknown_column():
+    flow_id = create_flow_with_manual_input_and_select()
+    flow_file_handler.get_flow(flow_id).flow_settings.execution_mode = "Development"
+    client.post("/node/trigger_fetch_data", params={"flow_id": flow_id, "node_id": 2})
+    response = client.get(
+        "/node/column_stats", params={"flow_id": flow_id, "node_id": 2, "column_name": "nope"}
+    )
+    assert response.status_code == 404
+
+
+def test_get_node_column_stats_special_character_column():
+    """Query-param transport keeps '/', '.', '%' and spaces in column names intact."""
+    flow_id = ensure_clean_flow()
+    graph = flow_file_handler.get_flow(flow_id)
+    graph.flow_settings.execution_mode = "Development"
+    graph.add_node_promise(input_schema.NodePromise(flow_id=flow_id, node_id=1, node_type="manual_input"))
+    graph.add_manual_input(
+        input_schema.NodeManualInput(
+            flow_id=flow_id,
+            node_id=1,
+            raw_data_format=input_schema.RawData.from_pylist([{"a.b/c %": 1}, {"a.b/c %": None}]),
+        )
+    )
+    client.post("/node/trigger_fetch_data", params={"flow_id": flow_id, "node_id": 1})
+    response = client.get(
+        "/node/column_stats", params={"flow_id": flow_id, "node_id": 1, "column_name": "a.b/c %"}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "a.b/c %"
+    assert body["number_of_empty_values"] + body["number_of_filled_values"] == 2
+
+
+def _export_node_data(flow_id: int, node_id: int = 2, **params):
+    return client.get("/node/data/export", params={"flow_id": flow_id, "node_id": node_id, **params})
+
+
+def _run_export_flow(node_id: int = 2) -> FlowId:
+    flow_id = create_flow_with_manual_input_and_select()
+    flow_file_handler.get_flow(flow_id).flow_settings.execution_mode = "Development"
+    client.post("/node/trigger_fetch_data", params={"flow_id": flow_id, "node_id": node_id})
+    return flow_id
+
+
+def test_export_node_data_csv():
+    flow_id = create_flow_with_manual_input_and_select()
+    flow_file_handler.get_flow(flow_id).flow_settings.execution_mode = "Development"
+    assert _export_node_data(flow_id).status_code == 409, "Nothing to export before the node has run"
+
+    client.post("/node/trigger_fetch_data", params={"flow_id": flow_id, "node_id": 2})
+    before = set(storage.temp_directory.glob("export_*"))
+    response = _export_node_data(flow_id)
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/csv")
+    lines = response.text.strip().splitlines()
+    assert [line.strip('"') for line in lines] == ["name", "John", "Jane", "Edward", "Courtney"]
+    assert set(storage.temp_directory.glob("export_*")) == before, "The temp file is removed after the response"
+
+
+def test_export_node_data_tsv_with_limit():
+    flow_id = _run_export_flow(node_id=1)
+    response = _export_node_data(flow_id, node_id=1, format="tsv", limit="2")
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/tab-separated-values")
+    lines = response.text.strip().splitlines()
+    assert len(lines) == 3, "header + 2 rows"
+    assert lines[0].replace('"', "").split("\t") == ["name", "city"]
+
+
+def test_export_node_data_stale_after_settings_change():
+    flow_id = _run_export_flow()
+    assert _export_node_data(flow_id).status_code == 200
+    settings = input_schema.NodeSelect(
+        flow_id=flow_id, node_id=2, select_input=[SelectInput(old_name="name", new_name="full_name")]
+    )
+    client.post("/update_settings/", json=settings.model_dump(), params={"node_type": "select"})
+    response = _export_node_data(flow_id)
+    assert response.status_code == 409, "A stale result must not be exported"
+    assert "Run the flow first" in response.json()["detail"]
+
+
+def test_export_node_data_blocked_when_run_flags_cleared():
+    flow_id = _run_export_flow()
+    assert _export_node_data(flow_id).status_code == 200
+    node = flow_file_handler.get_flow(flow_id).get_node(2)
+    node.invalidate_cache()
+    assert node.results.resulting_data is not None
+    response = _export_node_data(flow_id)
+    assert response.status_code == 409
+    assert "current settings" in response.json()["detail"]
+
+
+def test_export_node_data_uses_cached_result_in_performance_mode():
+    flow_id = _run_export_flow()
+    flow_file_handler.get_flow(flow_id).flow_settings.execution_mode = "Performance"
+    assert _export_node_data(flow_id).status_code == 200
+
+
+def test_export_node_data_invalid_limit():
+    flow_id = _run_export_flow()
+    assert _export_node_data(flow_id, limit="abc").status_code == 422
+    assert _export_node_data(flow_id, limit="all").status_code == 422
+    assert _export_node_data(flow_id, limit="10001").status_code == 422
+
+
 def test_flow_run_status():
     flow_id = create_flow_with_manual_input_and_select()
     response = client.get("/flow/run_status", params={"flow_id": flow_id})
@@ -1803,19 +3619,16 @@ def test_flow_run_status():
     assert response.json()["end_time"] is not None, "Flow should have ended"
 
 
-# =============================================================================
 # Path Traversal Security Tests
 #
 # Note: These tests verify sandboxing behavior which is enforced in Docker/package mode.
 # In Electron mode, users have access to their local filesystem (which is expected for
 # a desktop application). Tests that check absolute path blocking use monkeypatch to
 # simulate Docker mode.
-# =============================================================================
 
 
 def test_directory_contents_in_electron_mode():
     """Test that directory_contents allows browsing any directory in Electron mode."""
-    # Default mode is electron, so this should work for any readable directory
     response = client.get("/files/directory_contents/", params={"directory": "/tmp", "include_hidden": False})
     assert response.status_code == 200, "Should be able to browse /tmp in Electron mode"
     assert isinstance(response.json(), list), "Should return a list of file info"
@@ -1846,7 +3659,6 @@ def test_directory_contents_allowed_inside_sandbox(monkeypatch):
     from flowfile_core.routes import routes
 
     monkeypatch.setattr(routes, "is_electron_mode", lambda: False)
-    # user_data_directory itself should be accessible
     response = client.get(
         "/files/directory_contents/", params={"directory": str(storage.user_data_directory), "include_hidden": False}
     )
@@ -1864,7 +3676,6 @@ def test_directory_contents_invalid_directory():
 
 def test_get_local_files_path_traversal_blocked():
     """Test that get_local_files blocks access to directories outside sandbox."""
-    # Attempt to access /etc directory (should be blocked)
     # Note: This endpoint uses SecureFileExplorer which sandboxes to user_data_directory
     response = client.get("/files/files_in_local_directory/", params={"directory": "/etc"})
     assert response.status_code == 403, "Path traversal to /etc should be blocked"
@@ -1877,59 +3688,12 @@ def test_get_local_files_path_traversal_with_dots():
     assert response.status_code == 403, "Path traversal with .. should be blocked"
 
 
-def test_upload_file_sanitizes_filename():
-    """Test that upload_file sanitizes filenames to prevent path traversal."""
-    import io
-
-    # Create a file with a malicious filename containing path traversal
-    malicious_filename = "../../../etc/cron.d/evil"
-    file_content = b"malicious content"
-
-    files = {"file": (malicious_filename, io.BytesIO(file_content), "application/octet-stream")}
-    response = client.post("/upload/", files=files)
-
-    assert response.status_code == 200, "Upload should succeed with sanitized filename"
-    result = response.json()
-    # The filename should be sanitized to just 'evil' (basename without ..)
-    assert result["filename"] == "evil", f"Filename should be sanitized to 'evil', got: {result['filename']}"
-    assert "../" not in result["filepath"], "Filepath should not contain path traversal sequences"
-    # Normalize path separators for cross-platform comparison
-    normalized_filepath = result["filepath"].replace("\\", "/")
-    assert normalized_filepath == "uploads/evil", f"Filepath should be 'uploads/evil', got: {result['filepath']}"
-
-    # Clean up uploaded file
-    if os.path.exists(result["filepath"]):
-        os.remove(result["filepath"])
-
-
-def test_upload_file_sanitizes_filename_with_multiple_traversals():
-    """Test that upload_file handles multiple path traversal attempts."""
-    import io
-
-    malicious_filename = "..%2F..%2F..%2Fetc/passwd"
-    file_content = b"test content"
-
-    files = {"file": (malicious_filename, io.BytesIO(file_content), "application/octet-stream")}
-    response = client.post("/upload/", files=files)
-
-    assert response.status_code == 200, "Upload should succeed with sanitized filename"
-    result = response.json()
-    assert "../" not in result["filename"], "Filename should not contain path traversal"
-    assert "/" not in result["filename"], "Filename should not contain directory separators"
-
-    # Clean up
-    if os.path.exists(result["filepath"]):
-        os.remove(result["filepath"])
-
-
 def test_import_flow_path_traversal_blocked(monkeypatch):
     """Test that import_flow blocks access to files outside sandbox in Docker mode."""
-    # Patch is_electron_mode to return False (simulating Docker/package mode)
     # This is needed because FLOWFILE_MODE is cached at module load time
     from flowfile_core.configs import settings
 
     monkeypatch.setattr(settings, "is_electron_mode", lambda: False)
-    # Attempt to import /etc/passwd (should be blocked in Docker mode)
     response = client.get("/import_flow/", params={"flow_path": "/etc/passwd"})
     assert response.status_code == 403, "Path traversal to /etc/passwd should be blocked in Docker mode"
     assert "Access denied" in response.json()["detail"], "Should return access denied message"
@@ -1944,7 +3708,6 @@ def test_import_flow_path_traversal_with_dots():
 
 def test_save_flow_path_traversal_blocked(monkeypatch):
     """Test that save_flow blocks saving to paths outside sandbox in Docker mode."""
-    # Patch is_electron_mode to return False (simulating Docker/package mode)
     from flowfile_core.configs import settings
 
     monkeypatch.setattr(settings, "is_electron_mode", lambda: False)
@@ -1963,13 +3726,58 @@ def test_save_flow_path_traversal_with_dots():
     assert response.status_code == 403, "Path traversal with .. should be blocked"
 
 
+def test_save_flow_to_catalog_allows_name_with_spaces():
+    """A flow name with spaces is a free-form display label, not a filename. The
+    save must succeed (200), the catalog must register the exact name typed, and
+    the file on disk must use a slugified, filesystem-safe ``{flow_id}_{slug}.yaml``
+    name (no spaces). Regression guard for the old filename-regex rejection."""
+    from flowfile_core.database.models import User
+
+    cat = client.post("/catalog/namespaces", json={"name": "SpaceCat"}).json()
+    schema = client.post("/catalog/namespaces", json={"name": "SpaceSchema", "parent_id": cat["id"]}).json()
+    ns_id = schema["id"]
+
+    with get_db_context() as db:
+        user_id = db.query(User).first().id
+    flow_id = flow_file_handler.add_flow(name="space_scratch", user_id=user_id)
+
+    new_flow_id = None
+    try:
+        resp = client.post(
+            "/save_flow_to_catalog",
+            params={"flow_id": flow_id, "flow_name": "market analytics", "namespace_id": ns_id},
+        )
+        assert resp.status_code == 200, resp.text
+        new_flow_id = resp.json()
+
+        # The filename is a slug of the display name, prefixed with the originating
+        # flow id; the space must never reach disk.
+        saved_path = Path(flow_file_handler.get_flow(new_flow_id).flow_settings.path)
+        assert saved_path.name == f"{flow_id}_market_analytics.yaml", saved_path.name
+        assert " " not in saved_path.name
+        assert saved_path.exists()
+
+        # The catalog registration keeps exactly what the user typed.
+        names = {f["name"] for f in client.get("/catalog/flows", params={"namespace_id": ns_id}).json()}
+        assert "market analytics" in names, names
+    finally:
+        for fid in (flow_id, new_flow_id):
+            if fid is None:
+                continue
+            saved = flow_file_handler.get_flow(fid)
+            if saved is not None:
+                Path(saved.flow_settings.path).unlink(missing_ok=True)
+            try:
+                flow_file_handler.delete_flow(fid)
+            except Exception:
+                pass
+
+
 def test_get_excel_sheet_names_path_traversal_blocked(monkeypatch):
     """Test that get_excel_sheet_names blocks access to files outside sandbox in Docker mode."""
-    # Patch is_electron_mode to return False (simulating Docker/package mode)
     from flowfile_core.configs import settings
 
     monkeypatch.setattr(settings, "is_electron_mode", lambda: False)
-    # Attempt to read /etc/passwd (should be blocked in Docker mode)
     response = client.get("/api/get_xlsx_sheet_names", params={"path": "/etc/passwd"})
     assert response.status_code == 403, "Path traversal to /etc/passwd should be blocked in Docker mode"
     assert "Access denied" in response.json()["detail"], "Should return access denied message"
@@ -1982,9 +3790,54 @@ def test_get_excel_sheet_names_path_traversal_with_dots():
     assert response.status_code == 403, "Path traversal with .. should be blocked"
 
 
+def test_validate_path_under_cwd_electron_allows_any_local_path(monkeypatch):
+    """In electron (desktop) mode, validate_path_under_cwd permits any local
+    absolute path and returns it normalized.
+
+    Regression guard for the py/path-injection fix: the electron branch now routes
+    the value through a normpath+startswith barrier (CodeQL-recognized sanitizer),
+    and that must NOT change desktop behavior of allowing any local file.
+    """
+    from flowfile_core.configs import settings
+    from flowfile_core.fileExplorer.funcs import validate_path_under_cwd
+
+    monkeypatch.setattr(settings, "is_electron_mode", lambda: True)
+
+    abs_path = str(storage.user_data_directory / "some_local_flow.yaml")
+    result = validate_path_under_cwd(abs_path)
+    assert os.path.isabs(result), "An absolute local path must stay absolute in desktop mode"
+    assert result == os.path.normpath(abs_path), "An already-normalized absolute path is returned unchanged"
+
+
+def test_validate_path_under_cwd_electron_blocks_dot_dot(monkeypatch):
+    """In electron mode, .. traversal must still be rejected with a 403 (the
+    blocklist is kept on top of the normpath+startswith barrier)."""
+    from fastapi import HTTPException
+
+    from flowfile_core.configs import settings
+    from flowfile_core.fileExplorer.funcs import validate_path_under_cwd
+
+    monkeypatch.setattr(settings, "is_electron_mode", lambda: True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_path_under_cwd(os.path.join("a", "..", "..", "etc", "passwd"))
+    assert exc_info.value.status_code == 403
+
+
+def test_validate_path_under_cwd_electron_relative_path_resolves_to_cwd(monkeypatch):
+    """In electron mode a relative path anchors to the cwd, not the filesystem
+    root — joining it onto '/' would point create_flow at a nonexistent dir."""
+    from flowfile_core.configs import settings
+    from flowfile_core.fileExplorer.funcs import validate_path_under_cwd
+
+    monkeypatch.setattr(settings, "is_electron_mode", lambda: True)
+
+    result = validate_path_under_cwd(os.path.join("some_dir", "flow.yaml"))
+    assert result == os.path.normpath(os.path.join(os.getcwd(), "some_dir", "flow.yaml"))
+
+
 def test_get_available_flow_files_path_traversal_blocked():
     """Test that available_flow_files blocks access to directories outside sandbox."""
-    # Attempt to scan /etc directory (should return empty or be blocked)
     response = client.get("/files/available_flow_files", params={"path": "/etc"})
     # Should return empty list for paths outside sandbox (graceful handling)
     assert response.status_code == 200, "Should return 200 with empty list"
@@ -2006,7 +3859,6 @@ def test_get_node_reference():
     flow_id = create_flow_with_manual_input()
     response = client.get("/node/reference", params={"flow_id": flow_id, "node_id": 1})
     assert response.status_code == 200, "Node reference not retrieved"
-    # Default should be empty string
     assert response.json() == "", "Default node reference should be empty string"
 
 
@@ -2014,12 +3866,11 @@ def test_set_node_reference():
     """Test setting a node reference."""
     flow_id = create_flow_with_manual_input()
 
-    # Set a valid reference
     response = client.post("/node/reference/", params={"flow_id": flow_id, "node_id": 1}, json="my_custom_ref")
     assert response.status_code == 200, "Node reference not set"
-    assert response.json() is True, "Should return True on success"
+    assert response.json()["success"] is True, "Should report success"
+    assert response.json()["history"]["flow_id"] == flow_id
 
-    # Verify the reference was set
     response = client.get("/node/reference", params={"flow_id": flow_id, "node_id": 1})
     assert response.status_code == 200
     assert response.json() == "my_custom_ref", "Node reference should be updated"
@@ -2049,21 +3900,18 @@ def test_set_node_reference_allows_underscores():
 
     response = client.post("/node/reference/", params={"flow_id": flow_id, "node_id": 1}, json="my_custom_ref_123")
     assert response.status_code == 200, "Underscores should be allowed"
-    assert response.json() is True
+    assert response.json()["success"] is True
 
 
 def test_set_node_reference_empty_clears():
     """Test that empty string clears the node reference."""
     flow_id = create_flow_with_manual_input()
 
-    # First set a reference
     client.post("/node/reference/", params={"flow_id": flow_id, "node_id": 1}, json="my_ref")
 
-    # Then clear it with empty string
     response = client.post("/node/reference/", params={"flow_id": flow_id, "node_id": 1}, json="")
     assert response.status_code == 200, "Empty reference should be allowed"
 
-    # Verify it was cleared
     response = client.get("/node/reference", params={"flow_id": flow_id, "node_id": 1})
     assert response.json() == "", "Node reference should be empty after clearing"
 
@@ -2117,14 +3965,11 @@ def test_validate_node_reference_unique():
     """Test that validation checks uniqueness across nodes."""
     flow_id = ensure_clean_flow()
 
-    # Add two nodes
     add_node_placeholder("manual_input", flow_id=flow_id, node_id=1)
     add_node_placeholder("manual_input", flow_id=flow_id, node_id=2)
 
-    # Set reference on first node
     client.post("/node/reference/", params={"flow_id": flow_id, "node_id": 1}, json="my_unique_ref")
 
-    # Try to validate same reference for second node
     response = client.get(
         "/node/validate_reference", params={"flow_id": flow_id, "node_id": 2, "reference": "my_unique_ref"}
     )
@@ -2138,14 +3983,11 @@ def test_set_node_reference_rejects_duplicate():
     """Test that setting a duplicate reference is rejected."""
     flow_id = ensure_clean_flow()
 
-    # Add two nodes
     add_node_placeholder("manual_input", flow_id=flow_id, node_id=1)
     add_node_placeholder("manual_input", flow_id=flow_id, node_id=2)
 
-    # Set reference on first node
     client.post("/node/reference/", params={"flow_id": flow_id, "node_id": 1}, json="my_ref")
 
-    # Try to set same reference on second node
     response = client.post("/node/reference/", params={"flow_id": flow_id, "node_id": 2}, json="my_ref")
     assert response.status_code == 422, "Duplicate reference should be rejected"
     assert "already used" in response.json()["detail"].lower(), "Error should mention duplicate"
@@ -2159,19 +4001,15 @@ def test_node_reference_not_found():
     assert response.status_code == 404, "Non-existent node should return 404"
 
 
-# ---------------------------------------------------------------------------
 # /node/input_names endpoint
-# ---------------------------------------------------------------------------
 
 
 def test_get_input_names_with_reference():
     """input_names returns source node_reference when set."""
     flow_id = create_flow_with_manual_input()  # node 1
 
-    # Set a reference on node 1
     client.post("/node/reference/", params={"flow_id": flow_id, "node_id": 1}, json="orders")
 
-    # Add python_script node 2 connected to node 1
     add_node(flow_id, 2, node_type="python_script", pos_x=200, pos_y=0)
     connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
     connect_node(flow_id, connection)
@@ -2215,3 +4053,38 @@ def test_get_input_names_node_not_found():
 
     response = client.get("/node/input_names", params={"flow_id": flow_id, "node_id": 9999})
     assert response.status_code == 404
+
+
+def test_analysis_routes_are_scoped_to_the_callers_own_flows():
+    """A flow the caller hasn't opened must not be chartable through the explorer.
+
+    The explorer's compute route can run arbitrary Graphic Walker aggregations —
+    group-bys, filters, distinct-value enumeration — over a node's full dataset,
+    so an unscoped flow_id would be a far better exfiltration primitive than the
+    100-row previews elsewhere in this router.
+    """
+    flow_id = create_flow_with_graphic_walker_input()
+    flow_file_handler.get_flow(flow_id).run_graph()
+
+    # Sanity: the caller's own flow still resolves.
+    assert client.post(
+        "/analysis_data/fields", json={"flow_id": flow_id, "node_id": 2}
+    ).status_code != 404
+
+    # Same flow, but no longer in this user's session -> invisible, not merely unauthorised.
+    handler = flow_file_handler
+    sessions = {uid: set(ids) for uid, ids in handler._user_sessions.items()}
+    for ids in handler._user_sessions.values():
+        ids.discard(flow_id)
+    try:
+        for route, body in (
+            ("/analysis_data/fields", {"flow_id": flow_id, "node_id": 2}),
+            ("/analysis_data/compute", {"flow_id": flow_id, "node_id": 2, "payload": {"workflow": []}}),
+        ):
+            assert client.post(route, json=body).status_code == 404, route
+        assert client.get(
+            "/analysis_data/graphic_walker_input", params={"flow_id": flow_id, "node_id": 2}
+        ).status_code == 404
+    finally:
+        handler._user_sessions.clear()
+        handler._user_sessions.update(sessions)

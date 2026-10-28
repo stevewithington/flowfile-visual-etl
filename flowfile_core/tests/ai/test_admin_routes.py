@@ -97,7 +97,6 @@ def non_admin_client(non_admin_user: PydanticUser) -> Iterator[TestClient]:
 def unauth_client() -> Iterator[TestClient]:
     """TestClient with no auth override — relies on the default JWT path which
     will reject because no Authorization header is sent."""
-    # Make sure no leaked override from a sibling test interferes.
     main.app.dependency_overrides.pop(get_current_active_user, None)
     main.app.dependency_overrides.pop(get_current_user, None)
     main.app.dependency_overrides.pop(get_current_admin_user, None)
@@ -172,7 +171,6 @@ def test_non_admin_cannot_toggle_returns_403(
 
     assert response.status_code == 403, response.text
     assert "admin" in response.json()["detail"].lower()
-    # State unchanged
     assert is_ai_enabled() is True
     assert os.environ.get("FEATURE_FLAG_AI") == pre_env
 
@@ -208,7 +206,6 @@ def test_endpoint_reachable_when_flag_off(
     core_settings.FEATURE_FLAG_AI.set(False)
     assert is_ai_enabled() is False
 
-    # Admin endpoint reachable with the gate closed
     response = admin_client.post("/system/feature_flags/ai", json={"enabled": True})
     assert response.status_code == 200, response.text
 
@@ -279,8 +276,8 @@ def test_response_shape_is_stable(
 
     ``persisted`` is intentionally always ``False`` in; cross-restart
     persistence is the user's responsibility (set ``FEATURE_FLAG_AI=true`` in
-    ``.env``). If a future workstream adds a write-to-disk path, that change
-    should be opt-in via a separate field rather than flipping this one.
+    ``.env``). If a write-to-disk path is added later, that change should be
+    opt-in via a separate field rather than flipping this one.
     """
     response = admin_client.post("/system/feature_flags/ai", json={"enabled": True})
     body = response.json()

@@ -6,11 +6,13 @@
 @import './components/_buttons.css';
 @import './components/_column-options.css';
 @import './components/_styled-table.css';
+@import './components/_column-list.css';
 @import './components/_cards.css';
 @import './components/_forms.css';
 @import './components/_modals.css';
 @import './components/_context-menu.css';
 @import './components/_status-badges.css';
+@import './components/_node-rows.css';
 @import './components/_detail-panels.css';
 @import './components/_popovers.css';
 @import './utils/_spacing.css';
@@ -77,6 +79,33 @@ select,
 button {
   font-family: inherit;
   font-size: inherit;
+}
+
+/* Listed by type, not :not(), to stay a low-specificity base components can override. */
+input:not([type]),
+input[type="text"],
+input[type="number"],
+input[type="search"],
+input[type="email"],
+input[type="url"],
+input[type="password"],
+input[type="tel"],
+textarea,
+select {
+  background-color: var(--color-background-primary);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border-primary);
+  border-radius: 4px;
+}
+
+/* Element Plus draws its chrome on the wrapper; styling the inner field doubles the border. */
+input.el-input__inner,
+input.el-select__input,
+input.el-range-input,
+textarea.el-textarea__inner {
+  background-color: transparent;
+  border: none;
+  border-radius: 0;
 }
 
 button {
@@ -162,8 +191,11 @@ button {
   transition: all var(--transition-fast) var(--transition-timing);
 }
 
-/* Primary button - friendly teal/cyan color */
-.el-button--primary {
+/* Primary button - friendly teal/cyan color.
+   Exclude text/link variants: those are meant to be colored text on a
+   transparent background, so forcing a solid accent fill made their
+   (also-accent) label unreadable. */
+.el-button--primary:not(.is-text):not(.is-link) {
   --el-button-bg-color: var(--color-accent) !important;
   --el-button-border-color: var(--color-accent) !important;
   --el-button-hover-bg-color: var(--color-accent-hover) !important;
@@ -174,8 +206,8 @@ button {
   border-color: var(--color-accent) !important;
 }
 
-.el-button--primary:hover,
-.el-button--primary:focus {
+.el-button--primary:not(.is-text):not(.is-link):hover,
+.el-button--primary:not(.is-text):not(.is-link):focus {
   background-color: var(--color-accent-hover) !important;
   border-color: var(--color-accent-hover) !important;
 }
@@ -228,6 +260,48 @@ button {
 .el-select-dropdown__item.is-selected:hover,
 .el-select-dropdown__item.is-selected.hover {
   background-color: var(--color-accent-subtle) !important;
+}
+
+/* Element Plus dark theme isn't imported — theme multiselect tags explicitly.
+   Scoped to .el-select so standalone status tags (success/danger/info) stay colored. */
+[data-theme="dark"] .el-select .el-tag {
+  background-color: var(--color-background-secondary);
+  border-color: var(--color-border-primary);
+  color: var(--color-text-primary);
+}
+
+[data-theme="dark"] .el-select .el-tag .el-tag__close {
+  color: var(--color-text-secondary);
+}
+
+[data-theme="dark"] .el-select .el-tag .el-tag__close:hover {
+  background-color: var(--color-text-secondary);
+  color: var(--color-background-primary);
+}
+
+/* ========== Element Plus Message ========== */
+.el-message {
+  font-family: var(--font-family-base);
+  border-radius: var(--border-radius-lg);
+  box-shadow: var(--shadow-lg);
+  max-width: min(360px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.el-message__content {
+  font-size: var(--font-size-sm);
+}
+
+/* Noise is click-through; things you need to read stay hoverable (pauses the timer). */
+.el-message .el-message__closeBtn,
+.el-message--warning,
+.el-message--error {
+  pointer-events: auto;
+}
+
+[data-theme="dark"] .el-message {
+  background-color: var(--color-background-secondary);
+  border-color: var(--color-border-primary);
 }
 
 /* ========== Element Plus Notification ========== */
@@ -414,6 +488,16 @@ button {
 }
 
 .el-menu-item.is-active i {
+  color: var(--color-accent);
+}
+
+/* Sub-menu parents (Catalog, Connections) carry is-active on the root .el-sub-menu, not the item — mirror the plain active highlight so their rail icon turns accent too. */
+.el-sub-menu.is-active > .el-sub-menu__title {
+  color: var(--color-accent);
+  background-color: var(--color-background-selected);
+}
+
+.el-sub-menu.is-active > .el-sub-menu__title i {
   color: var(--color-accent);
 }
 
@@ -604,6 +688,9 @@ button {
   border: 1px solid var(--color-border-primary) !important;
   color: var(--color-text-primary) !important;
   box-shadow: var(--shadow-lg) !important;
+  /* Body-mounted via tooltips({parent}); must beat draggable panels (100000),
+     high-z-index dialogs (200001) and el-popper (200010) */
+  z-index: 200020 !important;
 }
 
 .cm-tooltip-autocomplete {

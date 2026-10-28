@@ -1,6 +1,7 @@
 /mysql
 /mysql/*
 .idea
+.build-logs
 files/*
 .env
 /.env
@@ -41,16 +42,18 @@ print_structure.py
 services_dist/
 shared_data/
 saved_flows/
-/flowfile_frontend/playwright-report/index.html
 /flowfile.db
 /flowfile_catalog.db
 /flowfile_frontend/flowfile.db
 /flowfile_frontend/flowfile_catalog.db
 /flowfile_worker.spec
-/flowfile_frontend/test-results/.last-run.json
 /test_utils/postgres/postgres-docker-samples/
 **/test_flowfile.db
 **/test_flowfile_catalog.db
+
+playwright-report/
+test-results/
+
 /flowfile/flowfile/web/static/
 flowfile.db
 flowfile_catalog.db
@@ -96,6 +99,32 @@ test-embed
 error-linux
 .claude/scheduled_tasks.lock
 
-# Repo-root local Claude state only — leave subtree configs
-# (e.g. plugin/agent dirs nested under packages) tracked.
-/.claude/
+# Repo-root Claude state: track the shared skills/investigation/launch config,
+# keep only machine-local settings out of version control
+# (scheduled_tasks.lock is ignored above under runtime artefacts).
+.claude/settings.local.json
+
+# Signing checklist holds real cert/notarization secrets — never commit
+flowfile_frontend/src-tauri/SIGNING_CHECKLIST.md
+/.claude/agents/
+
+# Docs planning/working notes (untracked)
+DOCS_IMAGE_TODO.md
+DOCS_DIAGRAMS_AGENT_PROMPT.md
+/notes/
+
+# Collected telemetry (the compose file bind-mounts this into the working tree)
+tools/telemetry_collector/data/
+/scratch/
+
+# Alteryx material: Designer samples, macros and data files are proprietary and must never be committed.
+# Hand-written .yxmd fixtures are allowed only in the converter test fixtures directory.
+*.yxmd
+!flowfile_core/tests/flowfile/converters/fixtures/*.yxmd
+*.yxmc
+*.yxwz
+*.yxdb
+*.yxzp
+*.yxi
+/alteryx_nodes/
+/alteryx_nodes_data/

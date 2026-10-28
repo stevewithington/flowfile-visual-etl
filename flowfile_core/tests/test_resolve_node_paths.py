@@ -1,4 +1,5 @@
-"""Tests for resolve_node_paths, write_inputs_to_parquet, and FlowSettings.show_edge_labels."""
+"""Tests for resolve_node_paths, to_kernel_path, write_inputs_to_parquet, read_kernel_outputs,
+and FlowSettings.show_edge_labels."""
 
 import os
 from pathlib import Path
@@ -8,15 +9,19 @@ import polars as pl
 import pytest
 
 from flowfile_core.configs.utils import MutableBool
-from flowfile_core.kernel.execution import _write_parquet_locally, write_inputs_to_parquet
+from flowfile_core.flowfile.flow_data_engine.flow_data_engine import FlowDataEngine
+from flowfile_core.kernel.execution import (
+    _write_parquet_locally,
+    clear_stale_parquets,
+    read_kernel_outputs,
+    write_inputs_to_parquet,
+)
 from flowfile_core.kernel.manager import KernelManager
-from flowfile_core.kernel.models import ExecuteRequest
+from flowfile_core.kernel.models import ExecuteRequest, ExecuteResult
 from flowfile_core.schemas import input_schema
 from flowfile_core.schemas.schemas import FlowSettings
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_manager(shared_volume: str) -> KernelManager:
@@ -26,11 +31,19 @@ def _make_manager(shared_volume: str) -> KernelManager:
         mgr._docker = MagicMock()
         mgr._kernels = {}
         mgr._kernel_owners = {}
+        mgr._scratch_flow_ids = {}
         mgr._shared_volume = shared_volume
+        # Catalog tables dir is irrelevant for resolve_node_paths tests but
+        # ``to_kernel_path`` references it; point at a sentinel outside the
+        # shared tree so the prefix-match branch never accidentally fires.
+        mgr._catalog_tables_dir = "/__catalog_tables_unused__"
         mgr._docker_network = None
         mgr._kernel_volume = None
         mgr._kernel_volume_type = None
         mgr._kernel_mount_target = None
+        mgr._catalog_volume = None
+        mgr._catalog_volume_type = None
+        mgr._catalog_mount_target = None
     return mgr
 
 
@@ -43,9 +56,7 @@ def _create_inputs(tmp_path: Path, flow_id: int, node_id: int, filenames: list[s
     return input_dir
 
 
-# ---------------------------------------------------------------------------
 # resolve_node_paths
-# ---------------------------------------------------------------------------
 
 
 class TestResolveNodePaths:
@@ -125,15 +136,14 @@ class TestResolveNodePaths:
         assert req.input_paths == {}
 
     def test_output_dir_always_set(self, tmp_path: Path):
-        """output_dir is set regardless of whether input files exist."""
+        """output_dir is set regardless of whether input files exist, as a pure-POSIX path."""
         _create_inputs(tmp_path, 1, 2, [])
         mgr = _make_manager(str(tmp_path))
 
         req = ExecuteRequest(node_id=2, code="", flow_id=1)
         mgr.resolve_node_paths(req)
 
-        expected_suffix = os.path.join("1", "2", "outputs")
-        assert req.output_dir.endswith(expected_suffix)
+        assert req.output_dir == "/shared/1/2/outputs"
 
     def test_underscore_in_name(self, tmp_path: Path):
         """A name with underscores (my_orders_0.parquet) groups under 'my_orders'."""
@@ -177,16 +187,185 @@ class TestResolveNodePaths:
         req = ExecuteRequest(node_id=2, code="", flow_id=1)
         mgr.resolve_node_paths(req)
 
-        # In local mode to_kernel_path replaces _shared_volume with /shared
         for paths in req.input_paths.values():
             for p in paths:
                 assert p.startswith("/shared/")
         assert req.output_dir.startswith("/shared/")
 
 
-# ---------------------------------------------------------------------------
+# to_kernel_path — Windows host paths must yield pure-POSIX container paths
+
+
+_WIN_SHARED = r"C:\Users\u\.flowfile\temp\kernel_shared"
+_WIN_CATALOG = r"C:\Users\u\.flowfile\catalog_tables"
+
+
+class TestToKernelPathWindows:
+    """Regression tests for the Windows mixed-separator path bug (kernel exchange)."""
+
+    def test_windows_output_dir_pure_posix(self):
+        mgr = _make_manager(_WIN_SHARED)
+        result = mgr.to_kernel_path(_WIN_SHARED + r"\1\5\outputs")
+        assert result == "/shared/1/5/outputs"
+        assert "\\" not in result
+
+    def test_windows_input_file(self):
+        mgr = _make_manager(_WIN_SHARED)
+        result = mgr.to_kernel_path(_WIN_SHARED + r"\1\5\inputs\orders_0.parquet")
+        assert result == "/shared/1/5/inputs/orders_0.parquet"
+
+    def test_windows_persistence_path(self):
+        """PERSISTENCE_PATH used to come out as /shared\\artifacts on Windows."""
+        mgr = _make_manager(_WIN_SHARED)
+        assert mgr.to_kernel_path(_WIN_SHARED + r"\artifacts") == "/shared/artifacts"
+
+    def test_windows_exact_prefix(self):
+        mgr = _make_manager(_WIN_SHARED)
+        assert mgr.to_kernel_path(_WIN_SHARED) == "/shared"
+
+    def test_windows_catalog_prefix_wins(self):
+        mgr = _make_manager(_WIN_SHARED)
+        mgr._catalog_tables_dir = _WIN_CATALOG
+        assert mgr.to_kernel_path(_WIN_CATALOG + r"\orders_ab12") == "/catalog_tables/orders_ab12"
+        assert mgr.to_kernel_path(_WIN_CATALOG) == "/catalog_tables"
+
+    def test_windows_unknown_prefix_passthrough(self):
+        mgr = _make_manager(_WIN_SHARED)
+        other = r"D:\elsewhere\data.parquet"
+        assert mgr.to_kernel_path(other) == other
+
+    def test_posix_paths_unchanged(self):
+        mgr = _make_manager("/home/u/.flowfile/temp/kernel_shared")
+        result = mgr.to_kernel_path("/home/u/.flowfile/temp/kernel_shared/1/5/outputs")
+        assert result == "/shared/1/5/outputs"
+
+    def test_posix_prefix_no_partial_match(self):
+        """A sibling dir sharing the prefix string must not be rebased."""
+        mgr = _make_manager("/home/u/shared")
+        assert mgr.to_kernel_path("/home/u/shared_other/x.parquet") == "/home/u/shared_other/x.parquet"
+
+    def test_dind_identity(self):
+        mgr = _make_manager(_WIN_SHARED)
+        mgr._kernel_volume = "flowfile-internal-storage"
+        path = "/app/internal_storage/temp/kernel_shared/1/5/outputs"
+        assert mgr.to_kernel_path(path) == path
+
+    def test_resolve_node_paths_windows_shared_volume(self, tmp_path: Path):
+        """End-to-end: resolve_node_paths on a real dir but with Windows-style prefix registered."""
+        _create_inputs(tmp_path, 1, 2, ["orders_0.parquet"])
+        mgr = _make_manager(str(tmp_path))
+
+        req = ExecuteRequest(node_id=2, code="", flow_id=1)
+        mgr.resolve_node_paths(req)
+
+        for paths in req.input_paths.values():
+            for p in paths:
+                assert "\\" not in p
+        assert "\\" not in req.output_dir
+
+
+# read_kernel_outputs
+
+
+class _FakeNode:
+    def __init__(self):
+        self._named_outputs = {}
+
+
+def _execute_result(output_paths: list[str]) -> ExecuteResult:
+    return ExecuteResult(success=True, output_paths=output_paths)
+
+
+class TestReadKernelOutputs:
+    """Unit tests for kernel.execution.read_kernel_outputs."""
+
+    def test_reads_primary_output(self, tmp_path: Path):
+        pl.DataFrame({"a": [1, 2]}).write_parquet(tmp_path / "main.parquet")
+        node = _FakeNode()
+
+        result = read_kernel_outputs(
+            output_dir=str(tmp_path),
+            output_names=["main"],
+            result=_execute_result([str(tmp_path / "main.parquet")]),
+            node=node,
+        )
+
+        assert isinstance(result, FlowDataEngine)
+        assert "output-0" in node._named_outputs
+        assert result.data_frame.collect().shape == (2, 1)
+
+    def test_multiple_named_outputs(self, tmp_path: Path):
+        pl.DataFrame({"a": [1]}).write_parquet(tmp_path / "clean.parquet")
+        pl.DataFrame({"b": [2]}).write_parquet(tmp_path / "rejected.parquet")
+        node = _FakeNode()
+
+        result = read_kernel_outputs(
+            output_dir=str(tmp_path),
+            output_names=["clean", "rejected"],
+            result=_execute_result(["clean.parquet", "rejected.parquet"]),
+            node=node,
+        )
+
+        assert set(node._named_outputs) == {"output-0", "output-1"}
+        assert result.data_frame.collect().columns == ["a"]
+
+    def test_none_when_nothing_published(self, tmp_path: Path):
+        """Empty kernel output_paths -> None (caller's input-passthrough fallback)."""
+        result = read_kernel_outputs(
+            output_dir=str(tmp_path),
+            output_names=["main"],
+            result=_execute_result([]),
+            node=_FakeNode(),
+        )
+        assert result is None
+
+    def test_raises_on_translation_mismatch(self, tmp_path: Path):
+        """Kernel reported outputs but none exist locally -> loud error, not ghost data."""
+        with pytest.raises(RuntimeError, match="mount mismatch"):
+            read_kernel_outputs(
+                output_dir=str(tmp_path),
+                output_names=["main"],
+                result=_execute_result(["/shared\\1\\5\\outputs/main.parquet"]),
+                node=_FakeNode(),
+            )
+
+    def test_raises_on_output_name_mismatch(self, tmp_path: Path):
+        """publish_output under a name not in output_names -> naming error, not a mount error."""
+        with pytest.raises(RuntimeError, match="expects outputs named"):
+            read_kernel_outputs(
+                output_dir=str(tmp_path),
+                output_names=["main"],
+                result=_execute_result(["/shared/1/5/outputs/results.parquet"]),
+                node=_FakeNode(),
+            )
+
+    def test_no_raise_when_some_outputs_found(self, tmp_path: Path):
+        """A partial match (only a secondary output) does not trip the guard."""
+        pl.DataFrame({"b": [2]}).write_parquet(tmp_path / "rejected.parquet")
+        node = _FakeNode()
+
+        result = read_kernel_outputs(
+            output_dir=str(tmp_path),
+            output_names=["clean", "rejected"],
+            result=_execute_result(["rejected.parquet"]),
+            node=node,
+        )
+
+        assert result is None
+        assert set(node._named_outputs) == {"output-1"}
+
+    def test_node_none_supported(self, tmp_path: Path):
+        pl.DataFrame({"a": [1]}).write_parquet(tmp_path / "main.parquet")
+        result = read_kernel_outputs(
+            output_dir=str(tmp_path),
+            output_names=["main"],
+            result=_execute_result(["main.parquet"]),
+            node=None,
+        )
+        assert isinstance(result, FlowDataEngine)
+
+
 # FlowSettings.show_edge_labels
-# ---------------------------------------------------------------------------
 
 
 class TestFlowSettingsShowEdgeLabels:
@@ -213,9 +392,7 @@ class TestFlowSettingsShowEdgeLabels:
         assert settings.show_edge_labels is False
 
 
-# ---------------------------------------------------------------------------
 # write_inputs_to_parquet
-# ---------------------------------------------------------------------------
 
 
 def _mock_fetcher(has_error=False, error_description=None):
@@ -244,7 +421,6 @@ class TestWriteInputsToParquet:
 
         assert list(result.keys()) == ["main"]
         assert len(result["main"]) == 2
-        # Paths should be kernel-translated
         for p in result["main"]:
             assert p.startswith("/shared/")
 
@@ -268,8 +444,8 @@ class TestWriteInputsToParquet:
         assert len(result["clients"]) == 1
         assert len(result["main"]) == 2
 
-    def test_named_inputs_main_no_duplicate(self, tmp_path: Path):
-        """When one input is named 'main', no extra 'main' alias is added."""
+    def test_named_input_main_refused(self, tmp_path: Path):
+        """An input named 'main' is refused: that key is the positional list of every input."""
         mgr = _make_manager(str(tmp_path))
         input_dir = str(tmp_path / "inputs")
         os.makedirs(input_dir, exist_ok=True)
@@ -279,10 +455,8 @@ class TestWriteInputsToParquet:
             "flowfile_core.kernel.execution.ExternalDfFetcher",
             side_effect=lambda **kw: _mock_fetcher(),
         ):
-            result = write_inputs_to_parquet((ft1,), mgr, input_dir, 1, 2, input_names=["main"])
-
-        assert list(result.keys()) == ["main"]
-        assert len(result["main"]) == 1
+            with pytest.raises(ValueError, match="'main' is reserved"):
+                write_inputs_to_parquet((ft1,), mgr, input_dir, 1, 2, input_names=["main"])
 
     def test_unnamed_fetcher_error_raises(self, tmp_path: Path):
         """An error in ExternalDfFetcher raises RuntimeError (unnamed path)."""
@@ -377,6 +551,31 @@ class TestWriteInputsToParquet:
             with pytest.raises(OSError, match="disk full"):
                 write_inputs_to_parquet((ft1,), mgr, input_dir, 1, 2)
 
+    def test_local_flag_writes_in_process_with_offload_on(self, tmp_path: Path):
+        """local=True writes the parquet files in-process even when worker offload is on."""
+
+        class _PathManager:
+            def to_kernel_path(self, path: str) -> str:
+                return path
+
+        def _no_worker(**kwargs):
+            raise AssertionError("worker must not be used for a local graph")
+
+        input_dir = str(tmp_path / "inputs")
+        ft1 = FlowDataEngine(pl.LazyFrame({"a": [1, 2]}))
+        ft2 = FlowDataEngine(pl.LazyFrame({"b": ["x"]}))
+        with (
+            patch("flowfile_core.kernel.execution.OFFLOAD_TO_WORKER", MutableBool(True)),
+            patch("flowfile_core.kernel.execution.ExternalDfFetcher", side_effect=_no_worker),
+        ):
+            result = write_inputs_to_parquet(
+                (ft1, ft2), _PathManager(), input_dir, 1, 2, input_names=["orders", "clients"], local=True
+            )
+
+        assert pl.read_parquet(result["orders"][0]).to_dict(as_series=False) == {"a": [1, 2]}
+        assert pl.read_parquet(result["clients"][0]).to_dict(as_series=False) == {"b": ["x"]}
+        assert result["main"] == result["orders"] + result["clients"]
+
 
 class TestWriteParquetLocally:
     """Unit tests for _write_parquet_locally."""
@@ -410,9 +609,7 @@ class TestWriteParquetLocally:
         assert os.path.exists(output_path)
 
 
-# ---------------------------------------------------------------------------
 # NodePythonScript / UserDefinedNode output_names
-# ---------------------------------------------------------------------------
 
 
 class TestOutputNamesSchema:
@@ -440,9 +637,7 @@ class TestOutputNamesSchema:
         assert node.output_names == ["out1", "out2"]
 
 
-# ---------------------------------------------------------------------------
 # NodeBase.node_reference validator
-# ---------------------------------------------------------------------------
 
 
 class TestNodeReferenceValidator:
@@ -503,3 +698,26 @@ class TestOutputNamesValidator:
     def test_user_defined_node_rejects_unsafe(self):
         with pytest.raises(Exception, match="lowercase letters, digits, and underscores"):
             input_schema.UserDefinedNode(flow_id=1, node_id=1, settings={}, output_names=["foo/bar"])
+
+
+class TestClearStaleParquets:
+    """Unit tests for kernel.execution.clear_stale_parquets."""
+
+    def test_removes_stale_parquets(self, tmp_path: Path):
+        (tmp_path / "old_input_0.parquet").write_bytes(b"stale")
+        (tmp_path / "main.parquet").write_bytes(b"stale")
+
+        clear_stale_parquets(str(tmp_path))
+
+        assert list(tmp_path.iterdir()) == []
+
+    def test_leaves_non_parquet_files(self, tmp_path: Path):
+        (tmp_path / "main.parquet").write_bytes(b"stale")
+        (tmp_path / "notes.txt").write_text("keep me")
+
+        clear_stale_parquets(str(tmp_path))
+
+        assert [p.name for p in tmp_path.iterdir()] == ["notes.txt"]
+
+    def test_missing_dir_is_noop(self, tmp_path: Path):
+        clear_stale_parquets(str(tmp_path / "does_not_exist"))

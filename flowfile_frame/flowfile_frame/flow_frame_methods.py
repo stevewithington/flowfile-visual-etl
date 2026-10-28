@@ -1,6 +1,7 @@
 import io
 import os
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -10,11 +11,22 @@ from polars._typing import IO, CsvEncoding, PolarsDataType, SchemaDict, Sequence
 from flowfile_core.flowfile.flow_data_engine.flow_data_engine import FlowDataEngine
 from flowfile_core.flowfile.flow_graph import FlowGraph
 from flowfile_core.schemas import cloud_storage_schemas, input_schema, transform_schema
+from flowfile_frame import _metadata
 from flowfile_frame.cloud_storage.secret_manager import get_current_user_id
 from flowfile_frame.config import logger
 from flowfile_frame.expr import col
 from flowfile_frame.flow_frame import FlowFrame
-from flowfile_frame.utils import create_flow_graph, generate_node_id
+from flowfile_frame.native import source_frame
+from flowfile_frame.utils import _expand_user, _implicit_graph, generate_node_id
+from shared.path_utils import (
+    default_scan_extension,
+    ensure_glob_pattern,
+    file_name,
+    is_cloud_path,
+    is_glob_pattern,
+    is_url,
+    refuse_cloud_path,
+)
 
 
 def sum(expr):
@@ -52,6 +64,41 @@ def count(expr):
     return expr.count()
 
 
+def _resolve_scan_mode(source: str, *, glob: bool = True) -> Literal["single_file", "directory"]:
+    """Infer whether ``source`` names one file or a set of files read as a single table.
+
+    Mirrors the engine's glob-anywhere rule: a metacharacter anywhere in the path counts. The
+    cloud readers only inspect the last character, which misses ``data/*.csv``; that narrower
+    check is deliberately not reproduced here. A trailing separator or an existing directory
+    also reads as a directory scan, so a bare folder works without a hand-written pattern.
+    URLs are always single-file: polars reads them natively, and their query strings
+    (``?raw=true``) are not glob metacharacters.
+    """
+    if not glob or is_url(source):
+        return "single_file"
+    if is_glob_pattern(source) or source.endswith(("/", os.sep)):
+        return "directory"
+    if is_cloud_path(source):
+        return "single_file"
+    if input_schema.keep_paths_as_written.get():
+        # In a notebook kernel the folder is probed on the user's machine, by core; a Windows one may end in "\".
+        return "directory" if source.endswith("\\") or _metadata.is_directory(source) else "single_file"
+    return "directory" if Path(source).expanduser().is_dir() else "single_file"
+
+
+def _refuse_cloud_sources(source: Any, file_type: str) -> None:
+    """Refuse a non-local URI while building, so the error names the cloud readers.
+
+    A notebook push keeps paths as written instead: a flow holding such a read node must still round-trip,
+    and core refuses the path when the node runs.
+    """
+    if input_schema.keep_paths_as_written.get():
+        return
+    for path in source if isinstance(source, list) else [source]:
+        if isinstance(path, str | os.PathLike):
+            refuse_cloud_path(path, file_type)
+
+
 def read_csv(
     source: str | Path | IO[bytes] | bytes | list[str | Path | IO[bytes] | bytes],
     *,
@@ -59,6 +106,8 @@ def read_csv(
     separator: str = ",",
     convert_to_absolute_path: bool = True,
     description: str | None = None,
+    scan_mode: Literal["single_file", "directory"] | None = None,
+    include_file_paths: str | None = None,
     has_header: bool = True,
     new_columns: list[str] | None = None,
     comment_prefix: str | None = None,
@@ -103,6 +152,10 @@ def read_csv(
         separator: Single byte character to use as separator in the file.
         convert_to_absolute_path: If the path needs to be set to a fixed location
         description: if you want to add a readable name in the frontend (advised)
+        scan_mode: 'single_file' or 'directory'. Auto-detected from path if None. In 'directory'
+            mode every matching file is read as one table (requires glob=True).
+        include_file_paths: Name of a column holding each row's source file path. None (or a
+            blank string) adds no column.
 
         # Polars.scan_csv aligned parameters
         has_header: Indicate if the first row of the dataset is a header or not.
@@ -131,7 +184,8 @@ def read_csv(
         raise_if_empty: Raise error if file is empty.
         truncate_ragged_lines: Truncate lines with too many values.
         decimal_comma: Parse floats with decimal comma.
-        glob: Use glob pattern for file path (if source is a string).
+        glob: Allow glob expansion of a string source; False treats the path literally via the
+            polars fallback and forbids scan_mode='directory'.
         cache: Cache the result after reading (Polars default True).
         with_column_names: Apply a function over the column names.
         other_options: Any other options to pass to polars.scan_csv (e.g. retries, file_cache_ttl).
@@ -141,20 +195,29 @@ def read_csv(
     """
     node_id = generate_node_id()
     if flow_graph is None:
-        flow_graph = create_flow_graph()
+        flow_graph = _implicit_graph()
     flow_id = flow_graph.flow_id
     current_source_path_for_native = None
     if isinstance(source, str | os.PathLike):
         current_source_path_for_native = str(source)
         if "~" in current_source_path_for_native:
-            current_source_path_for_native = os.path.expanduser(current_source_path_for_native)
+            current_source_path_for_native = _expand_user(current_source_path_for_native)
     elif isinstance(source, list) and all(isinstance(s, str | os.PathLike) for s in source):
-        current_source_path_for_native = str(source[0]) if source else None
+        # The native read node takes one path; a longer list goes to scan_csv, which reads them all.
+        current_source_path_for_native = str(source[0]) if len(source) == 1 else None
         if current_source_path_for_native and "~" in current_source_path_for_native:
-            current_source_path_for_native = os.path.expanduser(current_source_path_for_native)
+            current_source_path_for_native = _expand_user(current_source_path_for_native)
     elif isinstance(source, io.BytesIO | io.StringIO):
         logger.warning("Read from bytes io from csv not supported, converting data to raw data")
         return from_dict(pl.read_csv(source), flow_graph=flow_graph, description=description)
+    if storage_options is None:
+        _refuse_cloud_sources(source, "csv")
+    include_file_paths = (include_file_paths or "").strip() or None
+    # Only a single path is inferred from; a list source keeps its existing single-file handling.
+    if scan_mode is None and isinstance(source, str | os.PathLike):
+        scan_mode = _resolve_scan_mode(current_source_path_for_native, glob=glob)
+    if scan_mode == "directory" and glob is False:
+        raise ValueError("scan_mode='directory' requires glob=True")
     actual_infer_schema_length: int | None
     if not infer_schema:
         actual_infer_schema_length = 0
@@ -185,7 +248,9 @@ def read_csv(
         received_table = input_schema.ReceivedTable(
             file_type="csv",
             path=current_source_path_for_native,
-            name=Path(current_source_path_for_native).name,
+            name=file_name(current_source_path_for_native),
+            scan_mode=scan_mode or "single_file",
+            include_file_paths=include_file_paths,
             table_settings=input_schema.InputCsvTable(
                 delimiter=separator,
                 has_headers=has_header,
@@ -193,19 +258,19 @@ def read_csv(
                 starting_from_line=skip_rows,
                 quote_char=quote_char if quote_char is not None else '"',
                 infer_schema_length=actual_infer_schema_length if actual_infer_schema_length is not None else 10000,
+                infer_schema=infer_schema,
                 truncate_ragged_lines=truncate_ragged_lines,
                 ignore_errors=ignore_errors,
                 row_delimiter=eol_char,
             ),
         )
-        if convert_to_absolute_path:
+        if convert_to_absolute_path and not input_schema.keep_paths_as_written.get():
             try:
                 received_table.set_absolute_filepath()
                 received_table.path = received_table.abs_file_path
             except Exception as e:
                 logger.warning(f"Could not determine absolute path for {current_source_path_for_native}: {e}")
 
-        read_node_description = description or f"Read CSV from {Path(current_source_path_for_native).name}"
         read_node = input_schema.NodeRead(
             flow_id=flow_id,
             node_id=node_id,
@@ -213,18 +278,19 @@ def read_csv(
             pos_x=100,
             pos_y=100,
             is_setup=True,
-            description=read_node_description,
+            description=description,
         )
         flow_graph.add_read(read_node)
         flow_graph.get_node(1)
 
-        result_frame = FlowFrame(
-            data=flow_graph.get_node(node_id).get_resulting_data().data_frame, flow_graph=flow_graph, node_id=node_id
-        )
+        result_frame = source_frame(flow_graph, node_id)
         flow_graph.get_node(1)
         return result_frame
     else:
         polars_source_arg = source
+        if scan_mode == "directory" and isinstance(source, str | os.PathLike):
+            # A bare directory is not a pattern polars understands; hand it a real glob.
+            polars_source_arg = ensure_glob_pattern(current_source_path_for_native, default_scan_extension("csv"))
         polars_code = _build_polars_code_args(
             source=polars_source_arg,
             separator=separator,
@@ -256,6 +322,7 @@ def read_csv(
             glob=glob,
             cache=cache,
             with_column_names=with_column_names,
+            include_file_paths=include_file_paths,
             **other_options,
         )
         polars_code_node_description = description or "Read CSV with Polars scan_csv"
@@ -266,7 +333,6 @@ def read_csv(
                 description or f"Read CSV with Polars scan_csv from {Path(source[0]).name} (and possibly others)"
             )
 
-        # Assuming input_schema.NodePolarsCode, transform_schema.PolarsCodeInput are defined
         polars_code_settings = input_schema.NodePolarsCode(
             flow_id=flow_id,
             node_id=node_id,
@@ -275,11 +341,7 @@ def read_csv(
             description=polars_code_node_description,
         )
         flow_graph.add_polars_code(polars_code_settings)
-        return FlowFrame(
-            data=flow_graph.get_node(node_id).get_resulting_data().data_frame,
-            flow_graph=flow_graph,
-            node_id=node_id,
-        )
+        return source_frame(flow_graph, node_id)
 
 
 def _build_polars_code_args(
@@ -313,6 +375,7 @@ def _build_polars_code_args(
     glob: bool,
     cache: bool,
     with_column_names: Callable[[list[str]], list[str]] | None,
+    include_file_paths: str | None = None,
     **other_options: Any,
 ) -> str:
     source_repr: str
@@ -367,6 +430,10 @@ def _build_polars_code_args(
         formatted_value = format_func(value)
         kwargs_list.append(f"{param_name_key}={formatted_value}")
 
+    # Emitted only when set: adding it to param_mapping would rewrite every existing fallback string.
+    if include_file_paths:
+        kwargs_list.append(f"include_file_paths={include_file_paths!r}")
+
     if other_options:
         for k, v in other_options.items():
             kwargs_list.append(f"{k}={repr(v)}")
@@ -382,34 +449,79 @@ def _build_polars_code_args(
 
 
 def read_parquet(
-    source, *, flow_graph: FlowGraph = None, description: str = None, convert_to_absolute_path: bool = True, **options
+    source,
+    *,
+    flow_graph: FlowGraph = None,
+    description: str = None,
+    convert_to_absolute_path: bool = True,
+    scan_mode: Literal["single_file", "directory"] | None = None,
+    include_file_paths: str | None = None,
+    **options,
 ) -> FlowFrame:
     """
     Read a Parquet file into a FlowFrame.
 
     Args:
-        source: Path to Parquet file
+        source: Path to Parquet file (a directory or glob pattern in 'directory' scan mode)
         flow_graph: if you want to add it to an existing graph
         description: if you want to add a readable name in the frontend (advised)
         convert_to_absolute_path: If the path needs to be set to a fixed location
+        scan_mode: 'single_file' or 'directory'. Auto-detected from path if None. In 'directory'
+            mode every matching file is read as one table.
+        include_file_paths: Name of a column holding each row's source file path. None (or a
+            blank string) adds no column.
         **options: Options for polars.read_parquet
 
     Returns:
         A FlowFrame with the Parquet data
     """
-    if "~" in source:
-        os.path.expanduser(source)
+    return _read_simple_file(
+        source,
+        "parquet",
+        input_schema.InputParquetTable(),
+        flow_graph=flow_graph,
+        description=description,
+        convert_to_absolute_path=convert_to_absolute_path,
+        scan_mode=scan_mode or _resolve_scan_mode(str(source)),
+        include_file_paths=include_file_paths,
+    )
+
+
+def _read_simple_file(
+    source,
+    file_type: str,
+    table_settings,
+    *,
+    flow_graph: FlowGraph = None,
+    description: str = None,
+    convert_to_absolute_path: bool = True,
+    scan_mode: Literal["single_file", "directory"] | None = None,
+    include_file_paths: str | None = None,
+) -> FlowFrame:
+    """Shared native reader for parquet, excel, ipc, ndjson, avro and ipc_stream.
+
+    Only directory-capable formats pass ``scan_mode``/``include_file_paths``; the rest leave them
+    at their single-file defaults.
+    """
+    _refuse_cloud_sources(source, file_type)
+    if isinstance(source, str) and "~" in source:
+        source = _expand_user(source)
     node_id = generate_node_id()
 
     if flow_graph is None:
-        flow_graph = create_flow_graph()
+        flow_graph = _implicit_graph()
 
     flow_id = flow_graph.flow_id
 
     received_table = input_schema.ReceivedTable(
-        file_type="parquet", path=source, name=Path(source).name, table_settings=input_schema.InputParquetTable()
+        file_type=file_type,
+        path=source,
+        name=file_name(source),
+        scan_mode=scan_mode or "single_file",
+        include_file_paths=include_file_paths,
+        table_settings=table_settings,
     )
-    if convert_to_absolute_path:
+    if convert_to_absolute_path and not input_schema.keep_paths_as_written.get():
         received_table.path = received_table.abs_file_path
 
     read_node = input_schema.NodeRead(
@@ -424,8 +536,122 @@ def read_parquet(
 
     flow_graph.add_read(read_node)
 
-    return FlowFrame(
-        data=flow_graph.get_node(node_id).get_resulting_data().data_frame, flow_graph=flow_graph, node_id=node_id
+    return source_frame(flow_graph, node_id)
+
+
+def read_ipc(
+    source,
+    *,
+    flow_graph: FlowGraph = None,
+    description: str = None,
+    convert_to_absolute_path: bool = True,
+    scan_mode: Literal["single_file", "directory"] | None = None,
+    include_file_paths: str | None = None,
+    **options,
+) -> FlowFrame:
+    """
+    Read an Arrow IPC/Feather file into a FlowFrame.
+
+    Args:
+        source: Path to the IPC/Arrow file (a directory or glob pattern in 'directory' scan mode)
+        flow_graph: if you want to add it to an existing graph
+        description: if you want to add a readable name in the frontend (advised)
+        convert_to_absolute_path: If the path needs to be set to a fixed location
+        scan_mode: 'single_file' or 'directory'. Auto-detected from path if None. In 'directory'
+            mode every matching file is read as one table.
+        include_file_paths: Name of a column holding each row's source file path. None (or a
+            blank string) adds no column.
+
+    Returns:
+        A FlowFrame with the IPC data
+    """
+    return _read_simple_file(
+        source,
+        "ipc",
+        input_schema.InputIpcTable(),
+        flow_graph=flow_graph,
+        description=description,
+        convert_to_absolute_path=convert_to_absolute_path,
+        scan_mode=scan_mode or _resolve_scan_mode(str(source)),
+        include_file_paths=include_file_paths,
+    )
+
+
+def read_ndjson(
+    source, *, flow_graph: FlowGraph = None, description: str = None, convert_to_absolute_path: bool = True, **options
+) -> FlowFrame:
+    """
+    Read a newline-delimited JSON (NDJSON) file into a FlowFrame.
+
+    Args:
+        source: Path to the NDJSON file
+        flow_graph: if you want to add it to an existing graph
+        description: if you want to add a readable name in the frontend (advised)
+        convert_to_absolute_path: If the path needs to be set to a fixed location
+
+    Returns:
+        A FlowFrame with the NDJSON data
+    """
+    return _read_simple_file(
+        source,
+        "ndjson",
+        input_schema.InputNdjsonTable(),
+        flow_graph=flow_graph,
+        description=description,
+        convert_to_absolute_path=convert_to_absolute_path,
+    )
+
+
+def read_avro(
+    source, *, flow_graph: FlowGraph = None, description: str = None, convert_to_absolute_path: bool = True, **options
+) -> FlowFrame:
+    """
+    Read an Avro file into a FlowFrame.
+
+    Args:
+        source: Path to the Avro file
+        flow_graph: if you want to add it to an existing graph
+        description: if you want to add a readable name in the frontend (advised)
+        convert_to_absolute_path: If the path needs to be set to a fixed location
+
+    Returns:
+        A FlowFrame with the Avro data
+    """
+    return _read_simple_file(
+        source,
+        "avro",
+        input_schema.InputAvroTable(),
+        flow_graph=flow_graph,
+        description=description,
+        convert_to_absolute_path=convert_to_absolute_path,
+    )
+
+
+def read_ipc_stream(
+    source, *, flow_graph: FlowGraph = None, description: str = None, convert_to_absolute_path: bool = True, **options
+) -> FlowFrame:
+    """
+    Read an Arrow IPC stream file (``.arrows``) into a FlowFrame.
+
+    The stream format has no footer, so unlike ``read_ipc`` it cannot be scanned lazily; the
+    read is offloaded to the worker.
+
+    Args:
+        source: Path to the IPC stream file
+        flow_graph: if you want to add it to an existing graph
+        description: if you want to add a readable name in the frontend (advised)
+        convert_to_absolute_path: If the path needs to be set to a fixed location
+
+    Returns:
+        A FlowFrame with the stream's data
+    """
+    return _read_simple_file(
+        source,
+        "ipc_stream",
+        input_schema.InputIpcStreamTable(),
+        flow_graph=flow_graph,
+        description=description,
+        convert_to_absolute_path=convert_to_absolute_path,
     )
 
 
@@ -452,38 +678,13 @@ def read_excel(
     Returns:
         A FlowFrame with the Excel data
     """
-    if "~" in source:
-        os.path.expanduser(source)
-    node_id = generate_node_id()
-
-    if flow_graph is None:
-        flow_graph = create_flow_graph()
-
-    flow_id = flow_graph.flow_id
-
-    received_table = input_schema.ReceivedTable(
-        file_type="excel",
-        path=source,
-        name=Path(source).name,
-        table_settings=input_schema.InputExcelTable(sheet_name=sheet_name, has_headers=has_header),
-    )
-    if convert_to_absolute_path:
-        received_table.path = received_table.abs_file_path
-
-    read_node = input_schema.NodeRead(
-        flow_id=flow_id,
-        node_id=node_id,
-        received_file=received_table,
-        pos_x=100,
-        pos_y=100,
-        is_setup=True,
+    return _read_simple_file(
+        source,
+        "excel",
+        input_schema.InputExcelTable(sheet_name=sheet_name, has_headers=has_header),
+        flow_graph=flow_graph,
         description=description,
-    )
-
-    flow_graph.add_read(read_node)
-
-    return FlowFrame(
-        data=flow_graph.get_node(node_id).get_resulting_data().data_frame, flow_graph=flow_graph, node_id=node_id
+        convert_to_absolute_path=convert_to_absolute_path,
     )
 
 
@@ -498,11 +699,10 @@ def from_dict(data, *, flow_graph: FlowGraph = None, description: str = None) ->
     Returns:
         A FlowFrame with the data
     """
-    # Create new node ID
     node_id = generate_node_id()
 
     if not flow_graph:
-        flow_graph = create_flow_graph()
+        flow_graph = _implicit_graph()
     flow_id = flow_graph.flow_id
 
     input_node = input_schema.NodeManualInput(
@@ -515,13 +715,9 @@ def from_dict(data, *, flow_graph: FlowGraph = None, description: str = None) ->
         description=description,
     )
 
-    # Add to graph
     flow_graph.add_manual_input(input_node)
 
-    # Return new frame
-    return FlowFrame(
-        data=flow_graph.get_node(node_id).get_resulting_data().data_frame, flow_graph=flow_graph, node_id=node_id
-    )
+    return source_frame(flow_graph, node_id)
 
 
 def from_raw_data(
@@ -539,7 +735,7 @@ def from_raw_data(
     node_id = generate_node_id()
 
     if not flow_graph:
-        flow_graph = create_flow_graph()
+        flow_graph = _implicit_graph()
 
     input_node = input_schema.NodeManualInput(
         flow_id=flow_graph.flow_id,
@@ -553,9 +749,68 @@ def from_raw_data(
 
     flow_graph.add_manual_input(input_node)
 
-    return FlowFrame(
-        data=flow_graph.get_node(node_id).get_resulting_data().data_frame, flow_graph=flow_graph, node_id=node_id
+    return source_frame(flow_graph, node_id)
+
+
+def list_files(
+    directory: str | Path,
+    *,
+    file_types: list[str] | None = None,
+    recursive: bool = False,
+    max_depth: int = 5,
+    include_hidden: bool = False,
+    include_files: bool = True,
+    include_directories: bool = False,
+    max_files: int | None = None,
+    flow_graph: FlowGraph = None,
+    description: str = None,
+) -> FlowFrame:
+    """List the contents of a directory as a table.
+
+    One row per entry, with the fixed columns ``file_name``, ``file_path``, ``directory``,
+    ``relative_path``, ``file_type``, ``size_bytes``, ``last_modified``, ``created_date``
+    and ``is_directory``. Feed ``file_path`` into a reader to process a whole folder.
+
+    Args:
+        directory: Folder to list.
+        file_types: Extensions to keep (``["csv"]`` or ``[".csv"]``); empty lists everything.
+        recursive: Descend into subfolders.
+        max_depth: How deep to descend when ``recursive`` is set.
+        include_hidden: Include dotfiles / hidden entries.
+        include_files: Include files in the output.
+        include_directories: Include subfolders in the output.
+        max_files: Cap the number of rows.
+        flow_graph: if you want to add it to an existing graph
+        description: if you want to add a readable name in the frontend (advised)
+
+    Returns:
+        A FlowFrame with one row per directory entry.
+    """
+    node_id = generate_node_id()
+
+    if not flow_graph:
+        flow_graph = _implicit_graph()
+
+    settings = input_schema.NodeListFiles(
+        flow_id=flow_graph.flow_id,
+        node_id=node_id,
+        path=str(directory),
+        file_types=file_types or [],
+        recursive=recursive,
+        max_depth=max_depth,
+        include_hidden=include_hidden,
+        include_files=include_files,
+        include_directories=include_directories,
+        max_files=max_files,
+        pos_x=100,
+        pos_y=100,
+        is_setup=True,
+        description=description,
     )
+
+    flow_graph.add_list_files(settings)
+
+    return source_frame(flow_graph, node_id)
 
 
 def concat(
@@ -590,7 +845,6 @@ def concat(
         raise ValueError("No frames provided to concat_frames")
     if len(frames) == 1:
         return frames[0]
-    # Use first frame's concat method with remaining frames
     first_frame = frames[0]
     remaining_frames = frames[1:]
 
@@ -604,6 +858,8 @@ def scan_csv(
     separator: str = ",",
     convert_to_absolute_path: bool = True,
     description: str | None = None,
+    scan_mode: Literal["single_file", "directory"] | None = None,
+    include_file_paths: str | None = None,
     has_header: bool = True,
     new_columns: list[str] | None = None,
     comment_prefix: str | None = None,
@@ -649,6 +905,8 @@ def scan_csv(
         separator=separator,
         convert_to_absolute_path=convert_to_absolute_path,
         description=description,
+        scan_mode=scan_mode,
+        include_file_paths=include_file_paths,
         has_header=has_header,
         new_columns=new_columns,
         comment_prefix=comment_prefix,
@@ -683,7 +941,14 @@ def scan_csv(
 
 
 def scan_parquet(
-    source, *, flow_graph: FlowGraph = None, description: str = None, convert_to_absolute_path: bool = True, **options
+    source,
+    *,
+    flow_graph: FlowGraph = None,
+    description: str = None,
+    convert_to_absolute_path: bool = True,
+    scan_mode: Literal["single_file", "directory"] | None = None,
+    include_file_paths: str | None = None,
+    **options,
 ) -> FlowFrame:
     """
     Scan a Parquet file into a FlowFrame. This function is an alias for read_parquet.
@@ -694,6 +959,53 @@ def scan_parquet(
     See read_parquet for full documentation.
     """
     return read_parquet(
+        source=source,
+        flow_graph=flow_graph,
+        description=description,
+        convert_to_absolute_path=convert_to_absolute_path,
+        scan_mode=scan_mode,
+        include_file_paths=include_file_paths,
+        **options,
+    )
+
+
+def scan_ipc(
+    source,
+    *,
+    flow_graph: FlowGraph = None,
+    description: str = None,
+    convert_to_absolute_path: bool = True,
+    scan_mode: Literal["single_file", "directory"] | None = None,
+    include_file_paths: str | None = None,
+    **options,
+) -> FlowFrame:
+    """
+    Scan an Arrow IPC/Feather file into a FlowFrame. Alias for read_ipc, provided
+    for compatibility with the polars API where scan_ipc returns a LazyFrame.
+
+    See read_ipc for full documentation.
+    """
+    return read_ipc(
+        source=source,
+        flow_graph=flow_graph,
+        description=description,
+        convert_to_absolute_path=convert_to_absolute_path,
+        scan_mode=scan_mode,
+        include_file_paths=include_file_paths,
+        **options,
+    )
+
+
+def scan_ndjson(
+    source, *, flow_graph: FlowGraph = None, description: str = None, convert_to_absolute_path: bool = True, **options
+) -> FlowFrame:
+    """
+    Scan a newline-delimited JSON file into a FlowFrame. Alias for read_ndjson,
+    provided for compatibility with the polars API where scan_ndjson returns a LazyFrame.
+
+    See read_ndjson for full documentation.
+    """
+    return read_ndjson(
         source=source,
         flow_graph=flow_graph,
         description=description,
@@ -720,7 +1032,7 @@ def scan_parquet_from_cloud_storage(
             scan_mode: Literal["single_file", "directory"] = "single_file"
 
     if flow_graph is None:
-        flow_graph = create_flow_graph()
+        flow_graph = _implicit_graph()
 
     flow_id = flow_graph.flow_id
     settings = input_schema.NodeCloudStorageReader(
@@ -734,9 +1046,7 @@ def scan_parquet_from_cloud_storage(
         output_field_config=output_field_config,
     )
     flow_graph.add_cloud_storage_reader(settings)
-    return FlowFrame(
-        data=flow_graph.get_node(node_id).get_resulting_data().data_frame, flow_graph=flow_graph, node_id=node_id
-    )
+    return source_frame(flow_graph, node_id)
 
 
 def scan_csv_from_cloud_storage(
@@ -748,6 +1058,7 @@ def scan_csv_from_cloud_storage(
     delimiter: str = ";",
     has_header: bool | None = True,
     encoding: CsvEncoding | None = "utf8",
+    description: str | None = None,
     output_field_config: input_schema.OutputFieldConfig | None = None,
 ) -> FlowFrame:
     node_id = generate_node_id()
@@ -759,7 +1070,7 @@ def scan_csv_from_cloud_storage(
             scan_mode: Literal["single_file", "directory"] = "single_file"
 
     if flow_graph is None:
-        flow_graph = create_flow_graph()
+        flow_graph = _implicit_graph()
     flow_id = flow_graph.flow_id
     settings = input_schema.NodeCloudStorageReader(
         flow_id=flow_id,
@@ -774,12 +1085,11 @@ def scan_csv_from_cloud_storage(
             file_format="csv",
         ),
         user_id=get_current_user_id(),
+        description=description,
         output_field_config=output_field_config,
     )
     flow_graph.add_cloud_storage_reader(settings)
-    return FlowFrame(
-        data=flow_graph.get_node(node_id).get_resulting_data().data_frame, flow_graph=flow_graph, node_id=node_id
-    )
+    return source_frame(flow_graph, node_id)
 
 
 def scan_delta(
@@ -788,25 +1098,68 @@ def scan_delta(
     flow_graph: FlowGraph | None = None,
     connection_name: str | None = None,
     version: int = None,
+    changes_since: int | str | datetime | None = None,
+    include_change_preimage: bool = False,
+    description: str | None = None,
     output_field_config: input_schema.OutputFieldConfig | None = None,
 ) -> FlowFrame:
+    """Scan a Delta table in cloud storage into a FlowFrame.
+
+    Args:
+        source: Cloud storage path of the Delta table (e.g. ``'s3://bucket/table'``).
+        flow_graph: Optional existing FlowGraph to add the node to.
+        connection_name: Name of the stored cloud storage connection.
+        version: Delta table version for time travel. Mutually exclusive with ``changes_since``.
+        changes_since: Read the table's change feed instead of its current rows. An ``int`` is a
+            Delta commit version and returns the changes *after* it; a string or a ``datetime``
+            is an ISO-8601 instant. The table must be change-tracked (see ``track_changes`` on
+            :meth:`FlowFrame.write_delta`). The result carries the feed's ``_change_type``,
+            ``_commit_version`` and ``_commit_timestamp`` columns.
+        include_change_preimage: Keep ``update_preimage`` rows (the before-image of an
+            update). Dropped by default.
+        description: Optional description for the node.
+        output_field_config: Optional schema validation/transformation config.
+
+    Returns:
+        FlowFrame: A FlowFrame backed by a cloud storage reader node.
+
+    Raises:
+        ValueError: If both ``version`` and ``changes_since`` are given, or if
+            ``changes_since="last_run"`` (cursors exist for catalog tables only).
+    """
+    from flowfile_frame.catalog import _resolve_change_mode
+
+    if changes_since == "last_run":
+        raise ValueError(
+            "changes_since='last_run' is only available for catalog tables; "
+            "pass a commit version or an ISO-8601 instant for a cloud Delta path"
+        )
+    if version is not None and changes_since is not None:
+        raise ValueError("version and changes_since are mutually exclusive")
+    cdc_mode, cdc_from_version, cdc_from_timestamp = _resolve_change_mode(changes_since)
     node_id = generate_node_id()
     if flow_graph is None:
-        flow_graph = create_flow_graph()
+        flow_graph = _implicit_graph()
     flow_id = flow_graph.flow_id
     settings = input_schema.NodeCloudStorageReader(
         flow_id=flow_id,
         node_id=node_id,
         cloud_storage_settings=cloud_storage_schemas.CloudStorageReadSettings(
-            resource_path=source, connection_name=connection_name, file_format="delta", delta_version=version
+            resource_path=source,
+            connection_name=connection_name,
+            file_format="delta",
+            delta_version=version,
+            cdc_mode=cdc_mode,
+            cdc_from_version=cdc_from_version,
+            cdc_from_timestamp=cdc_from_timestamp,
+            cdc_include_preimage=include_change_preimage,
         ),
         user_id=get_current_user_id(),
+        description=description,
         output_field_config=output_field_config,
     )
     flow_graph.add_cloud_storage_reader(settings)
-    return FlowFrame(
-        data=flow_graph.get_node(node_id).get_resulting_data().data_frame, flow_graph=flow_graph, node_id=node_id
-    )
+    return source_frame(flow_graph, node_id)
 
 
 def scan_json_from_cloud_storage(
@@ -815,6 +1168,7 @@ def scan_json_from_cloud_storage(
     flow_graph: FlowGraph | None = None,
     connection_name: str | None = None,
     scan_mode: Literal["single_file", "directory", None] = None,
+    description: str | None = None,
     output_field_config: input_schema.OutputFieldConfig | None = None,
 ) -> FlowFrame:
     node_id = generate_node_id()
@@ -826,7 +1180,7 @@ def scan_json_from_cloud_storage(
             scan_mode: Literal["single_file", "directory"] = "single_file"
 
     if flow_graph is None:
-        flow_graph = create_flow_graph()
+        flow_graph = _implicit_graph()
     flow_id = flow_graph.flow_id
     settings = input_schema.NodeCloudStorageReader(
         flow_id=flow_id,
@@ -835,9 +1189,8 @@ def scan_json_from_cloud_storage(
             resource_path=source, scan_mode=scan_mode, connection_name=connection_name, file_format="json"
         ),
         user_id=get_current_user_id(),
+        description=description,
         output_field_config=output_field_config,
     )
     flow_graph.add_cloud_storage_reader(settings)
-    return FlowFrame(
-        data=flow_graph.get_node(node_id).get_resulting_data().data_frame, flow_graph=flow_graph, node_id=node_id
-    )
+    return source_frame(flow_graph, node_id)

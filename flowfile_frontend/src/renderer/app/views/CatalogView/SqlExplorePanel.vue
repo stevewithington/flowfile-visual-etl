@@ -86,6 +86,7 @@
 import { computed, reactive, ref, onBeforeUnmount, watch } from "vue";
 import { ElMessage } from "element-plus";
 import VueGraphicWalker from "../../components/nodes/node-types/elements/exploreData/vueGraphicWalker/VueGraphicWalker.vue";
+import { captureThumbnail } from "../../composables/useChartThumbnail";
 import type {
   IMutField,
   IRow,
@@ -94,6 +95,8 @@ import type {
 import type { SqlQueryResult } from "../../types";
 import { CatalogApi } from "../../api/catalog.api";
 import { useCatalogStore } from "../../stores/catalog-store";
+import { useWritableNamespaces } from "../../composables/useWritableNamespaces";
+import { catalogSaveErrorMessage } from "../../composables/saveError";
 import { useGraphicWalkerCompute } from "../../composables/useGraphicWalkerCompute";
 
 const catalogStore = useCatalogStore();
@@ -228,17 +231,7 @@ const saveForm = reactive({
 });
 const exportedCharts = ref<Record<string, any>[]>([]);
 
-// Flatten the namespace tree to a list of schema-level entries the user
-// can attach a chart to. Mirrors the existing virtual-table save form.
-const schemaNamespaces = computed(() => {
-  const items: { id: number; label: string }[] = [];
-  for (const catalog of catalogStore.tree) {
-    for (const schema of catalog.children) {
-      items.push({ id: schema.id, label: `${catalog.name} / ${schema.name}` });
-    }
-  }
-  return items;
-});
+const { writableSchemaNamespaces: schemaNamespaces } = useWritableNamespaces();
 
 async function openSaveDialog() {
   if (!props.sourceQuery || !vueGraphicWalkerRef.value) return;
@@ -268,6 +261,7 @@ async function onConfirmSave() {
   }
   saving.value = true;
   try {
+    const thumbnail_data_url = await captureThumbnail(vueGraphicWalkerRef);
     await CatalogApi.createVisualization({
       name,
       description: saveForm.description.trim() || null,
@@ -276,6 +270,7 @@ async function onConfirmSave() {
       source_type: "sql",
       sql_query: props.sourceQuery,
       namespace_id: saveForm.namespaceId ?? null,
+      ...(thumbnail_data_url ? { thumbnail_data_url } : {}),
     });
     const where = saveForm.namespaceId
       ? (schemaNamespaces.value.find((n) => n.id === saveForm.namespaceId)?.label ?? "the catalog")
@@ -286,7 +281,7 @@ async function onConfirmSave() {
     // catalog/schema right away.
     catalogStore.loadTree().catch((err) => console.warn("[catalog] tree refresh failed", err));
   } catch (err: any) {
-    ElMessage.error(err?.response?.data?.detail ?? err?.message ?? String(err));
+    ElMessage.error(catalogSaveErrorMessage(err, "Failed to save chart"));
   } finally {
     saving.value = false;
   }

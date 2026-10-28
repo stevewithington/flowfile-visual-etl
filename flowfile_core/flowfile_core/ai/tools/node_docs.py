@@ -130,7 +130,8 @@ NODE_LONG_DESCRIPTIONS: Final[dict[str, str]] = {
         "or compute across rows.** For aggregation use ``group_by``; for raw "
         "row count use ``record_count``; for window / multi-column / "
         "aggregation logic that ``[col]`` syntax can't express use "
-        "``polars_code``. Pick ``formula`` ONLY when the new column can be "
+        "``polars_code``; for the SAME expression over MANY columns use "
+        "``multi_field_formula``. Pick ``formula`` ONLY when the new column can be "
         "derived from the SAME row's existing columns (string concat, "
         "arithmetic, conditional, type cast). "
         "Adds or replaces a single column using Flowfile's expression "
@@ -140,9 +141,43 @@ NODE_LONG_DESCRIPTIONS: Final[dict[str, str]] = {
         "``==``, ``!=``, ``and``, ``or`` work; the canonical function "
         "library is documented at stage 3 (fill_settings) when you pick this "
         "node type. Examples: ``[first] + ' ' + [last]`` (string concat), "
-        "``[amount] * 1.21`` (arithmetic). Often paired upstream of "
+        "``[amount] * 1.21`` (arithmetic). "
+        "**One node can hold SEVERAL expressions, evaluated IN ORDER**: pass "
+        '``functions`` as a list of ``{"field": {"name": ..., "data_type": ...}, '
+        '"function": ...}`` entries. Entry N sees the input columns PLUS every '
+        "column entries 1..N-1 produced, so a later entry may reference an "
+        "earlier entry's output — exactly like that many chained formula nodes. "
+        "Prefer one multi-entry node over a chain of single-entry nodes when the "
+        "derivations belong together. For ONE column, ``function`` (a single "
+        "entry, no list) still works and is the simpler shape. Contrast with "
+        "``multi_field_formula``, which applies ONE expression across MANY "
+        "columns (each reading the ORIGINAL input values, not each other's). "
+        "Often paired upstream of "
         "``group_by`` (after deriving a key) or after ``join`` (combining "
         "columns from both sides)."
+    ),
+    "multi_field_formula": (
+        "**ROW-WISE ONLY**, like ``formula``, but applies ONE expression to MANY "
+        "columns in a single node. Pick it when the same calculation has to hit "
+        "several columns — 'uppercase every text column', 'divide each month "
+        "column by the total', 'round all the numeric columns'. Use ``formula`` "
+        "instead when only ONE column is produced, and ``dynamic_rename`` when "
+        "the column NAMES change but the values don't. Inside the expression "
+        "three placeholders bind to the column being processed: "
+        "``[_CurrentField_]`` (its value), ``[_CurrentFieldName_]`` (its name as "
+        "a string) and ``[_CurrentFieldType_]`` (its Polars dtype as a string). "
+        "Every target column is computed in ONE step from the ORIGINAL input "
+        "values — the opposite of ``formula``'s ``functions`` list, whose entries "
+        "run SEQUENTIALLY and can read each other's output. "
+        "Other columns are still referenced normally as ``[other_column]``. "
+        "Target columns are all columns, a listed subset, or one data-type group "
+        "(``Numeric``, ``String``, ``Date``, ``Boolean``, ``Binary``, "
+        "``Complex``, ``Other``). ``output_mode`` ``replace`` overwrites each "
+        "source column; ``new`` writes ``<prefix><name><suffix>`` columns and "
+        "needs at least one affix. Example: "
+        '{"multi_field_formula_input": {"formula": "[_CurrentField_] / [Total] * 100", '
+        '"selection_mode": "list", "selected_columns": ["jan", "feb"], '
+        '"output_mode": "new", "output_suffix": " pct", "output_data_type": "Float64"}}.'
     ),
     "select": (
         "Project, rename, drop, or reorder columns; can also cast types. Use when "
@@ -154,6 +189,34 @@ NODE_LONG_DESCRIPTIONS: Final[dict[str, str]] = {
         '{"old_name": "email", "keep": false}]}. '
         "Often the last step before 'output' or 'database_writer' to shape the "
         "final column list."
+    ),
+    "dynamic_rename": (
+        "Rename many columns at once with a single rule: add a prefix or "
+        "suffix, evaluate a formula over each current name (``[column_name]``, "
+        "e.g. ``uppercase([column_name])``), or promote the first data row to "
+        "headers. Applies to all columns, a listed subset, or one data type. "
+        "Don't use for renaming specific columns to specific names — that's "
+        "'select'. Example: "
+        '{"dynamic_rename_input": {"rename_mode": "prefix", "prefix": "src_", '
+        '"selection_mode": "all"}}.'
+    ),
+    "data_cleansing": (
+        "Fix the usual data-quality problems in one pass: drop rows/columns that are "
+        "null in every field, replace nulls with a blank (string columns) or zero "
+        "(numeric columns), strip letters/numbers/punctuation/whitespace out of text, "
+        "and force upper, lower or title case. Use when the user says 'clean this up', "
+        "'trim the whitespace', 'remove the empty rows', 'strip the currency symbols', "
+        "or 'uppercase the codes'. Row and column dropping always look at every column; "
+        "the other rules only touch the columns you select, and only the ones whose type "
+        "matches (string rules skip numbers, zero-fill skips text, dates and booleans "
+        "pass through). Don't use it for conditional edits or per-column arithmetic — "
+        "that's 'formula' — and don't use it to drop rows on a predicate, which is "
+        "'filter'. Example: "
+        '{"cleansing_input": {"remove_null_rows": true, "trim_whitespace": true, '
+        '"remove_punctuation": true, "case_mode": "uppercase", '
+        '"selection_mode": "list", "selected_columns": ["product_code"]}}. '
+        "Often paired upstream of 'unique' (dedupe only works once values are "
+        "normalised) or 'join' (keys must match exactly)."
     ),
     "sort": (
         "Order rows by one or more columns ascending or descending. Use when the "
@@ -215,6 +278,24 @@ NODE_LONG_DESCRIPTIONS: Final[dict[str, str]] = {
         "Often paired downstream of 'filter' (then aggregate) and upstream of "
         "'sort' (rank by aggregate)."
     ),
+    "window_functions": (
+        "Add rolling, cumulative, rank, tile, or partition-aggregate columns over "
+        "rows, optionally reset per partition (Polars `.over(...)`). Use for running "
+        "totals, moving averages, row ranks within a group, N-tile buckets, or a "
+        "per-group aggregate broadcast to every row (functions 'mean', 'sum', 'min', "
+        "'max', 'count', 'std', 'median' — SQL `AVG(x) OVER (PARTITION BY g)`, no "
+        "window_size, no order_by needed). "
+        "Don't use for plain group aggregation (one row per group) — that's "
+        "'group_by'; window functions keep every input row and add columns. "
+        "Rolling and tile functions REQUIRE at least one order_by column; "
+        "rolling needs window_size; each op needs a unique new_column_name. "
+        "Example: "
+        '{"window_input": {"partition_by": ["region"], '
+        '"order_by": [{"column": "date", "how": "asc"}], '
+        '"window_functions": [{"column": "amount", "function": "rolling_mean", '
+        '"new_column_name": "amount_7d_avg", "window_size": 7}]}}. '
+        "Often paired downstream of 'sort'/'filter' and upstream of 'select'."
+    ),
     "pivot": (
         "Long-to-wide reshape: turn distinct values of one column into new columns "
         "with an aggregate per cell. Use for cross-tabs, monthly summaries (rows "
@@ -256,6 +337,20 @@ NODE_LONG_DESCRIPTIONS: Final[dict[str, str]] = {
         "Often paired downstream of 'fuzzy_match' or two 'join's that produce "
         "id-pair output."
     ),
+    "explode_hierarchy": (
+        "Explode a parent -> child edge list (bill of materials, chart of accounts, org chart) into "
+        "its transitive closure: one row per ancestor and every descendant below it. The output "
+        "REPLACES the input table; input columns are not carried through. Quantities multiply along "
+        "a path and add up across paths; without ``quantity_column`` every edge counts 1. "
+        "``output_detail``: ``totals`` (ancestor, descendant, level, quantity, is_leaf), ``levels`` "
+        "(one row per level a descendant occurs at) or ``paths`` (one row per path in indented-BOM "
+        "order, adding parent, quantity_per and path). ``top_level_only`` explodes only items that "
+        "are never a child; ``include_self`` adds level-0 rows so a node's own records count in its "
+        "roll-up. A cycle or a null quantity fails the run. Example: "
+        '{"explode_hierarchy_input": {"parent_column": "assembly", "child_column": "component", '
+        '"quantity_column": "qty", "top_level_only": true}}. '
+        "Often followed by a 'join' on descendant and a 'group_by' on ancestor."
+    ),
     "python_script": (
         "Run a Python function in the isolated kernel_runtime sandbox; receives "
         "upstream inputs as polars DataFrames, returns a DataFrame. Use only when "
@@ -272,7 +367,9 @@ NODE_LONG_DESCRIPTIONS: Final[dict[str, str]] = {
         "Run a Polars expression body against the upstream LazyFrame. Use for "
         "complex multi-column transforms or window functions where 'formula' "
         "(single-column) is too narrow but 'python_script' (full sandbox) is "
-        "overkill. The body must end with a returnable LazyFrame / DataFrame. "
+        "overkill — unless the transform is one expression repeated per column, "
+        "which is ``multi_field_formula``. "
+        "The body must end with a returnable LazyFrame / DataFrame. "
         "Don't use to issue arbitrary Python — use 'python_script' for that. "
         "Don't use for SQL-shaped joins/aggregations — 'sql_query' is clearer. "
         "1-row dry-run discovers the prospective output schema. "
@@ -395,6 +492,18 @@ NODE_LONG_DESCRIPTIONS: Final[dict[str, str]] = {
         '"/tmp/outputs", "output_csv_table": null}}. '
         "Often the last node in a flow."
     ),
+    "api_response": (
+        "Mark the upstream output as the body of an HTTP API response. Use as the "
+        "terminal node of a flow you intend to publish as an API endpoint — the "
+        "data reaching this node is serialized and returned to the caller. During "
+        "interactive runs it is a pass-through (output equals input), so previews "
+        "keep working. Don't use to write a file — use 'output'; don't use to "
+        "persist to a database — use 'database_writer'. Settings: orientation "
+        "('records' = a list of row objects, the default; 'columns' = "
+        "column-oriented arrays) and an optional max_rows cap on the payload. "
+        'Example: {"orientation": "records", "max_rows": 100}. '
+        "Often the last node in a flow that is published as an endpoint."
+    ),
     "read": (
         "Read a local file (csv, parquet, excel, json) into the flow. Use as the "
         "first step when the data lives on disk. Schema is inferred (csv) or "
@@ -403,6 +512,19 @@ NODE_LONG_DESCRIPTIONS: Final[dict[str, str]] = {
         "'cloud_storage_reader'. Example: "
         '{"received_file": {"name": "users.csv", "file_type": "csv"}}. '
         "Often paired downstream with 'filter' / 'select' (initial cleanup)."
+    ),
+    "list_files": (
+        "List the contents of a local folder as a table — one row per file, with "
+        "columns file_name, file_path, directory, relative_path, file_type, "
+        "size_bytes, last_modified, created_date, is_directory. Use to inventory a "
+        "folder, or to filter files by extension / size / date before acting on "
+        "them. Don't use to read the *contents* of those files — 'read' has a "
+        "directory scan mode that loads a whole folder of csv/parquet as one "
+        "table. Options: file_types (extensions, no dot), recursive + max_depth, "
+        "include_hidden, include_files / include_directories, max_files. Example: "
+        '{"path": "/data/incoming", "file_types": ["csv"], "recursive": true}. '
+        "Often paired downstream with 'filter' (narrow by size or date) or "
+        "'record_count' (how many files arrived)."
     ),
     "database_reader": (
         "Read from a SQL database via a stored connection. Use to pull the result "
@@ -434,17 +556,24 @@ NODE_LONG_DESCRIPTIONS: Final[dict[str, str]] = {
         "node when results are consumed by downstream cloud systems."
     ),
     "catalog_reader": (
-        "Read from a data catalog table (e.g. Iceberg, Delta) via a registered "
-        "catalog connection. Use to pull governed data without managing object "
-        "paths directly. Don't use 'cloud_storage_reader' when a catalog binding "
-        "exists — the catalog reader handles schema, partitioning, and time-travel "
-        "on the user's behalf. Often the first step in a governed pipeline."
+        "Read a table from Flowfile's own catalog (Delta tables under a namespace, "
+        "picked by schema and table name). Use to pull governed data without managing "
+        "object paths directly. Don't use 'cloud_storage_reader' when the data is a "
+        "catalog table — the catalog reader handles schema, partitioning, and time-travel "
+        "on the user's behalf. Often the first step in a governed pipeline. "
+        "If the table is SCD2-tracked, a History selector chooses active / all / "
+        "active at a given time; the default is all records — add an explicit "
+        "'active' filter when only the current version is wanted."
     ),
     "catalog_writer": (
         "Write the upstream output to a catalog table. Use as a terminal step "
         "for governed datasets. Append / overwrite / merge semantics depending "
         "on the catalog binding. Don't use 'cloud_storage_writer' when the target "
-        "is a catalog table — the catalog writer maintains the metadata correctly."
+        "is a catalog table — the catalog writer maintains the metadata correctly. "
+        "An 'scd2' mode keeps a slowly-changing dimension: it end-dates the rows "
+        "whose compared columns changed and inserts new versions, keying on the "
+        "merge/business key. Use it for dimensions where history matters; don't "
+        "use it for fact tables or append-only event streams."
     ),
     "kafka_source": (
         "Stream-read from a Kafka topic. Use when the data source is a Kafka "
@@ -456,6 +585,12 @@ NODE_LONG_DESCRIPTIONS: Final[dict[str, str]] = {
         "Read from Google Analytics 4 via a stored credential. Use when the user "
         "wants GA4 metrics / dimensions inside the flow. Don't use for ad-platform "
         "data — those need their own connectors / 'external_source'."
+    ),
+    "rest_api_reader": (
+        "Read JSON from a REST API (optionally paginated) into the flow. Not for "
+        "streaming (use 'kafka_source') or a source with a typed node (database / "
+        "cloud). Auth uses a Secrets-manager secret the agent can't create, so beyond "
+        "a public endpoint let the user finish auth, pagination and 'Fetch sample'."
     ),
     "external_source": (
         "Generic plug-in source: invokes a registered external connector. Use "
@@ -495,12 +630,72 @@ NODE_LONG_DESCRIPTIONS: Final[dict[str, str]] = {
         "the test split from 'random_split'). Use after 'train_model' to assess "
         "quality. Don't use to score unlabelled data — that's 'apply_model'."
     ),
+    "gate": (
+        "Conditional passthrough: the data input flows through unchanged when the "
+        "gate's condition holds; when it does not, the gate itself still succeeds "
+        "but every node DOWNSTREAM of it is deliberately SKIPPED — reported as "
+        "skipped, not failed, so the run stays green and source callbacks (Kafka "
+        "offset commits) still fire. Input-0 is the data; input-1 is an OPTIONAL "
+        "control input. Two condition sources: "
+        '"parameter" (the default) evaluates a flow-parameter rule before the run '
+        "— operators equals, not_equals, in, not_in, is_true, is_false, is_set, "
+        "with `value` always a string (comma-separated for in / not_in); "
+        '"formula" applies a flowfile formula (the filter node\'s expression '
+        "language, e.g. `[status] = 'error'`) as a row predicate when the gate "
+        "executes — it opens iff AT LEAST ONE ROW matches, checked against the "
+        "control input when one is connected, else against the data input "
+        "itself. ${param} refs work inside the formula. With `else_output: "
+        "true` the gate becomes a two-exit router: data leaves output-0 "
+        "('then') when the condition holds and output-1 ('else') when it does "
+        "not — exactly one side runs per execution; the other side is "
+        "skipped. Use for environment-gated writes, data-quality gates (gate "
+        "on the data itself, or a 'filter' feeding the control input), and "
+        "either/or branches. Don't use to drop rows — that's 'filter'; don't "
+        "use for pure ordering with no condition — that's 'wait_for'. "
+        'Example: {"gate_input": {"condition_source": "parameter", '
+        '"parameter": "env", "operator": "equals", "value": "prod"}, '
+        '"else_output": true}. '
+        "Canonical if/else: ONE gate with else_output, branch A on the then "
+        "output (output-0), branch B on the else output (output-1), both "
+        "re-converging into a 'union' — the skipped branch contributes "
+        "nothing, so the union outputs only the branch that ran (its columns "
+        "only). Cost note: a gate only prevents its DOWNSTREAM from running, so "
+        "place it as early as possible."
+    ),
     "wait_for": (
         "Synchronisation barrier: wait for one or more upstream nodes to finish "
         "before downstream nodes run. Use when downstream sequencing matters "
         "but data doesn't flow through the barrier. Don't use as a data-passing "
         "node — its output is the unmodified primary input. Often used to enforce "
         "side-effect ordering (write A before reading B)."
+    ),
+    "flow_input": (
+        "A subflow's named input port — where a parent flow feeds data in. Only "
+        "used when this flow is run inside another flow (via 'run_flow'). Has no "
+        "input port of its own, so it counts as a source. Extends 'manual_input': "
+        "the sample rows you type are placeholders shown during a standalone run; "
+        "the parent 'run_flow' node replaces them with real data. ``input_name`` "
+        "labels the port. For a normal top-level flow, load data with 'read' or "
+        "'manual_input' instead — not this. Pairs with 'flow_output' and 'run_flow'."
+    ),
+    "flow_output": (
+        "A subflow's named output port — the result a parent flow can read back. "
+        "Only used when this flow is run inside another flow (via 'run_flow'). A "
+        "passthrough: its output equals its input, so it does not change the data. "
+        "``output_name`` labels the result; a flow can have several 'flow_output' "
+        "nodes for several results. It does NOT write a file or a database — for "
+        "that use 'output' (file) or 'database_writer'. Pairs with 'flow_input' "
+        "and 'run_flow'."
+    ),
+    "run_flow": (
+        "Runs another flow (from the catalog) as a subflow, then returns its "
+        "outputs. Data inputs map to the subflow's 'flow_input' ports; the "
+        "subflow's 'flow_output' ports become this node's outputs (handle "
+        "``input-0`` is reserved for parameter data). ``parameter_bindings`` set "
+        "each subflow parameter from a default, a constant, or a column. "
+        "``iteration_mode`` runs the subflow once (``first_value``) or once per "
+        "input row (``iterate``). Its output columns are known only after the "
+        "subflow runs. Pairs with 'flow_input' / 'flow_output' inside that flow."
     ),
 }
 
@@ -532,9 +727,11 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "rows.** For aggregation use 'Group by' or 'Record count'. Pick "
         "Formula only when the new column comes from the SAME row's "
         "existing values (concat, arithmetic, conditional, type cast). "
-        "Settings panel: a single 'Output column' name, a Flowfile "
-        "expression editor for the formula body, and a 'Data type' "
-        "selector for the output. **Syntax**: SQL-style ``[column_name]`` "
+        "Settings panel: one or more formula rows, each with an 'Output "
+        "column' name, a Flowfile expression editor for the formula body, "
+        "and a 'Data type' selector for the output. Rows are evaluated top "
+        "to bottom and a row may reference a column an earlier row created. "
+        "**Syntax**: SQL-style ``[column_name]`` "
         "references (square brackets), NOT Polars-Python. Worked example: "
         "'add a full_name column from first + last' → drag 'Formula' from "
         "Transformations, set Output column=full_name, expression="
@@ -544,7 +741,28 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "totals or per-group statistics use 'Group by' first, then a "
         "Formula on the aggregated result. Pitfall 3: For multi-column "
         "transforms or window functions use 'Polars code' instead — that "
-        "node accepts real Polars-Python."
+        "node accepts real Polars-Python; for the SAME expression over MANY "
+        "columns use 'Multi-field formula'."
+    ),
+    "multi_field_formula": (
+        "Settings panel: four sections — 'Apply to' (All columns / Specific "
+        "columns / By data type), a Flowfile expression editor for the formula, "
+        "'Output' (Overwrite selected columns vs Write to new columns, with "
+        "Prefix / Suffix fields and a Data type selector) and a Preview table "
+        "showing Column → Output. The expression uses the same SQL-style "
+        "``[column_name]`` syntax as Formula, plus three placeholders that bind "
+        "to each selected column: ``[_CurrentField_]`` for its value, "
+        "``[_CurrentFieldName_]`` for its name and ``[_CurrentFieldType_]`` for "
+        "its data type. Worked example: 'show each month as a percentage of the "
+        "total' → drag 'Multi-field formula' from Transformations, Apply to = "
+        "Specific columns and pick the month columns, expression="
+        "``[_CurrentField_] / [Total] * 100``, Output = Write to new columns, "
+        "Suffix=` % Total`, Data type=Float64. Pitfall 1: every expression sees "
+        "the ORIGINAL input values, so overwriting a column another target "
+        "references is safe. Pitfall 2: in 'Write to new columns' mode a prefix "
+        "or suffix is required, and the resulting name must not already exist. "
+        "Pitfall 3: for one output column use 'Formula'; to change column NAMES "
+        "rather than values use 'Rename columns'."
     ),
     "select": (
         "Settings panel: a row per upstream column with checkboxes for "
@@ -555,6 +773,35 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "user_id, find the `email` row, uncheck Keep. Pitfall: 'Select "
         "data' does not compute new columns — for that use 'Formula'. It "
         "also doesn't filter rows — that's 'Filter data'."
+    ),
+    "dynamic_rename": (
+        "Settings panel: 'Rename mode' (Prefix / Suffix / Formula / First "
+        "row), the matching value field, and 'Apply to' (All columns / "
+        "Specific columns / By data type); a 'Preview' shows Original → "
+        "Renamed. Worked example: 'prefix every column with raw_' → drag "
+        "'Rename columns' from Transformations, Rename mode=Prefix, "
+        "Prefix=raw_. Pitfall: to rename specific columns one-by-one use "
+        "'Select data'; in First row mode the new names are read at run "
+        "time and the first row is dropped from the data."
+    ),
+    "data_cleansing": (
+        "Settings panel: five sections — 'Remove null data' (Remove null "
+        "rows / Remove null columns), 'Columns to cleanse' (All columns vs "
+        "Selected columns), 'Replace nulls' (with blank for text, with zero "
+        "for numbers), 'Remove unwanted characters' (Trim whitespace, "
+        "Normalize whitespace, Remove all whitespace, Letters, Numbers, "
+        "Punctuation) and 'Modify case' (None / Uppercase / Lowercase / "
+        "Titlecase). Worked example: 'strip the spaces and symbols off the "
+        "product codes and uppercase them' -> drag 'Data cleansing' from "
+        "Transformations, set Columns to cleanse = Selected columns and pick "
+        "`product_code`, tick Remove punctuation, leave Trim whitespace on, "
+        "set Modify case = Uppercase. Pitfalls: 'Remove null rows' only "
+        "drops a row where EVERY column is null (and an empty string is not "
+        "a null) — to drop rows on one column being empty use 'Filter data' "
+        "instead; the same is true of 'Remove null columns'. Both null "
+        "rules ignore the column selection on purpose. Text rules never "
+        "touch numeric columns and 'with zero' never touches text, so a "
+        "column that looks unchanged is usually the wrong type."
     ),
     "sort": (
         "Settings panel: a 'Columns' list where the user adds sort keys, "
@@ -616,6 +863,21 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "the value doesn't matter for count, but the panel won't validate "
         "without one. Pick any non-null column (the id is fine)."
     ),
+    "window_functions": (
+        "Settings panel: 'Partition by' columns (optional — leave empty for a "
+        "single window over all rows), 'Order by' columns (sort key applied "
+        "before windowing), and a 'Window functions' list. Each row picks a "
+        "Function (rolling_mean, rolling_sum, cum_sum, rank, tile, …), a source "
+        "Column, an output column name, and function-specific options (window "
+        "size, rank method, number of tiles). Worked example: '7-day moving "
+        "average of sales per region' → drag 'Window functions' from the "
+        "Aggregations section, set Partition by=[region], Order by=[date], add a "
+        "row: Function=rolling_mean, Column=sales, output=sales_7d_avg, window "
+        "size=7. Pitfall 1: rolling and tile functions need an Order by column — "
+        "the panel won't compute a meaningful window without one. Pitfall 2: for "
+        "a single total/count per group (collapsing rows) use 'Group by' instead; "
+        "window functions keep every row and just add columns."
+    ),
     "pivot": (
         "Settings panel: 'Index columns' (the rows to keep as-is), a "
         "'Pivot column' (its distinct values become new columns), a "
@@ -658,6 +920,16 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "for general-purpose graph traversal you'd need a 'Polars code' "
         "or 'Python Script' node."
     ),
+    "explode_hierarchy": (
+        "Settings panel: 'Parent column' and 'Child column' for each edge, an optional 'Quantity "
+        "column', an Output choice (Totals / Levels / Paths) and options 'Top-level items only', "
+        "'Include each item itself' and 'Max depth'. Worked example: 'how many screws does each "
+        "finished bike need' → drag 'Explode hierarchy' from Combine Operations, Parent column="
+        "assembly, Child column=component, Quantity column=qty, Totals, Top-level items only on, "
+        "then filter descendant=screw. Pitfall: the result is a new table, not the input with extra "
+        "columns — join other attributes back on ancestor or descendant; a cycle in the data fails "
+        "the run."
+    ),
     "python_script": (
         "Settings panel: 'Kernel' (the runtime the script executes in), "
         "'Available Inputs' (the upstream node names exposed inside the "
@@ -680,7 +952,10 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "write `output_df = input_df.with_columns(pl.col('amount').mean()."
         "over('region').alias('avg_30d'))`. Pitfall: the script is not "
         "Python in general — it's a Polars expression. Imperative loops "
-        "don't fit; use 'Python Script' for that."
+        "don't fit; use 'Python Script' for that. A new node starts as "
+        "`def transform(input_df: pl.LazyFrame) -> pl.LazyFrame: return input_df`: "
+        "code that is a single `def` is called with one parameter per input, in "
+        "connection order, and what it returns is the output."
     ),
     "sql_query": (
         "Settings panel: a SQL editor under a 'SQL Query' heading. "
@@ -795,6 +1070,19 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "For S3 / GCS / Azure use 'Write to cloud provider'; for a "
         "database use 'Write to Database'."
     ),
+    "api_response": (
+        "Settings panel: an 'Orientation' choice (Records — a list of "
+        "row objects, the default; or Columns — column-oriented arrays) "
+        "and an optional 'Max rows' cap on the returned payload. Worked "
+        "example: 'expose the cleaned orders as a JSON API' → drag 'API "
+        "response' from Output Operations onto the final node, leave "
+        "orientation=Records, optionally set Max rows=1000, then publish "
+        "the flow as an endpoint. Pitfall: this is for flows served over "
+        "HTTP — it does not save anything to disk. To write a file use "
+        "'Write data'; to persist to a database use 'Write to Database'. "
+        "In normal interactive runs it just passes its input through, so "
+        "previews still work."
+    ),
     "read": (
         "Settings panel: a 'File Specs' section where the user picks a "
         "file path and the format (CSV / Excel / Parquet via tabs). "
@@ -805,6 +1093,18 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "customers.csv, leave format=csv. Pitfall: this is for local "
         "files. For cloud paths (s3://, gs://) use 'Read from cloud "
         "provider'; for databases use 'Read from Database'."
+    ),
+    "list_files": (
+        "Settings panel: a 'Folder' path box with a Browse button that "
+        "opens the folder picker, then 'Filter' (file types, whether to "
+        "include files and/or folders, hidden files) and 'Subfolders' "
+        "(search subfolders + max depth, max rows). Worked example: "
+        "'which csv files landed in the drop folder this week?' → drag "
+        "'List files' from Input Sources, browse to the folder, set file "
+        "types to csv, then add a 'Filter' on last_modified. Pitfall: "
+        "this lists file *metadata*, it does not open the files — to "
+        "load a whole folder of data use 'Read data' and switch its "
+        "Source to Directory."
     ),
     "database_reader": (
         "Settings panel: a 'Connection' dropdown (lists previously-saved "
@@ -845,24 +1145,30 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "'Write data' writes to local disk."
     ),
     "catalog_reader": (
-        "Settings panel: a 'Catalog' dropdown (Iceberg / Delta), a "
-        "table picker (often namespaced), and an optional time-travel "
-        "version selector. Worked example: 'read the latest customers "
-        "snapshot from Iceberg' → drag 'Read from Catalog' from Input "
-        "Sources, pick the catalog, navigate to db.customers. Pitfall: "
+        "Settings panel: a 'Catalog / Schema' (namespace) dropdown, a "
+        "'Table' picker, and an optional 'Version' selector for time travel. "
+        "Worked example: 'read the latest customers snapshot from the catalog' "
+        "→ drag 'Read from Catalog' from Input Sources, pick the schema, "
+        "then the customers table. Pitfall: "
         "use this rather than 'Read from cloud provider' when the "
         "destination is a *catalog table* (managed metadata) instead "
         "of bare files — the catalog handles partitioning and schema "
-        "evolution."
+        "evolution. When the selected table is SCD2-tracked, a "
+        "'History' selector appears with active / all / active-at "
+        "options; the default is all records, so a downstream join "
+        "expecting one row per key needs 'active' set explicitly."
     ),
     "catalog_writer": (
-        "Settings panel: a 'Catalog' dropdown, a target table, and a "
-        "mode (append / overwrite / merge). Worked example: 'persist "
-        "the cleaned customers to Iceberg' → drag 'Write to Catalog' "
-        "from Output Operations, pick the catalog, table=db.clean_customers, "
-        "mode=overwrite. Pitfall: 'merge' needs a key — define it via "
+        "Settings panel: a target table name, a namespace dropdown, and a "
+        "write mode (overwrite / error if exists / append / upsert / update / "
+        "delete / scd2). Worked example: 'persist the cleaned customers to the "
+        "catalog' → drag 'Write to Catalog' from Output Operations, pick the "
+        "namespace, table=clean_customers, mode=overwrite. Pitfall: 'merge' "
+        "needs a key — define it via "
         "the upstream schema; without a key, only append / overwrite "
-        "are valid."
+        "are valid. SCD2 requires key columns too (the business key); "
+        "the target table must be new or already SCD2 — Flowfile "
+        "refuses to convert an existing plain table in place."
     ),
     "kafka_source": (
         "Settings panel: a Kafka connection / broker URL, a 'Topic' "
@@ -881,6 +1187,14 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "metric=sessions, dimension=country. Pitfall: GA4 has hard rate "
         "limits — large date ranges with high-cardinality dimensions "
         "may be sampled."
+    ),
+    "rest_api_reader": (
+        "Settings: a Request ('Method', 'URL', optional 'Record path' to the records "
+        "array), 'Headers' / 'Query parameters', an 'Authentication' type (None / API "
+        "key / Bearer / Basic) backed by a reusable secret from the Secrets manager, "
+        "and a 'Pagination' strategy (Offset / Page / Cursor); 'Fetch sample' previews "
+        "the columns. Pitfalls: the credential is a named secret (not typed inline), "
+        "JSON only, and set 'Record path' (e.g. data.items) for nested payloads."
     ),
     "external_source": (
         "Settings panel: depends on the connector — each external "
@@ -935,6 +1249,33 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "must include both the true value AND the prediction — apply "
         "the model first, then evaluate."
     ),
+    "gate": (
+        "Settings panel: a 'Condition source' choice — a flow parameter (the "
+        "default) or a formula — plus an 'Add an else output' switch. For a "
+        "parameter condition pick the 'Parameter', an 'Operator' (equals / "
+        "not equals / in / not in / is true / is false / is set) and a "
+        "'Value'. For a formula condition write a flowfile formula (the "
+        "Filter node's expression language, e.g. [status] = 'error') — the "
+        "gate opens when at least one row matches it, checked against the "
+        "optional control input (the bottom handle) when one is connected, "
+        "otherwise against the data input itself. Worked example: 'only load "
+        "to the production table when I run with env=prod' → drag 'Gate' "
+        "from Combine Operations, connect the cleaned data to the first "
+        "input, set Parameter=env, Operator=equals, Value=prod, then connect "
+        "the gate to 'Write to Database'. To run one branch or the other, "
+        "enable the else output: the data leaves handle T (then, output-0) "
+        "when the condition holds and handle E (else, output-1) when it does "
+        "not — put each branch behind one exit and feed both into a 'Union "
+        "data' node; the skipped branch contributes nothing, so the union "
+        "outputs only the branch that ran (its columns only). "
+        "Pitfall 1: a closed gate does not fail the run — the gate succeeds "
+        "and everything downstream is marked skipped, so a green run can "
+        "legitimately produce no output. Pitfall 2: it only stops work "
+        "downstream of itself; the reads it depends on still run, so place it "
+        "as early in the branch as possible. Pitfall 3: to remove rows use "
+        "'Filter data', and to order side effects with no condition use "
+        "'Wait For'."
+    ),
     "wait_for": (
         "Settings panel: empty — no configuration; the node passes "
         "input-0 through unchanged and uses input-1 only as a "
@@ -945,12 +1286,42 @@ NODE_USER_INSTRUCTIONS: Final[dict[str, str]] = {
         "Pitfall: this is for ordering side effects, not data — "
         "input-1's data is discarded; only its completion is observed."
     ),
+    "flow_input": (
+        "Marks where a parent flow sends data in when this flow is used as a "
+        "subflow. Settings: an 'Input name' (the label the parent maps data to) "
+        "and the same sample-data grid as 'Manual input' — type a few rows so you "
+        "can build and preview the subflow on its own. Worked example: 'a "
+        "reusable cleaning flow another flow feeds orders into' → drag 'Flow "
+        "Input' from Input Sources, set Input name=orders, add a few sample rows. "
+        "Pitfall: the sample rows are placeholders — a 'Run Flow' node in the "
+        "parent replaces them with real data at run time. For a normal flow, use "
+        "'Read data' or 'Manual input' instead."
+    ),
+    "flow_output": (
+        "Marks a result this flow exposes when it's used as a subflow. Settings: "
+        "just an 'Output name' (the label the parent reads it back by); the node "
+        "passes its input through unchanged. Worked example: 'expose the cleaned "
+        "orders to the parent flow' → drag 'Flow Output' from Output Operations, "
+        "connect it to the last step, set Output name=clean_orders. Add one 'Flow "
+        "Output' per result you want to expose. Pitfall: this does NOT save a "
+        "file or write to a database — use 'Write data' for a file or 'Write to "
+        "Database' for a table."
+    ),
+    "run_flow": (
+        "Runs another saved flow inside this one. Settings: pick a 'Flow' from "
+        "the catalog; the node then shows one input per 'Flow Input' in that flow "
+        "and one output per 'Flow Output'. A 'Parameters' section binds each "
+        "subflow parameter to a default, a constant, or a column, and a toggle "
+        "runs the subflow once or once per input row. Worked example: 'reuse my "
+        "orders-cleaning flow here' → drag 'Run Flow' from Combine Operations, "
+        "pick that flow, wire your data into its inputs, map any parameters. "
+        "Pitfall: the output columns appear only after the referenced flow has "
+        "run once — re-sync if you change that flow."
+    ),
 }
 
 
-# --------------------------------------------------------------------------- #
-# Agent payload examples                                                       #
-# --------------------------------------------------------------------------- #
+# Agent payload examples
 #
 # Only for node types whose Pydantic settings shape diverges from what an LLM
 # would naively guess from the field names. The agent prompt injects this

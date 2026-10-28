@@ -26,9 +26,7 @@ from flowfile_core.kernel.models import CleanupRequest, ExecuteRequest, ExecuteR
 pytestmark = pytest.mark.kernel
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _run(coro):
@@ -71,9 +69,7 @@ def _post_json(port: int, path: str, json: dict | None = None) -> dict:
         return response.json()
 
 
-# ---------------------------------------------------------------------------
 # Tests — persistence basics
-# ---------------------------------------------------------------------------
 
 
 class TestArtifactPersistenceBasics:
@@ -84,19 +80,16 @@ class TestArtifactPersistenceBasics:
         manager, kernel_id = kernel_manager
         kernel = _run(manager.get_kernel(kernel_id))
 
-        # Clear any leftover state
         _run(manager.clear_artifacts(kernel_id))
 
-        # Publish an artifact
         result = _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("persist_test", {"weights": [1, 2, 3]})',
+            'flowfile_ctx.publish_artifact("persist_test", {"weights": [1, 2, 3]})',
             node_id=100,
         )
         assert result.success
-        assert "persist_test" in result.artifacts_published
+        assert "persist_test" in [a.name for a in result.artifacts_published]
 
-        # Check persistence info
         persistence = _get_json(kernel.port, "/persistence")
         assert persistence["enabled"] is True
         assert persistence["persisted_count"] >= 1
@@ -112,7 +105,7 @@ class TestArtifactPersistenceBasics:
 
         _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("meta_test", [1, 2, 3])',
+            'flowfile_ctx.publish_artifact("meta_test", [1, 2, 3])',
             node_id=101,
         )
 
@@ -129,7 +122,7 @@ class TestArtifactPersistenceBasics:
 
         _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("big_item", list(range(10000)))',
+            'flowfile_ctx.publish_artifact("big_item", list(range(10000)))',
             node_id=102,
         )
 
@@ -160,9 +153,7 @@ class TestHealthAndRecoveryStatus:
         assert status["status"] in ("completed", "pending", "disabled")
 
 
-# ---------------------------------------------------------------------------
 # Tests — manual recovery
-# ---------------------------------------------------------------------------
 
 
 class TestManualRecovery:
@@ -173,25 +164,22 @@ class TestManualRecovery:
         manager, kernel_id = kernel_manager
         kernel = _run(manager.get_kernel(kernel_id))
 
-        # Start fresh
         _run(manager.clear_artifacts(kernel_id))
 
-        # Publish two artifacts
         result1 = _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("model_a", {"type": "linear"})',
+            'flowfile_ctx.publish_artifact("model_a", {"type": "linear"})',
             node_id=200,
         )
         assert result1.success
 
         result2 = _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("model_b", {"type": "tree"})',
+            'flowfile_ctx.publish_artifact("model_b", {"type": "tree"})',
             node_id=201,
         )
         assert result2.success
 
-        # Verify both are persisted
         persistence = _get_json(kernel.port, "/persistence")
         assert persistence["persisted_count"] >= 2
 
@@ -223,19 +211,17 @@ class TestManualRecovery:
 
         _run(manager.clear_artifacts(kernel_id))
 
-        # Node 300 publishes
         r1 = _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("shared_model", {"accuracy": 0.95})',
+            'flowfile_ctx.publish_artifact("shared_model", {"accuracy": 0.95})',
             node_id=300,
         )
         assert r1.success
 
-        # Node 301 reads it
         r2 = _execute(
             manager, kernel_id,
             """
-model = flowfile.read_artifact("shared_model")
+model = flowfile_ctx.read_artifact("shared_model")
 assert model["accuracy"] == 0.95, f"Expected 0.95, got {model}"
 print(f"model accuracy: {model['accuracy']}")
 """,
@@ -245,9 +231,7 @@ print(f"model accuracy: {model['accuracy']}")
         assert "0.95" in r2.stdout
 
 
-# ---------------------------------------------------------------------------
 # Tests — cleanup
-# ---------------------------------------------------------------------------
 
 
 class TestArtifactCleanup:
@@ -260,19 +244,17 @@ class TestArtifactCleanup:
 
         _run(manager.clear_artifacts(kernel_id))
 
-        # Publish two artifacts
         _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("keep_me", 42)',
+            'flowfile_ctx.publish_artifact("keep_me", 42)',
             node_id=400,
         )
         _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("delete_me", 99)',
+            'flowfile_ctx.publish_artifact("delete_me", 99)',
             node_id=401,
         )
 
-        # Cleanup only "delete_me"
         cleanup_result = _post_json(kernel.port, "/cleanup", {
             "artifact_names": [{"flow_id": 0, "name": "delete_me"}],
         })
@@ -288,11 +270,10 @@ class TestArtifactCleanup:
 
         _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("recent_item", "fresh")',
+            'flowfile_ctx.publish_artifact("recent_item", "fresh")',
             node_id=410,
         )
 
-        # Cleanup with 24h threshold — recent artifacts should survive
         cleanup_result = _post_json(kernel.port, "/cleanup", {
             "max_age_hours": 24,
         })
@@ -307,25 +288,20 @@ class TestArtifactCleanup:
 
         _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("doomed", 123)',
+            'flowfile_ctx.publish_artifact("doomed", 123)',
             node_id=420,
         )
 
-        # Verify it's persisted
         persistence_before = _get_json(kernel.port, "/persistence")
         assert persistence_before["persisted_count"] >= 1
 
-        # Clear all
         _post_json(kernel.port, "/clear")
 
-        # Verify disk is clean too
         persistence_after = _get_json(kernel.port, "/persistence")
         assert persistence_after["persisted_count"] == 0
 
 
-# ---------------------------------------------------------------------------
 # Tests — persistence through KernelManager proxy
-# ---------------------------------------------------------------------------
 
 
 class TestKernelManagerPersistenceProxy:
@@ -358,9 +334,7 @@ class TestKernelManagerPersistenceProxy:
         assert result.recovery_mode in ("lazy", "eager", "none")
 
 
-# ---------------------------------------------------------------------------
 # Tests — persistence survives node re-execution
-# ---------------------------------------------------------------------------
 
 
 class TestPersistenceThroughReexecution:
@@ -375,18 +349,16 @@ class TestPersistenceThroughReexecution:
 
         _run(manager.clear_artifacts(kernel_id))
 
-        # Node 500 publishes "stable_model"
         r1 = _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("stable_model", {"v": 1})',
+            'flowfile_ctx.publish_artifact("stable_model", {"v": 1})',
             node_id=500,
         )
         assert r1.success
 
-        # Node 501 publishes "temp_model"
         r2 = _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("temp_model", {"v": 1})',
+            'flowfile_ctx.publish_artifact("temp_model", {"v": 1})',
             node_id=501,
         )
         assert r2.success
@@ -394,12 +366,11 @@ class TestPersistenceThroughReexecution:
         # Re-execute node 501 (clears its own artifacts, publishes new)
         r3 = _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("temp_model", {"v": 2})',
+            'flowfile_ctx.publish_artifact("temp_model", {"v": 2})',
             node_id=501,
         )
         assert r3.success
 
-        # "stable_model" from node 500 should still be on disk
         persistence = _get_json(kernel.port, "/persistence")
         assert "stable_model" in persistence["artifacts"]
         assert persistence["artifacts"]["stable_model"]["persisted"] is True
@@ -413,26 +384,23 @@ class TestPersistenceThroughReexecution:
 
         _run(manager.clear_artifacts(kernel_id))
 
-        # Publish model
         _execute(
             manager, kernel_id,
-            'flowfile.publish_artifact("durable_model", {"accuracy": 0.99})',
+            'flowfile_ctx.publish_artifact("durable_model", {"accuracy": 0.99})',
             node_id=510,
         )
 
-        # Different node re-executes multiple times
         for i in range(3):
             _execute(
                 manager, kernel_id,
-                f'flowfile.publish_artifact("ephemeral_{i}", {i})',
+                f'flowfile_ctx.publish_artifact("ephemeral_{i}", {i})',
                 node_id=511 + i,
             )
 
-        # Verify durable_model is still readable
         r = _execute(
             manager, kernel_id,
             """
-model = flowfile.read_artifact("durable_model")
+model = flowfile_ctx.read_artifact("durable_model")
 assert model["accuracy"] == 0.99
 print("durable model OK")
 """,

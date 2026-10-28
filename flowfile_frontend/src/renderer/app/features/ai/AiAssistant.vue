@@ -13,7 +13,8 @@ import { useRouter } from "vue-router";
 import { useAiAgentStore, type AgentEvent } from "../../stores/ai-agent-store";
 import { useAiStore, type AiMode, type ChatMessage } from "../../stores/ai-store";
 import { useFlowStore } from "../../stores/flow-store";
-import { AiDisabledError } from "../../views/AiProvidersView/api";
+import { LOCAL_PROVIDER_ID, LOCAL_PROVIDER_LABEL } from "../../views/AiSettingsView/localModelApi";
+import type { AiSettingsTabKey } from "../../views/AiSettingsView/aiSettingsTabs";
 import AiAgentRun from "./AiAgentRun.vue";
 import AiAvatar from "./AiAvatar.vue";
 import AiDiffPanel from "./AiDiffPanel.vue";
@@ -28,10 +29,11 @@ const flowStore = useFlowStore();
 const agentStore = useAiAgentStore();
 const router = useRouter();
 
-// Settings popover anchored to the gear button in the header. Holds
-// provider / model / agent-variant pickers plus inline explanations
-// of what each variant does. Closed by default; opens on gear click,
-// closes on outside click or Esc.
+// Model popover anchored to the gear button in the header: a quick
+// switcher for the device-wide provider / model (the same value
+// Settings → AI → Assistant edits) plus a link to the full page. Agent
+// behaviour lives on that page, not here. Closed by default; opens on
+// gear click, closes on outside click or Esc.
 const settingsOpen = ref(false);
 const settingsAnchorRef = ref<HTMLElement | null>(null);
 
@@ -44,7 +46,9 @@ const infoAnchorRef = ref<HTMLElement | null>(null);
 const composerText = ref("");
 const composerTextarea = ref<HTMLTextAreaElement | null>(null);
 const messageContainerRef = ref<HTMLElement | null>(null);
-const isDisabledByFlag = ref(false);
+// Single disabled flag, set by the store when GET /ai/providers answers the
+// router's 503 "AI features are disabled" contract.
+const isDisabledByFlag = computed(() => aiStore.aiDisabled);
 
 // `@`-mention autocomplete. Source the candidate node list from the
 // live VueFlow graph (the chat drawer is mounted from Canvas.vue, so
@@ -65,27 +69,17 @@ const mention = useMentionAutocomplete(composerTextarea, composerText, () => {
 const placeholder = computed(() =>
   aiStore.hasConfiguredProvider
     ? "Ask anything about Flowfile or your data..."
-    : "Configure a provider in Settings → AI Providers to start chatting.",
+    : "Configure a provider in Settings → AI to start chatting.",
 );
 
-// Model picker source. Prefer the credential's curated `models` list
-// (multiple free models behind one OpenRouter / Groq key); fall back
-// to the singleton `defaultModel`; finally the class-level default.
-// Picker only renders when there are multiple options.
-const selectedProviderMeta = computed(() => {
-  const name = aiStore.selectedProvider;
-  if (!name) return null;
-  return aiStore.providers.find((p) => p.provider === name) ?? null;
-});
+// User-facing provider label: the wire id stays "local"; users see "On-device AI".
+const providerLabel = (id: string): string =>
+  id === LOCAL_PROVIDER_ID ? LOCAL_PROVIDER_LABEL : id;
 
-const availableModels = computed<string[]>(() => {
-  const meta = selectedProviderMeta.value;
-  if (!meta) return [];
-  const curated = meta.credential?.models;
-  if (curated && curated.length > 0) return curated;
-  const singleton = meta.credential?.defaultModel ?? meta.defaultModel ?? null;
-  return singleton ? [singleton] : [];
-});
+// Model picker source: the same list Settings → AI and ⌘K offer.
+const availableModels = computed<string[]>(() =>
+  aiStore.modelsForProvider(aiStore.selectedProvider),
+);
 
 const showModelPicker = computed(() => availableModels.value.length >= 1);
 
@@ -183,13 +177,7 @@ watch(
 );
 
 onMounted(async () => {
-  try {
-    await aiStore.loadProviders();
-  } catch (err) {
-    if (err instanceof AiDisabledError) {
-      isDisabledByFlag.value = true;
-    }
-  }
+  await aiStore.loadProviders();
   // Outside-click + Esc dismiss for the settings popover. The handlers
   // early-out when ``settingsOpen`` is false so they're cheap when idle.
   document.addEventListener("click", handleDocumentClick);
@@ -201,31 +189,6 @@ onBeforeUnmount(() => {
   document.removeEventListener("keydown", handleDocumentKeydown);
 });
 
-const handleAgentSurfaceChange = (event: Event): void => {
-  // Handler bound to radio inputs in the settings popover; cast
-  // accepts either HTMLInputElement (radios) or HTMLSelectElement
-  // (legacy callers, if any) so the read of ``.value`` is type-safe.
-  const target = event.target as HTMLInputElement;
-  const value = target.value;
-  // Three surfaces are user-selectable:
-  //   - agent_live (default) — REPL-style; applies each step live.
-  //   - agent_staged — multi-stage planner; reviews steps before staging.
-  //   - agent_complex — single-shot full catalog.
-  if (value === "agent_complex" || value === "agent_staged" || value === "agent_live") {
-    aiStore.setSelectedAgentSurface(value);
-  }
-};
-
-const handleVerifyPlanCompletionChange = (event: Event): void => {
-  // Opt-in verify-completion gate. Toggled via a checkbox in the
-  // agent settings popover; the value flows into
-  // ``AgentStartRequest.verify_plan_completion`` on every dispatch
-  // (both the manual Agent toggle in this component and the
-  // auto-promote-from-chat path in ai-store.ts).
-  const target = event.target as HTMLInputElement;
-  aiStore.setVerifyPlanCompletion(target.checked);
-};
-
 const handleProviderChange = (event: Event): void => {
   const target = event.target as HTMLSelectElement;
   aiStore.setSelectedProvider(target.value);
@@ -236,11 +199,37 @@ const handleModelChange = (event: Event): void => {
   aiStore.setSelectedModel(target.value || null);
 };
 
+// --- Local model (offline) UI ---
+// The local 1.5B model can't drive the tool-calling agent, so when it's the
+// selected provider we replace the Chat/Auto-agent/Agent dropdown with a
+// simpler Chat / Generate toggle. "Generate" runs one-shot flow generation
+// (→ diff-review panel); "Chat" is plain offline Q&A.
+const isLocalSelected = computed(() => aiStore.isLocalSelected);
+
+// Apply a Simple-build result onto the canvas (inline "Add to canvas" button).
+const handleAddBuild = (messageId: number): void => {
+  void aiStore.addBuiltFlow(messageId);
+};
+
 const handleSend = async (): Promise<void> => {
   if (!canSend.value) return;
   const text = composerText.value;
   composerText.value = "";
   exitRecallMode();
+
+  // Simple build is a universal mode (local or cloud): generate a whole flow
+  // in one response, surfaced with an inline "Add to canvas" button.
+  if (aiStore.mode === "simple") {
+    await aiStore.generateFlowFromComposer(text);
+    return;
+  }
+
+  // The local model can't drive the tool-calling agent, so its only other mode
+  // is plain chat (the mode dropdown hides auto/agent for local).
+  if (isLocalSelected.value) {
+    await aiStore.sendMessage(text);
+    return;
+  }
 
   if (aiStore.mode === "agent") {
     if (flowStore.flowId === null) {
@@ -294,16 +283,16 @@ const handleSend = async (): Promise<void> => {
     await agentStore.start({
       flow_id: flowStore.flowId,
       prompt: promptWithHistory,
-      // Surface is user-selectable via the settings popover. Default
-      // is ``agent_live`` (REPL-style; applies each step live).
+      // Surface is user-selectable under Settings → AI → Assistant.
+      // Default is ``agent_live`` (REPL-style; applies each step live).
       // ``agent_staged`` (multi-stage planner with batched diff) and
       // ``agent_complex`` (single-shot full catalog) are opt-ins.
       surface: aiStore.selectedAgentSurface,
       provider: aiStore.selectedProvider ?? "anthropic",
       model: aiStore.selectedModel ?? null,
-      // Opt-in verify-completion gate. Default off; toggled via the
-      // agent settings panel checkbox so a multi-step plan that ends
-      // prematurely gets one auto-correction round.
+      // Opt-in verify-completion gate. Default off; toggled on the same
+      // settings page so a multi-step plan that ends prematurely gets one
+      // auto-correction round.
       verify_plan_completion: aiStore.verifyPlanCompletion,
     });
     return;
@@ -356,11 +345,26 @@ const modeTooltip = computed<string>(() => {
       return "Chat mode — every message stays in chat. The AI answers but never proposes graph changes.";
     case "agent":
       return "Agent mode — every Send runs the agent and proposes a GraphDiff for review.";
+    case "simple":
+      return "Simple build — the model writes the flow as FlowFrame code, Flowfile turns it into nodes; add them to the canvas with one click.";
     case "auto":
     default:
       return "Auto-agent — chat by default; the classifier auto-promotes to agent when a build intent is detected.";
   }
 });
+
+// Local can't run auto/agent (no tool-calling). If those modes were active
+// when the user switches to local, fall back to chat so the dropdown shows a
+// valid selection. Watcher (not computed) so it can call the store setter.
+watch(
+  isLocalSelected,
+  (local) => {
+    if (local && (aiStore.mode === "auto" || aiStore.mode === "agent")) {
+      aiStore.setMode("chat");
+    }
+  },
+  { immediate: true },
+);
 
 const toggleSettings = (): void => {
   settingsOpen.value = !settingsOpen.value;
@@ -427,12 +431,12 @@ const handleSuggestionPick = (text: string): void => {
   });
 };
 
-// Navigate to the AI Providers tab in Connections so users can add /
-// edit credentials. Closes the popover first to avoid a flash of the
-// open menu during the route transition.
-const handleManageProviders = (): void => {
+// Navigate to Settings → AI (providers, assistant defaults, on-device AI).
+// Closes the popover first to avoid a flash of the open menu during the
+// route transition.
+const openAiSettings = (tab: AiSettingsTabKey): void => {
   settingsOpen.value = false;
-  void router.push({ name: "connections", query: { tab: "ai" } });
+  void router.push({ name: "ai", query: { tab } });
 };
 
 // Terminal-style ↑/↓ prompt-history recall. Reads from the persisted
@@ -504,13 +508,16 @@ const tryRecall = (direction: 1 | -1): boolean => {
   return true;
 };
 
-// Cycle order matches the dropdown: Chat → Auto-agent → Agent → Chat.
+// Cycle order matches the dropdown. On-device AI can't tool-call, so it only
+// toggles Chat ↔ Simple build; cloud providers cycle Chat → Auto-agent → Agent.
 const _MODE_CYCLE: ReadonlyArray<AiMode> = ["chat", "auto", "agent"];
+const _LOCAL_MODE_CYCLE: ReadonlyArray<AiMode> = ["chat", "simple"];
 
 const cycleMode = (): void => {
   if (aiStore.isStreaming || isAgentRunning.value) return;
-  const idx = _MODE_CYCLE.indexOf(aiStore.mode);
-  const next = _MODE_CYCLE[(idx + 1) % _MODE_CYCLE.length];
+  const cycle = isLocalSelected.value ? _LOCAL_MODE_CYCLE : _MODE_CYCLE;
+  const idx = cycle.indexOf(aiStore.mode);
+  const next = cycle[(idx + 1) % cycle.length];
   aiStore.setMode(next);
 };
 
@@ -705,18 +712,45 @@ const showStandaloneThinking = computed<boolean>(() => {
           </div>
           <div class="ai-assistant__info-section">
             <h4 class="ai-assistant__info-heading">Modes</h4>
-            <ul class="ai-assistant__info-list">
-              <li><strong>Chat</strong> — Q&amp;A only; never modifies the canvas.</li>
-              <li>
-                <strong>Auto-agent</strong> (default) — chats; auto-promotes to the agent when you
-                describe a build.
-              </li>
-              <li>
-                <strong>Agent</strong> — every send runs the agent and proposes graph changes.
-              </li>
-            </ul>
-            <p class="ai-assistant__info-note">
-              Agent variant (Staged / Single-shot / Live) is in <strong>Settings</strong>.
+            <!-- On-device AI can't tool-call, so its modes differ from cloud
+                 providers (Chat / Simple build, no Auto-agent or Agent). -->
+            <template v-if="!isLocalSelected">
+              <ul class="ai-assistant__info-list">
+                <li><strong>Chat</strong> — Q&amp;A only; never modifies the canvas.</li>
+                <li>
+                  <strong>Auto-agent</strong> (default) — chats; auto-promotes to the agent when you
+                  describe a build.
+                </li>
+                <li>
+                  <strong>Agent</strong> — every send runs the agent and proposes graph changes.
+                </li>
+              </ul>
+              <p class="ai-assistant__info-note">
+                Agent variant (Staged / Single-shot / Live) is under
+                <strong>Settings → AI → Assistant</strong>.
+              </p>
+            </template>
+            <template v-else>
+              <ul class="ai-assistant__info-list">
+                <li><strong>Chat</strong> — Q&amp;A only; never modifies the canvas.</li>
+                <li>
+                  <strong>Simple build</strong> — generates a whole flow from one prompt; review and
+                  add it to the canvas with one click.
+                </li>
+              </ul>
+              <p class="ai-assistant__info-note">
+                On-device AI can't run Auto-agent or Agent: those build step by step through tool
+                calls, which this small model doesn't support.
+              </p>
+            </template>
+          </div>
+          <div class="ai-assistant__info-section">
+            <h4 class="ai-assistant__info-heading">On-device AI</h4>
+            <p class="ai-assistant__info-paragraph">
+              On-device AI runs on your machine and nothing leaves it. It's a small model: fine for
+              questions, explanations and simple builds, but it can't run the Agent and it gets
+              column names wrong more often than a cloud model. For bigger flows, add a provider
+              (e.g. Ollama or OpenRouter) under <strong>Settings → AI</strong>.
             </p>
           </div>
           <div class="ai-assistant__info-section">
@@ -740,9 +774,13 @@ const showStandaloneThinking = computed<boolean>(() => {
             <h4 class="ai-assistant__info-heading">Tips</h4>
             <ul class="ai-assistant__info-list">
               <li><kbd>↑</kbd> in the composer recalls your last prompt.</li>
-              <li>
+              <li v-if="!isLocalSelected">
                 <kbd>{{ modKeyLabel }}</kbd> + <kbd>⇧</kbd> + <kbd>M</kbd> cycles modes (Chat →
                 Auto-agent → Agent).
+              </li>
+              <li v-else>
+                <kbd>{{ modKeyLabel }}</kbd> + <kbd>⇧</kbd> + <kbd>M</kbd> toggles modes (Chat ↔
+                Simple build).
               </li>
               <li>
                 Chat history is per-flow and persists across reloads. Switching flows is automatic —
@@ -756,10 +794,11 @@ const showStandaloneThinking = computed<boolean>(() => {
           </div>
         </div>
       </div>
-      <!-- Provider / model / agent-variant pickers live in a popover
-           behind this gear button so the header stays compact in
-           steady state. The popover anchors to the wrapper below and
-           dismisses on outside click + Esc. -->
+      <!-- Quick provider / model switcher behind the gear button so the
+           header stays compact. It edits the same device-wide selection
+           as Settings → AI → Assistant; everything else (agent variant,
+           verification, on-device setup) lives on that page. The popover
+           anchors to the wrapper below and dismisses on outside click + Esc. -->
       <div ref="settingsAnchorRef" class="ai-assistant__settings-wrapper">
         <button
           v-if="!isDisabledByFlag"
@@ -769,8 +808,8 @@ const showStandaloneThinking = computed<boolean>(() => {
           :disabled="aiStore.isStreaming || isAgentRunning"
           aria-haspopup="dialog"
           :aria-expanded="settingsOpen"
-          aria-label="AI settings"
-          title="AI settings"
+          aria-label="Model and AI settings"
+          title="Model and AI settings"
           @click.stop="toggleSettings"
         >
           <span class="material-icons" aria-hidden="true">settings</span>
@@ -779,7 +818,7 @@ const showStandaloneThinking = computed<boolean>(() => {
           v-if="settingsOpen"
           class="ai-assistant__settings-popover"
           role="dialog"
-          aria-label="AI settings"
+          aria-label="Model and AI settings"
         >
           <div v-if="aiStore.providers.length > 0" class="ai-assistant__settings-section">
             <label class="ai-assistant__settings-label" for="ai-settings-provider">
@@ -799,7 +838,7 @@ const showStandaloneThinking = computed<boolean>(() => {
                 :value="provider.provider"
                 :disabled="provider.status === 'unconfigured'"
               >
-                {{ provider.provider }}
+                {{ providerLabel(provider.provider) }}
                 <template v-if="provider.status === 'env_fallback'"> (env)</template>
                 <template v-else-if="provider.status === 'unconfigured'">
                   (not configured)
@@ -821,103 +860,23 @@ const showStandaloneThinking = computed<boolean>(() => {
                 {{ model }}
               </option>
             </select>
-          </div>
-          <div class="ai-assistant__settings-section">
-            <span class="ai-assistant__settings-label">Agent variant</span>
-            <p class="ai-assistant__settings-hint">
-              How the agent plans and executes changes. Used when Send dispatches an agent run
-              (Auto-agent or Agent mode).
+            <p v-if="isLocalSelected" class="ai-assistant__settings-hint">
+              Best for simple tasks. For more capable models, use a cloud provider (e.g. Ollama or
+              OpenRouter).
             </p>
-            <label class="ai-assistant__settings-radio">
-              <input
-                type="radio"
-                name="ai-agent-surface"
-                value="agent_staged"
-                :checked="aiStore.selectedAgentSurface === 'agent_staged'"
-                :disabled="aiStore.isStreaming || isAgentRunning"
-                @change="handleAgentSurfaceChange"
-              />
-              <span class="ai-assistant__settings-radio-body">
-                <span class="ai-assistant__settings-radio-name">Staged</span>
-                <span class="ai-assistant__settings-radio-desc">
-                  Multi-stage planner. Reviews each step before staging. Reliable on small / local
-                  models.
-                </span>
-              </span>
-            </label>
-            <label class="ai-assistant__settings-radio">
-              <input
-                type="radio"
-                name="ai-agent-surface"
-                value="agent_complex"
-                :checked="aiStore.selectedAgentSurface === 'agent_complex'"
-                :disabled="aiStore.isStreaming || isAgentRunning"
-                @change="handleAgentSurfaceChange"
-              />
-              <span class="ai-assistant__settings-radio-body">
-                <span class="ai-assistant__settings-radio-name">Single-shot full</span>
-                <span class="ai-assistant__settings-radio-desc">
-                  Exposes the entire tool catalog at once. Best for large models that handle complex
-                  prompts well.
-                </span>
-              </span>
-            </label>
-            <label class="ai-assistant__settings-radio">
-              <input
-                type="radio"
-                name="ai-agent-surface"
-                value="agent_live"
-                :checked="aiStore.selectedAgentSurface === 'agent_live'"
-                :disabled="aiStore.isStreaming || isAgentRunning"
-                @change="handleAgentSurfaceChange"
-              />
-              <span class="ai-assistant__settings-radio-body">
-                <span class="ai-assistant__settings-radio-name">Live (REPL)</span>
-                <span class="ai-assistant__settings-radio-desc">
-                  Applies each step live to the canvas, runs the affected subgraph, retries on
-                  failure. Every step commits immediately, no staged diff.
-                </span>
-              </span>
-            </label>
-            <!-- Divider so the verify-completion gate doesn't read as a
-                 fourth Agent variant. Agent variant chooses *how* the
-                 agent runs; verify completion is an orthogonal post-run
-                 check that applies regardless of variant. -->
-            <hr class="ai-assistant__settings-divider" aria-hidden="true" />
-            <span class="ai-assistant__settings-label">Verification</span>
-            <!-- Opt-in verify-completion gate. After classify picks
-                 op_kind="other" (intending to terminate), the agent
-                 runs one extra LLM round to walk the plan as a
-                 checklist. Catches the case where a multi-step plan
-                 terminates after step 1. -->
-            <label class="ai-assistant__settings-radio">
-              <input
-                type="checkbox"
-                name="ai-agent-verify-plan"
-                :checked="aiStore.verifyPlanCompletion"
-                :disabled="aiStore.isStreaming || isAgentRunning"
-                @change="handleVerifyPlanCompletionChange"
-              />
-              <span class="ai-assistant__settings-radio-body">
-                <span class="ai-assistant__settings-radio-name">Verify plan completion</span>
-                <span class="ai-assistant__settings-radio-desc">
-                  After the agent finishes, double-check that every plan step was applied. Adds one
-                  LLM round per agent run. Useful when multi-step plans (e.g. add a node mid-flow
-                  plus the rewires) sometimes terminate after step 1.
-                </span>
-              </span>
-            </label>
           </div>
-          <!-- Footer link: navigates to Connections → AI Providers
-               where users add API keys, configure model overrides,
-               and test credentials. -->
+          <p class="ai-assistant__settings-hint">
+            Applies to every AI feature, not just this chat.
+          </p>
+          <!-- Footer link: the full settings page — API keys, the cheaper
+               simple-task tier, agent variant and verification, on-device AI. -->
           <div class="ai-assistant__settings-footer">
             <button
               type="button"
               class="ai-assistant__settings-link"
-              @click="handleManageProviders"
+              @click="openAiSettings('assistant')"
             >
-              Manage providers in Connections
+              All AI settings
               <span class="material-icons" aria-hidden="true">arrow_forward</span>
             </button>
           </div>
@@ -939,7 +898,15 @@ const showStandaloneThinking = computed<boolean>(() => {
     <div v-if="isDisabledByFlag" class="ai-assistant__notice">
       <p>AI features are disabled.</p>
       <p class="ai-assistant__notice-hint">
-        Set <code>FEATURE_FLAG_AI=true</code> on the backend and restart <code>flowfile_core</code>.
+        An administrator can turn them on under
+        <button
+          type="button"
+          class="ai-assistant__notice-link"
+          @click="openAiSettings('providers')"
+        >
+          Settings → AI
+        </button>
+        or by setting <code>FEATURE_FLAG_AI=true</code> on the backend.
       </p>
     </div>
 
@@ -949,10 +916,28 @@ const showStandaloneThinking = computed<boolean>(() => {
       <p>No providers configured yet.</p>
       <p class="ai-assistant__notice-hint">
         Open
-        <button type="button" class="ai-assistant__notice-link" @click="handleManageProviders">
-          Connections → AI Providers
+        <button
+          type="button"
+          class="ai-assistant__notice-link"
+          @click="openAiSettings('providers')"
+        >
+          Settings → AI
         </button>
-        and add an API key (or run a local Ollama server) to start chatting.
+        and add an API key (or point at a local Ollama server) to start chatting.
+      </p>
+      <!-- No-account route for a brand-new user: the platform supports a local
+           model and none is installed yet. The multi-GB download itself lives
+           on the settings page, with its progress bar. -->
+      <p v-if="aiStore.canSetupLocal" class="ai-assistant__notice-hint">
+        No API key? Run a small model on this machine instead —
+        <button
+          type="button"
+          class="ai-assistant__notice-link"
+          @click="openAiSettings('providers')"
+        >
+          set up On-device AI
+        </button>
+        (best for simple tasks).
       </p>
     </div>
 
@@ -1122,7 +1107,11 @@ const showStandaloneThinking = computed<boolean>(() => {
           </div>
         </div>
         <template v-for="(item, idx) in timelineItems" :key="`${item.kind}-${item.at}-${idx}`">
-          <AiMessage v-if="item.kind === 'message'" :message="item.data" />
+          <AiMessage
+            v-if="item.kind === 'message'"
+            :message="item.data"
+            @add-build="handleAddBuild"
+          />
           <AiAgentRun
             v-else
             :events="item.events"
@@ -1170,6 +1159,8 @@ const showStandaloneThinking = computed<boolean>(() => {
         />
       </div>
       <div class="ai-assistant__actions">
+        <!-- Unified send-mode dropdown. Local hides Auto-agent/Agent (the local
+             model can't tool-call); both surfaces get Simple build. -->
         <select
           class="ai-assistant__mode-select"
           :value="aiStore.mode"
@@ -1178,9 +1169,20 @@ const showStandaloneThinking = computed<boolean>(() => {
           @change="handleModeChange"
         >
           <option value="chat">Chat</option>
-          <option value="auto">Auto-agent</option>
-          <option value="agent">Agent</option>
+          <option v-if="!isLocalSelected" value="auto">Auto-agent</option>
+          <option v-if="!isLocalSelected" value="agent">Agent</option>
+          <option value="simple">Simple build</option>
         </select>
+        <!-- Say plainly what the local model can't do, right where the missing
+             modes would have been. -->
+        <span
+          v-if="isLocalSelected"
+          class="ai-assistant__local-chip"
+          title="On-device AI runs on your machine. It handles chat and simple builds, but can't run the Agent (no tool calling) and gives rougher answers than a cloud model."
+        >
+          <i class="fa-solid fa-microchip" aria-hidden="true"></i>
+          On-device · chat &amp; simple build
+        </span>
         <span v-if="kbdHint" class="ai-assistant__kbd-hint" aria-hidden="true">
           {{ kbdHint }}
         </span>
@@ -1199,7 +1201,7 @@ const showStandaloneThinking = computed<boolean>(() => {
           :disabled="!canSend"
           @click="handleSend"
         >
-          Send
+          {{ aiStore.mode === "simple" ? "Build" : "Send" }}
         </button>
       </div>
     </footer>
@@ -1458,7 +1460,7 @@ const showStandaloneThinking = computed<boolean>(() => {
 
 .ai-assistant__notice-link:hover,
 .ai-assistant__notice-link:focus-visible {
-  color: var(--color-primary-hover, #1d4ed8);
+  color: var(--color-accent-hover);
   outline: none;
 }
 
@@ -1539,6 +1541,26 @@ const showStandaloneThinking = computed<boolean>(() => {
 /* Conditional teaching cue — only shown when there's text to send.
    Sits between the mode dropdown and Send so it reads as "press this
    to do that". */
+/* Local-model limits, stated where Auto-agent / Agent would otherwise be. */
+.ai-assistant__local-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border-primary, #e2e8f0);
+  background-color: var(--color-background-secondary, #f8f9fa);
+  color: var(--color-text-secondary, #4a5568);
+  font-size: 10px;
+  white-space: nowrap;
+  cursor: help;
+}
+
+.ai-assistant__local-chip i {
+  font-size: 10px;
+  color: var(--color-accent, #6b4eff);
+}
+
 .ai-assistant__kbd-hint {
   flex: 1 1 auto;
   text-align: right;
@@ -1710,7 +1732,7 @@ const showStandaloneThinking = computed<boolean>(() => {
   box-shadow: 0 1px 0 var(--color-border-primary, #e2e8f0);
 }
 
-/* Settings popover (gear button → provider / model / agent-variant).
+/* Model popover (gear button → provider / model + link to Settings → AI).
    Anchors to the wrapper in the header so it floats below the gear
    without affecting layout flow. */
 .ai-assistant__settings-wrapper {
@@ -1759,15 +1781,14 @@ const showStandaloneThinking = computed<boolean>(() => {
 }
 
 /* Right-aligned popover anchored to the gear so it doesn't drift off
-   the drawer's right edge in narrow widths. ~290px gives the radio
-   descriptions room to breathe at small sizes. */
+   the drawer's right edge in narrow widths. */
 .ai-assistant__settings-popover {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
   z-index: 50;
-  min-width: 420px;
-  max-width: 460px;
+  min-width: 300px;
+  max-width: 360px;
   padding: 14px;
   border-radius: 8px;
   border: 1px solid var(--color-border-primary, #e1e4e8);
@@ -1799,61 +1820,9 @@ const showStandaloneThinking = computed<boolean>(() => {
   line-height: 1.4;
 }
 
-.ai-assistant__settings-radio {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background-color var(--transition-fast, 120ms ease);
-  color: var(--color-text-primary, #24292e);
-}
-
-.ai-assistant__settings-radio:hover {
-  background-color: var(--color-background-secondary, #f8f9fa);
-}
-
-.ai-assistant__settings-radio input[type="radio"] {
-  flex-shrink: 0;
-  cursor: pointer;
-  margin-top: 2px;
-}
-
-.ai-assistant__settings-radio:has(input:disabled) {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-.ai-assistant__settings-radio-body {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.ai-assistant__settings-radio-name {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--color-text-primary, #24292e);
-  line-height: 1.3;
-}
-
-.ai-assistant__settings-radio-desc {
-  font-size: 11px;
-  color: var(--color-text-tertiary, #6b7280);
-  line-height: 1.4;
-}
-
-.ai-assistant__settings-divider {
-  border: 0;
-  border-top: 1px solid var(--color-border-primary, #e2e8f0);
-  margin: 4px 0 2px;
-}
-
-/* Footer link to the full AI Providers admin page in Connections.
-   Looks like a quiet link, not a button — discoverable but not
-   competing with the inline controls above. */
+/* Footer link to the full Settings → AI page. Looks like a quiet link,
+   not a button — discoverable but not competing with the inline controls
+   above. */
 .ai-assistant__settings-footer {
   display: flex;
   flex-direction: column;
@@ -1911,7 +1880,7 @@ const showStandaloneThinking = computed<boolean>(() => {
 }
 
 .ai-assistant__surface-chip--legacy {
-  background-color: var(--color-warning-soft, rgba(204, 119, 0, 0.08));
+  background-color: var(--color-warning-light);
   border-color: var(--color-warning, #cc7700);
   color: var(--color-warning, #cc7700);
 }
@@ -1981,7 +1950,7 @@ const showStandaloneThinking = computed<boolean>(() => {
   gap: 6px;
   padding: 10px 12px;
   margin: 0 0 8px 0;
-  background-color: var(--color-warning-soft, #fff3cd);
+  background-color: var(--color-warning-light);
   border: 1px solid var(--color-warning, #d4a72c);
   border-radius: 4px;
   font-size: 12px;
@@ -1990,7 +1959,7 @@ const showStandaloneThinking = computed<boolean>(() => {
 .ai-assistant__drift-title {
   margin: 0;
   font-weight: 600;
-  color: var(--color-warning-text, #5c4400);
+  color: var(--color-warning-dark);
 }
 
 .ai-assistant__drift-list {
@@ -2017,11 +1986,11 @@ const showStandaloneThinking = computed<boolean>(() => {
   flex-direction: column;
   padding: 8px 12px;
   margin: 0 0 8px 0;
-  background-color: var(--color-info-soft, #eef2ff);
+  background-color: var(--color-info-light);
   border: 1px solid var(--color-info, #6366f1);
   border-radius: 4px;
   font-size: 12px;
-  color: var(--color-info-text, #312e81);
+  color: var(--color-info);
 }
 
 .ai-assistant__promo-text {

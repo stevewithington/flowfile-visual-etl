@@ -9,7 +9,7 @@
             @refresh-flow="refreshFlow"
             @flow-saved="handleFlowSaved"
           />
-          <undo-redo-controls v-if="hasOpenFlow" @refresh-flow="refreshFlow" />
+          <undo-redo-controls v-if="hasOpenFlow" />
         </div>
       </div>
       <div class="header-bottom">
@@ -18,6 +18,9 @@
             ref="flowSelector"
             @flow-changed="handleFlowChange"
             @close-tab="handleCloseFlow"
+            @close-tabs="handleCloseFlows"
+            @flow-renamed="handleFlowRenamed"
+            @create-flow="headerButtons?.handleQuickCreate()"
           />
         </div>
         <div v-if="hasOpenFlow" class="right-section">
@@ -32,31 +35,11 @@
         <p>Loading flows...</p>
       </div>
     </div>
-    <!-- Empty state when initial load completed but no flows are active. -->
-    <div v-else-if="flowsActive.length === 0" class="empty-state">
-      <div class="empty-state-content">
-        <span class="material-icons empty-icon">account_tree</span>
-        <h2>No Active Flows</h2>
-        <p>There are currently no active flows in the system.</p>
-        <el-button type="primary" class="action-button" @click="createFlowDialog">
-          <span class="material-icons">add_circle</span>
-          Create new flow
-        </el-button>
-        <el-button type="primary" class="action-button" @click="openFlowDialog">
-          <span class="material-icons">folder_open</span>
-          Open existing flow
-        </el-button>
-        <el-button type="primary" class="action-button" @click="openQuickCreateDialog">
-          <span class="material-icons">folder_open</span>
-          Quick create
-        </el-button>
-        <el-button type="primary" class="action-button" @click="browseTemplates">
-          <span class="material-icons">layers</span>
-          Browse Templates
-        </el-button>
-      </div>
-    </div>
-    <div v-else class="canvas-wrap">
+    <div
+      v-else
+      class="canvas-wrap"
+      :style="{ '--code-dock-offset': dockOpen ? `${codeDockWidth}px` : '0px' }"
+    >
       <canvas-flow
         ref="canvasFlow"
         class="canvas"
@@ -66,36 +49,69 @@
         @open="headerButtons?.openOpenDialog()"
         @open-settings="headerButtons?.openSettings()"
       />
+      <designer-empty-state
+        v-if="!hasOpenFlow"
+        @new-flow="headerButtons?.handleQuickCreate()"
+        @open-flow="headerButtons?.openOpenDialog()"
+        @import-flow="headerButtons?.openAlteryxDialog()"
+        @open-recent="handleOpenRecent"
+      />
       <div v-if="showSwitchIndicator" class="switch-indicator" aria-live="polite">
         <span class="switch-spinner" />
         <span>Loading flow…</span>
       </div>
+      <transition name="code-dock">
+        <aside
+          v-if="hasOpenFlow && editorStore.showCodeGenerator"
+          :class="['code-dock', 'nokey', { 'is-resizing': isResizing }]"
+          data-canvas-overlay
+          :style="{ width: `${codeDockWidth}px`, '--code-dock-width': `${codeDockWidth}px` }"
+        >
+          <div class="code-dock-resizer" @pointerdown="startResize" />
+          <div class="code-dock-body">
+            <code-generator :key="nodeStore.flow_id" />
+          </div>
+          <transition name="code-dock-hint">
+            <div v-if="closeArmed" class="code-dock-close-hint" aria-live="polite">
+              <span class="code-dock-close-pill">
+                <span class="material-icons" aria-hidden="true">close</span>
+                Release to close
+              </span>
+            </div>
+          </transition>
+        </aside>
+      </transition>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick } from "vue";
-import { useRouter } from "vue-router";
-import { ElNotification } from "element-plus";
+import {
+  ref,
+  computed,
+  onMounted,
+  onBeforeUnmount,
+  nextTick,
+  watch,
+  defineAsyncComponent,
+} from "vue";
 import HeaderButtons from "../../components/layout/Header/HeaderButtons.vue";
 import RightActionCluster from "../../components/layout/Header/RightActionCluster.vue";
 import CanvasFlow from "./Canvas.vue";
 import FlowSelector from "../FlowSelectorView/FlowSelectorView.vue";
 import UndoRedoControls from "./UndoRedoControls.vue";
+import DesignerEmptyState from "./DesignerEmptyState.vue";
 import { FlowApi } from "../../api";
 import { fetchNodes } from "../../features/designer/utils";
 import type { NodeTemplate, FlowSettings } from "../../types";
 import { useNodeStore } from "../../stores/column-store";
+import { useEditorStore } from "../../stores/editor-store";
+import { useFlowOpener } from "../../composables/useFlowOpener";
+import type { RecentFlow } from "../../composables/useRecentFlows";
+import { resolveBootFlowId, resolveNextFlowAfterClose } from "./flowSessionState";
+import { clampDockWidth, dragWidth } from "./codeDockResize";
 
-const notifyError = (title: string, message: string) =>
-  ElNotification({ title, message, type: "error", position: "top-left" });
-
-const router = useRouter();
-
-// Extract API functions
 const getAllFlows = FlowApi.getAllFlows;
-const importSavedFlow = FlowApi.importFlow;
 const closeFlow = FlowApi.closeFlow;
 
 const flowsActive = ref<FlowSettings[]>([]);
@@ -112,9 +128,85 @@ const nodeOptions = ref<NodeTemplate[]>([]);
 const initialLoadComplete = ref(false);
 
 const nodeStore = useNodeStore();
+const editorStore = useEditorStore();
+const CodeGenerator = defineAsyncComponent(() => import("./CodeGenerator/CodeGenerator.vue"));
+
+const CODE_DOCK_WIDTH_KEY = "flowfile.codeDock.width.v1";
+const clampWidth = (w: number) => clampDockWidth(w, window.innerWidth);
+const readWidth = () => {
+  try {
+    return Number(localStorage.getItem(CODE_DOCK_WIDTH_KEY)) || 600;
+  } catch {
+    return 600;
+  }
+};
+const codeDockWidth = ref(clampWidth(readWidth()));
+const isResizing = ref(false);
+const closeArmed = ref(false);
+
+let stopResize: (() => void) | null = null;
+/**
+ * Drag the pane's left edge; the width is saved when the gesture ends.
+ * Past the minimum width the pane only gives way a little; dragging
+ * CODE_DOCK_CLOSE_DRAG further arms a close, which a release then performs,
+ * keeping the pre-drag width for the next open. Released earlier, it springs back.
+ */
+const startResize = (down: PointerEvent) => {
+  if (stopResize) return;
+  // Cancelling pointerdown keeps text selection and focus changes out of the drag.
+  down.preventDefault();
+  const target = down.target as HTMLElement;
+  const startX = down.clientX;
+  const startWidth = codeDockWidth.value;
+  target.setPointerCapture(down.pointerId);
+  isResizing.value = true;
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+  const move = (e: PointerEvent) => {
+    const next = dragWidth(startWidth, startX - e.clientX, window.innerWidth);
+    closeArmed.value = next.closeArmed;
+    codeDockWidth.value = next.width;
+  };
+  // Also runs on lostpointercapture and unmount: any end but a release springs back.
+  const end = (e?: PointerEvent) => {
+    if (!stopResize) return;
+    stopResize = null;
+    target.removeEventListener("pointermove", move);
+    target.removeEventListener("pointerup", end);
+    target.removeEventListener("pointercancel", end);
+    target.removeEventListener("lostpointercapture", end);
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    isResizing.value = false;
+    const close = closeArmed.value && e?.type === "pointerup";
+    closeArmed.value = false;
+    if (close) {
+      codeDockWidth.value = startWidth;
+      editorStore.setCodeGeneratorVisibility(false);
+      return;
+    }
+    codeDockWidth.value = clampWidth(codeDockWidth.value);
+    try {
+      localStorage.setItem(CODE_DOCK_WIDTH_KEY, String(codeDockWidth.value));
+    } catch {
+      // Private mode or blocked storage: the width just isn't remembered.
+    }
+  };
+  stopResize = end;
+  target.addEventListener("pointermove", move);
+  target.addEventListener("pointerup", end);
+  target.addEventListener("pointercancel", end);
+  target.addEventListener("lostpointercapture", end);
+};
+// A window resize re-fits a settled width; a drag in progress keeps its own clamp.
+const reclampDock = () => {
+  if (!stopResize) codeDockWidth.value = clampWidth(codeDockWidth.value);
+};
+const { openFlow: openFlowFromPath } = useFlowOpener();
 
 // Hide undo/redo when no flow is loaded — same gating as the Save button.
 const hasOpenFlow = computed(() => !!nodeStore.flow_id && nodeStore.flow_id > 0);
+const dockOpen = computed(() => hasOpenFlow.value && editorStore.showCodeGenerator);
 
 // Spinner stays visible across the whole switch sequence: from "user clicked"
 // (isSwitching) through the Canvas watcher's async loadFlow (isLoadingFlow).
@@ -127,7 +219,6 @@ const fetchActiveFlows = async () => {
     const flows = await getAllFlows();
     flowsActive.value = flows;
 
-    // Refresh the flow selector when active flows change
     if (flowSelector.value) {
       await flowSelector.value.loadFlows();
     }
@@ -138,69 +229,91 @@ const fetchActiveFlows = async () => {
   }
 };
 
-const openFlow = (eventData: { message: string; flowPath: string }) => {
-  reloadCanvas(eventData.flowPath);
+const openFlow = (eventData: {
+  message: string;
+  flowPath: string;
+  flowName?: string;
+  catalogRef?: string;
+}) => {
+  reloadCanvas(eventData.flowPath, { name: eventData.flowName, catalogRef: eventData.catalogRef });
 };
 
-const reloadCanvas = async (flowPath: string) => {
+const reloadCanvas = async (flowPath: string, meta?: { name?: string; catalogRef?: string }) => {
   isSwitching.value = true;
   try {
-    const flowId = await importSavedFlow(flowPath);
-    if (flowId === undefined) {
-      notifyError(
-        "Couldn't open flow",
-        `Server returned no flow id for ${flowPath}. The file may be missing or unreadable.`,
-      );
-      return;
-    }
-    // setFlowId triggers the Canvas watcher which loads the flow.
-    nodeStore.setFlowId(flowId);
+    // openFlow owns importFlow + setFlowId + the recents record/prune contract.
+    const flowId = await openFlowFromPath(flowPath, meta);
+    if (flowId === null) return;
     if (headerButtons.value) {
       await headerButtons.value.loadFlowSettings();
     }
     await fetchActiveFlows();
-  } catch (error: any) {
-    const detail = error?.response?.data?.detail ?? error?.message ?? String(error);
-    notifyError("Couldn't open flow", `Failed to open ${flowPath}: ${detail}`);
   } finally {
     isSwitching.value = false;
   }
 };
 
+const handleOpenRecent = (flow: RecentFlow) => {
+  reloadCanvas(flow.path, { name: flow.name, catalogRef: flow.catalogRef });
+};
+
+// A run_flow node's "Go to Flow" menu dispatches this; route it through the
+// same reloadCanvas the catalog/header use so the tab strip + header refresh.
+watch(
+  () => editorStore.openFlowRequest.token,
+  () => {
+    const { flowPath, name } = editorStore.openFlowRequest;
+    if (flowPath) reloadCanvas(flowPath, { name });
+  },
+);
+
 const handleCloseFlow = async (flowId: number) => {
+  await handleCloseFlows([flowId]);
+};
+
+// Bulk closes route through here with one list refresh + one active-flow switch —
+// per-flow close-tab emits would cascade intermediate flow loads through the canvas.
+const handleCloseFlows = async (flowIds: number[]) => {
+  if (flowIds.length === 0) return;
   try {
-    console.log("Closing flow:", flowId);
+    console.log("Closing flows:", flowIds);
 
-    // Check if we're closing the currently active flow
-    const isCurrentFlow = nodeStore.flow_id === flowId;
-
-    // Call the API to close the flow
-    await closeFlow(flowId);
-
-    // Clean up any flow-related data in the store
-    nodeStore.clearFlowResults(flowId);
-    nodeStore.clearFlowDescriptionCache(flowId);
+    const currentFlowId = nodeStore.flow_id;
     isSwitching.value = true;
 
-    // Refresh the flows list
+    for (const flowId of flowIds) {
+      await closeFlow(flowId);
+      nodeStore.clearFlowResults(flowId);
+      nodeStore.clearFlowDescriptionCache(flowId);
+    }
+
     await fetchActiveFlows();
 
-    if (isCurrentFlow) {
-      if (flowsActive.value.length > 0) {
-        // Switch to the first available flow
-        const newFlowId = flowsActive.value[0].flow_id;
-        console.log("Switching to flow:", newFlowId);
-        await handleFlowChange(newFlowId);
+    const next = resolveNextFlowAfterClose(
+      flowsActive.value.map((f) => f.flow_id),
+      flowIds,
+      currentFlowId,
+    );
+    if (next !== null) {
+      if (next > 0) {
+        console.log("Switching to flow:", next);
+        await handleFlowChange(next);
       } else {
-        // No flows left — Canvas's watcher clears the canvas on flowId<=0.
+        // Last flow closed — the empty state takes over (no auto-created flow).
         nodeStore.setFlowId(-1);
       }
     }
   } catch (error) {
-    console.error("Error closing flow:", error);
+    console.error("Error closing flows:", error);
   } finally {
     isSwitching.value = false;
   }
+};
+
+// HeaderButtons caches a full FlowSettings and posts it back wholesale from the
+// settings modal — refresh it so a stale cached name can't revert the rename.
+const handleFlowRenamed = async () => {
+  await headerButtons.value?.loadFlowSettings();
 };
 
 const handleFlowChange = async (flowId: number) => {
@@ -232,9 +345,9 @@ const refreshFlow = async () => {
   isSwitching.value = true;
   try {
     console.log("refreshFlow");
-    await fetchActiveFlows(); // Refresh flows list
+    await fetchActiveFlows();
     // Same flowId — watcher won't fire, so trigger reload explicitly.
-    if (canvasFlow.value && flowsActive.value.length > 0) {
+    if (canvasFlow.value && flowsActive.value.length > 0 && nodeStore.flow_id > 0) {
       await canvasFlow.value.reloadCurrentFlow();
     }
     console.log("refreshFlow end");
@@ -244,28 +357,6 @@ const refreshFlow = async () => {
   } finally {
     isSwitching.value = false;
   }
-};
-
-const createFlowDialog = () => {
-  if (headerButtons.value) {
-    headerButtons.value.openCreateDialog();
-  }
-};
-
-const openFlowDialog = () => {
-  if (headerButtons.value) {
-    headerButtons.value.openOpenDialog();
-  }
-};
-
-const openQuickCreateDialog = () => {
-  if (headerButtons.value) {
-    headerButtons.value.handleQuickCreate();
-  }
-};
-
-const browseTemplates = () => {
-  router.push({ name: "templates" });
 };
 
 const initialSetup = async () => {
@@ -281,21 +372,14 @@ const initialSetup = async () => {
     const [nodes, flows] = await Promise.all([fetchNodes(), fetchActiveFlows()]);
 
     nodeOptions.value = nodes;
-    const persistedFlowId = nodeStore.flow_id;
-    const persistedIsActive =
-      persistedFlowId > 0 && flows.some((f) => f.flow_id === persistedFlowId);
-
-    if (flows.length === 0) {
-      // Drop any stale persisted ID so `hasOpenFlow` guards don't render
-      // canvas-only controls (right-cluster, undo/redo, Save) over the
-      // "No Active Flows" empty state.
-      if (persistedFlowId > 0) nodeStore.setFlowId(-1);
-    } else if (!persistedIsActive) {
-      console.log("Setting initial flow ID to:", flows[0].flow_id);
-      nodeStore.setFlowId(flows[0].flow_id);
-    } else {
-      console.log("Using existing flow ID:", persistedFlowId);
-    }
+    // Zero flows parks at -1 (empty state) — also clears a stale persisted id
+    // so the Canvas watcher never 404s against a session gone from the backend.
+    const bootFlowId = resolveBootFlowId(
+      flows.map((f) => f.flow_id),
+      nodeStore.flow_id,
+    );
+    console.log("Setting initial flow ID to:", bootFlowId);
+    nodeStore.setFlowId(bootFlowId);
 
     console.log("Initial setup completed");
   } catch (error) {
@@ -314,7 +398,13 @@ const initialSetup = async () => {
 
 onMounted(async () => {
   console.log("Component mounted, starting initialization");
+  window.addEventListener("resize", reclampDock);
   await initialSetup();
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("resize", reclampDock);
+  stopResize?.();
 });
 </script>
 
@@ -327,17 +417,113 @@ onMounted(async () => {
 
 .canvas-wrap {
   position: relative;
-  height: calc(100vh - 100px);
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .canvas {
+  flex: 1 1 auto;
+  min-width: 0;
   height: 100%;
+}
+
+.code-dock {
+  position: relative;
+  flex: 0 0 auto;
+  height: 100%;
+  border-left: 1px solid var(--color-border-primary);
+  background: var(--color-background-primary);
+  transition: width var(--transition-normal) var(--transition-timing);
+}
+
+.code-dock.is-resizing {
+  transition: none;
+}
+
+/* Open and close slide the pane from the right edge; outranks .is-resizing on release. */
+.code-dock.code-dock-enter-active,
+.code-dock.code-dock-leave-active {
+  overflow: hidden;
+  transition: width var(--transition-normal) var(--transition-timing);
+}
+
+.code-dock-enter-from,
+.code-dock-leave-to {
+  width: 0 !important;
+}
+
+.code-dock-enter-active .code-dock-body,
+.code-dock-leave-active .code-dock-body {
+  width: var(--code-dock-width);
+}
+
+.code-dock-close-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--color-background-primary) 70%, transparent);
+  pointer-events: none;
+}
+
+.code-dock-close-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-2) var(--spacing-4);
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-full);
+  background: var(--color-background-primary);
+  box-shadow: var(--shadow-md);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+}
+
+.code-dock-close-pill .material-icons {
+  font-size: 18px;
+}
+
+.code-dock-hint-enter-active,
+.code-dock-hint-leave-active {
+  transition: opacity var(--transition-base) var(--transition-timing);
+}
+
+.code-dock-hint-enter-from,
+.code-dock-hint-leave-to {
+  opacity: 0;
+}
+
+.code-dock-body {
+  height: 100%;
+  overflow: hidden;
+}
+
+.code-dock-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  z-index: 2;
+  width: 6px;
+  cursor: col-resize;
+}
+
+.code-dock-resizer:hover,
+.code-dock.is-resizing .code-dock-resizer {
+  background: var(--color-primary);
+  opacity: 0.4;
 }
 
 .switch-indicator {
   position: absolute;
   top: 12px;
-  right: 12px;
+  /* Stays over the canvas, not the code dock; moves with the dock's slide. */
+  right: calc(var(--code-dock-offset, 0px) + 12px);
+  transition: right var(--transition-normal) var(--transition-timing);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -408,10 +594,6 @@ onMounted(async () => {
     align-items: center;
     justify-content: flex-end;
   }
-
-  .canvas {
-    height: calc(100vh - 50px);
-  }
 }
 
 /* Mobile/tablet layout - stacked */
@@ -455,10 +637,6 @@ onMounted(async () => {
     align-items: center;
     justify-content: flex-end;
   }
-
-  .canvas {
-    height: calc(100vh - 90px);
-  }
 }
 
 /* Very narrow screens */
@@ -495,46 +673,5 @@ onMounted(async () => {
 .loading-state-content p {
   color: var(--color-text-secondary);
   margin-top: var(--spacing-4);
-}
-
-/* Empty state styles */
-.empty-state {
-  height: calc(100vh - 50px);
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  background-color: var(--color-background-secondary);
-}
-
-.empty-state-content {
-  text-align: center;
-  padding: var(--spacing-8);
-}
-
-.empty-icon {
-  font-size: var(--font-size-4xl);
-  color: var(--color-gray-400);
-  margin-bottom: var(--spacing-4);
-}
-
-.empty-state h2 {
-  color: var(--color-text-primary);
-  margin-bottom: var(--spacing-2);
-}
-
-.empty-state p {
-  color: var(--color-text-secondary);
-  margin-bottom: var(--spacing-6);
-}
-
-.action-button {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--spacing-2);
-  margin: 0 var(--spacing-2);
-}
-
-.action-button .material-icons {
-  font-size: var(--font-size-2xl);
 }
 </style>

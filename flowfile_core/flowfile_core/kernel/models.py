@@ -1,10 +1,13 @@
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class KernelState(str, Enum):
+    # In-memory only while create_kernel bakes the image; never persisted.
+    CREATING = "creating"
     STOPPED = "stopped"
     STARTING = "starting"
     IDLE = "idle"
@@ -18,6 +21,24 @@ class RecoveryMode(str, Enum):
     CLEAR = "clear"  # Clears all persisted artifacts on startup (destructive)
 
 
+class ImageFlavour(str, Enum):
+    BASE = "base"
+    ML = "ml"
+    # Same packages as BASE are baked, but /opt/constraints.txt only pins the
+    # kernel-critical ones — everything else floats so user installs can
+    # resolve their own dep trees freely.
+    LITE = "lite"
+    # LITE plus this app's flowfile, published per app version: the canvas notebook runs here.
+    NOTEBOOK = "notebook"
+    CUSTOM = "custom"
+
+
+class KernelUpdate(BaseModel):
+    """Mutable fields on an existing kernel."""
+
+    packages: list[str] = Field(default_factory=list)
+
+
 class KernelConfig(BaseModel):
     id: str
     name: str
@@ -26,9 +47,19 @@ class KernelConfig(BaseModel):
     memory_gb: float = 4.0
     gpu: bool = False
     health_timeout: int = 120
+    # Image selection: which baked flavour to launch, or a custom URI
+    image_flavour: ImageFlavour = ImageFlavour.BASE
+    custom_image: str | None = None
     # Persistence configuration
     persistence_enabled: bool = True
     recovery_mode: RecoveryMode = RecoveryMode.LAZY
+
+
+class ResolvedPackage(BaseModel):
+    """Actual version pip resolved for a user-requested package after bake."""
+
+    name: str
+    version: str
 
 
 class KernelInfo(BaseModel):
@@ -38,10 +69,15 @@ class KernelInfo(BaseModel):
     container_id: str | None = None
     port: int | None = None
     packages: list[str] = Field(default_factory=list)
+    # Populated after the derived image is built; one entry per requested package.
+    resolved_packages: list[ResolvedPackage] = Field(default_factory=list)
     memory_gb: float = 4.0
     cpu_cores: float = 2.0
     gpu: bool = False
     health_timeout: int = 120
+    image_flavour: ImageFlavour = ImageFlavour.BASE
+    custom_image: str | None = None
+    image: str | None = None  # Resolved image tag, populated when the kernel starts
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     error_message: str | None = None
     kernel_version: str | None = None
@@ -50,9 +86,98 @@ class KernelInfo(BaseModel):
     recovery_mode: RecoveryMode = RecoveryMode.LAZY
 
 
+class KernelImageStatus(BaseModel):
+    """Availability of one kernel image flavour on the host."""
+
+    flavour: ImageFlavour
+    image: str  # full registry tag, e.g. edwardvaneechoud/flowfile-kernel-base:0.4.0
+    available: bool
+    resolved_image: str | None = None
+    pull_state: str | None = None
+    # True when an older official version of this image is installed locally and a
+    # newer one (the ``image`` tag above) is available to pull.
+    update_available: bool = False
+
+
+class FlavourPackage(BaseModel):
+    """A single package baked into a kernel image flavour."""
+
+    name: str
+    version: str  # e.g. "1.38.1", or "—" if the lockfile couldn't be read
+
+
+class FlavourInfo(BaseModel):
+    """Static metadata + locked package list for a kernel image flavour."""
+
+    flavour: ImageFlavour
+    image: str | None = None  # registry tag for built flavours; None for "custom"
+    packages: list[FlavourPackage] = Field(default_factory=list)
+
+
+class KernelMatchRequest(BaseModel):
+    """Dependency specs (from a custom node) to match against the user's kernels."""
+
+    dependencies: list[str] = Field(default_factory=list)
+    node_name: str | None = None  # seeds the suggestion's generated id/name
+
+
+class KernelMatchEntry(BaseModel):
+    """How well one kernel satisfies a dependency spec list."""
+
+    kernel_id: str
+    kernel_name: str
+    state: KernelState
+    image_flavour: ImageFlavour
+    satisfied: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    unverified: list[str] = Field(default_factory=list)
+    # Deps we couldn't check at all because the image's contents aren't
+    # enumerable. Distinct from `unverified`, which means we did enumerate the
+    # image and found the name — never collapse the two into a match.
+    unknown: list[str] = Field(default_factory=list)
+    invalid: list[str] = Field(default_factory=list)
+    details: dict[str, str] = Field(default_factory=dict)  # spec -> human-readable reason
+    level: Literal["full", "unknown", "partial", "none"]
+    baseline: Literal["manifest", "declared", "unknown"] = "manifest"
+
+
+class KernelSuggestion(BaseModel):
+    """Ready-to-POST create seed derived from a node's dependency specs."""
+
+    config: KernelConfig
+
+
+class KernelMatchResponse(BaseModel):
+    matches: list[KernelMatchEntry] = Field(default_factory=list)  # sorted best-first
+    suggestion: KernelSuggestion
+    docker_available: bool
+
+
+class KernelMatchBatchRequest(BaseModel):
+    """Many dependency lists at once (e.g. every kernel node in a palette)."""
+
+    items: dict[str, list[str]] = Field(default_factory=dict)  # arbitrary key -> pip specs
+
+
+class KernelMatchBatchSummary(BaseModel):
+    """Best-match digest for one dependency list."""
+
+    level: Literal["full", "unknown", "partial", "none"]
+    best_kernel_id: str | None = None  # None when nothing useful matches
+    best_kernel_name: str | None = None
+
+
+class KernelMatchBatchResponse(BaseModel):
+    results: dict[str, KernelMatchBatchSummary] = Field(default_factory=dict)
+    docker_available: bool
+
+
 class DockerStatus(BaseModel):
     available: bool
+    # Legacy: True iff the default base image is available locally.
     image_available: bool
+    # Per-flavour breakdown so the UI can list exact pull commands.
+    images: list[KernelImageStatus] = Field(default_factory=list)
     error: str | None = None
 
 
@@ -66,6 +191,16 @@ class ExecuteRequest(BaseModel):
     log_callback_url: str = ""
     interactive: bool = False  # When True, auto-display last expression
     internal_token: str | None = None  # Core→kernel auth token for artifact API calls
+    # Artifact name → source node id lineage allowlist. None ⇒ no lineage context
+    # (no enforcement); {} ⇒ lineage known, nothing available.
+    available_artifacts: dict[str, int] | None = None
+    # Sandboxes global-artifact writes in the kernel; images before 0.5.4 ignore it.
+    dry_run: bool = False
+    # Identity of this one execution, stamped server-side by KernelManager.execute_sync.
+    # Cancellation is addressed to it, so a cancel can never land on a cell another
+    # flow is running on the same kernel. Kernel images at 0.5.4 and older ignore it —
+    # core's own ownership gate is what keeps cancellation flow-scoped against those.
+    exec_token: str = ""
 
 
 class ClearNodeArtifactsRequest(BaseModel):
@@ -90,21 +225,41 @@ class DisplayOutput(BaseModel):
     title: str = ""
 
 
+class PublishedArtifact(BaseModel):
+    """Metadata for an artifact a kernel node published during a run."""
+
+    name: str
+    type_name: str = ""
+    module: str = ""
+    size_bytes: int = 0
+    has_preview: bool = False
+    preview_mime: str | None = None
+
+
 class ExecuteResult(BaseModel):
     success: bool
     output_paths: list[str] = Field(default_factory=list)
-    artifacts_published: list[str] = Field(default_factory=list)
+    artifacts_published: list[PublishedArtifact] = Field(default_factory=list)
     artifacts_deleted: list[str] = Field(default_factory=list)
     display_outputs: list[DisplayOutput] = Field(default_factory=list)
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
     execution_time_ms: float = 0.0
+    namespace_generation: str | None = None
+    revision: int | None = None
+
+    @field_validator("artifacts_published", mode="before")
+    @classmethod
+    def _normalize_published(cls, value):
+        # Stale 0.4.0 kernel images emit plain name strings; map them to the rich
+        # shape so they degrade to names-only instead of a validation error.
+        if not isinstance(value, list):
+            return value
+        return [{"name": item} if isinstance(item, str) else item for item in value]
 
 
-# ---------------------------------------------------------------------------
 # Artifact Persistence & Recovery models
-# ---------------------------------------------------------------------------
 
 
 class RecoveryStatus(BaseModel):

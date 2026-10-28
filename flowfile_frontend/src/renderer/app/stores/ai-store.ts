@@ -5,17 +5,20 @@
 // participate in `hideAllPanels()` without coupling to this module. The
 // chat payload + streaming state live here.
 //
-// Persistence is per-flow + browser-local. Each flow's chat trail lives
-// under `flowfile.ai.chat.v1.{flow_id}` in `localStorage` so switching
-// flows shows the right conversation, and chat survives Electron app
-// restart. The `flowStore.flowId` watcher below performs an atomic
-// save-then-load swap on flow switch so round-tripping A → B → A
-// preserves A's history.
+// Persistence is browser-local in two buckets. Each flow's chat trail
+// lives under `flowfile.ai.chat.v1.{flow_id}` in `localStorage` so
+// switching flows shows the right conversation, and chat survives
+// Electron app restart; the `flowStore.flowId` watcher below performs an
+// atomic save-then-load swap on flow switch so round-tripping A → B → A
+// preserves A's history. The AI *preferences* (provider/model, simple
+// tier, agent behaviour) are device-wide under `flowfile.ai.settings.v1`
+// and never change on flow switch — they are what Settings → AI edits.
 
 import { defineStore } from "pinia";
 import { computed, ref, watch } from "vue";
 
 import {
+  AiDisabledError,
   AiStreamHttpError,
   fetchAiProviders,
   routeMessage,
@@ -29,12 +32,25 @@ import {
   type RouteHistoryEntry,
 } from "../api/ai.api";
 import { parseMentions } from "../features/ai/mentionVocabulary";
-import type { AiProvider } from "../views/AiProvidersView/aiProviderTypes";
+import type { AiProvider } from "../views/AiSettingsView/aiProviderTypes";
+import {
+  LOCAL_PROVIDER_ID,
+  fetchLocalModelStatus,
+  generateFlow,
+  isGenerateFlowFailure,
+  selectLocalModel,
+  type LocalModelStatus,
+} from "../views/AiSettingsView/localModelApi";
+import { acceptDiff } from "../services/aiDiffClient";
 import { useAiAgentStore } from "./ai-agent-store";
 import {
   highestPersistedMessageId,
+  loadPersistedAiSettings,
   loadPersistedAiState,
+  persistAiSettings,
   persistAiState,
+  type PersistedAgentSurface,
+  type PersistedSimpleBuildOutput,
 } from "./ai-store-persistence";
 import { useEditorStore } from "./editor-store";
 import { useFlowStore } from "./flow-store";
@@ -55,6 +71,18 @@ export interface ChatMessage {
   pending?: boolean;
   /** Reason why a message is in an error state, if any. */
   error?: string | null;
+  /** Simple-build result: a registered GraphDiff awaiting the user's
+   * "Add to canvas" click. Carries the diff id + node count so the chat
+   * bubble can render the inline Add button. ``buildAdded`` flips true once
+   * applied so the button becomes a confirmation. */
+  buildDiffId?: string | null;
+  buildOpCount?: number;
+  buildAdded?: boolean;
+  /** Simple build in code mode: the FlowFrame script the nodes came from
+   * (shown collapsed in the bubble), or the script that failed, with
+   * ``buildCodeLine`` the 1-based line the failure names. */
+  buildCode?: string | null;
+  buildCodeLine?: number | null;
 }
 
 export type StreamingState = "idle" | "streaming" | "error";
@@ -66,10 +94,13 @@ export type StreamingState = "idle" | "streaming" | "error";
  *     classifier auto-promotes to agent when an editing intent is
  *     detected.
  *   - ``"agent"`` — Send always dispatches the agent path with the
- *     configured surface. Sticky across sends instead of per-send. */
-export type AiMode = "chat" | "auto" | "agent";
+ *     configured surface. Sticky across sends instead of per-send.
+ *   - ``"simple"`` — Send generates a whole flow in one model response
+ *     (no validation/dry-run); the reply carries an inline "Add to canvas"
+ *     button. Universal: works for local and cloud providers. */
+export type AiMode = "chat" | "auto" | "agent" | "simple";
 
-const _AI_MODES: ReadonlyArray<AiMode> = ["chat", "auto", "agent"];
+const _AI_MODES: ReadonlyArray<AiMode> = ["chat", "auto", "agent", "simple"];
 
 /** Per-tab sessionStorage key for the user's send-mode preference.
  * Survives page refresh; resets fresh on tab close. Mirrors
@@ -139,24 +170,58 @@ export const useAiStore = defineStore("ai", () => {
   const providers = ref<AiProvider[]>([]);
   const providersLoading = ref(false);
   const providersError = ref<string | null>(null);
+  // True once ``loadProviders`` hits the router's 503 "AI features are
+  // disabled" contract. The single flag every AI surface reads for its
+  // disabled empty-state; cleared by the next successful load (an admin
+  // flipped the flag back on from Settings → AI).
+  const aiDisabled = ref(false);
 
   const selectedProvider = ref<string | null>(null);
   const selectedModel = ref<string | null>(null);
 
+  // Optional two-tier model selection. When ``splitModels`` is false (default),
+  // ``selectedProvider`` / ``selectedModel`` drive *every* AI feature. When
+  // true, the *simple* surfaces (cron-from-text, join-key suggestions) run on
+  // their own ``simpleProvider`` / ``simpleModel`` instead — so a user can run
+  // simple tasks on a cheap/local model while chat & agents use a stronger one.
+  // ``null`` on a simple tier field falls back to the main provider / the
+  // provider's per-surface preset. Resolve per-surface via ``resolveSurface``.
+  const splitModels = ref<boolean>(false);
+  const simpleProvider = ref<string | null>(null);
+  const simpleModel = ref<string | null>(null);
+
+  // Simple build output (see PersistedSimpleBuildOutput); Settings → AI → Assistant flips it.
+  const simpleBuildOutput = ref<PersistedSimpleBuildOutput>("code");
+
+  // Local model (offline llama.cpp) status. Surfaced as a synthetic
+  // ``"local"`` entry in ``providers`` so the chat drawer's picker lists it
+  // without it being a BYOK provider — chat + generate special-case the id
+  // to route through the /ai/local-model/* endpoints. Only injected when the
+  // runtime is installed (no point offering a model the user hasn't fetched).
+  const localModelStatus = ref<LocalModelStatus | null>(null);
+
+  const isLocalSelected = computed(() => selectedProvider.value === LOCAL_PROVIDER_ID);
+
+  // True when the platform supports a local model but none is installed yet —
+  // the chat empty state uses it to point a key-less user at Settings → AI →
+  // On-device AI as the no-account way to get going.
+  const canSetupLocal = computed(
+    () => localModelStatus.value?.available === true && !localModelStatus.value?.anyModelInstalled,
+  );
+
   // User-selectable agent surface. Defaults to ``agent_live`` so the
   // REPL-style canvas-mutating surface is what new sessions get; users
   // can switch to ``agent_staged`` (multi-stage planner) or
-  // ``agent_complex`` (single-shot full catalog) via the settings
-  // popover. Persisted alongside the other AI selections via
-  // ``ai-store-persistence``.
-  const selectedAgentSurface = ref<"agent_complex" | "agent_staged" | "agent_live">("agent_live");
+  // ``agent_complex`` (single-shot full catalog) under Settings → AI →
+  // Assistant. Device-wide, persisted with the other AI settings.
+  const selectedAgentSurface = ref<PersistedAgentSurface>("agent_live");
 
   // Opt-in verify-completion gate. When true, after classify picks
   // ``op_kind="other"`` the agent runs one extra LLM round at
   // ``stage="verify_completion"`` to walk the plan as a checklist
   // before the loop terminates. Default off (extra round per run); the
-  // user opts in via the agent settings panel checkbox. Persisted
-  // per-flow alongside ``selectedAgentSurface``.
+  // user opts in under Settings → AI → Assistant. Device-wide alongside
+  // ``selectedAgentSurface``.
   const verifyPlanCompletion = ref<boolean>(false);
 
   // ----- messages -----
@@ -222,12 +287,6 @@ export const useAiStore = defineStore("ai", () => {
       _messageCounter = persistedMax;
     }
   }
-  if (_hydrated.selectedProvider !== null) {
-    selectedProvider.value = _hydrated.selectedProvider;
-  }
-  if (_hydrated.selectedModel !== null) {
-    selectedModel.value = _hydrated.selectedModel;
-  }
   // Seed ``mode`` from sessionStorage (per-tab, fresh on tab close);
   // fall back to the legacy ``autoPromote`` from the localStorage blob
   // when no sessionStorage value is present (migration shim).
@@ -235,11 +294,59 @@ export const useAiStore = defineStore("ai", () => {
   if (_hydrated.agentModeAccepted !== null && _hydrated.agentModeAccepted !== undefined) {
     agentModeAccepted.value = _hydrated.agentModeAccepted;
   }
-  if (_hydrated.selectedAgentSurface !== null && _hydrated.selectedAgentSurface !== undefined) {
-    selectedAgentSurface.value = _hydrated.selectedAgentSurface;
+
+  // ----- Hydrate the device-wide AI settings -----
+  // The settings bucket wins. When it has never been written (first run
+  // after the settings moved out of the per-flow blob) seed it from the
+  // legacy fields of the flow bucket loaded above, then persist so the
+  // migration happens exactly once.
+  const _settings = loadPersistedAiSettings();
+  const _seedSettings = _settings ?? {
+    selectedProvider: _hydrated.selectedProvider ?? null,
+    selectedModel: _hydrated.selectedModel ?? null,
+    splitModels: _hydrated.splitModels ?? null,
+    simpleProvider: _hydrated.simpleProvider ?? null,
+    simpleModel: _hydrated.simpleModel ?? null,
+    selectedAgentSurface: _hydrated.selectedAgentSurface ?? null,
+    verifyPlanCompletion: _hydrated.verifyPlanCompletion ?? null,
+    simpleBuildOutput: _hydrated.simpleBuildOutput ?? null,
+  };
+  if (_seedSettings.selectedProvider !== null) {
+    selectedProvider.value = _seedSettings.selectedProvider;
   }
-  if (_hydrated.verifyPlanCompletion !== null && _hydrated.verifyPlanCompletion !== undefined) {
-    verifyPlanCompletion.value = _hydrated.verifyPlanCompletion;
+  if (_seedSettings.selectedModel !== null) {
+    selectedModel.value = _seedSettings.selectedModel;
+  }
+  if (_seedSettings.splitModels !== null) {
+    splitModels.value = _seedSettings.splitModels;
+  }
+  if (_seedSettings.simpleProvider !== null) {
+    simpleProvider.value = _seedSettings.simpleProvider;
+  }
+  if (_seedSettings.simpleModel !== null) {
+    simpleModel.value = _seedSettings.simpleModel;
+  }
+  if (_seedSettings.selectedAgentSurface !== null) {
+    selectedAgentSurface.value = _seedSettings.selectedAgentSurface;
+  }
+  if (_seedSettings.verifyPlanCompletion !== null) {
+    verifyPlanCompletion.value = _seedSettings.verifyPlanCompletion;
+  }
+  if (_seedSettings.simpleBuildOutput !== null) {
+    simpleBuildOutput.value = _seedSettings.simpleBuildOutput;
+  }
+  const _snapshotSettings = () => ({
+    selectedProvider: selectedProvider.value,
+    selectedModel: selectedModel.value,
+    splitModels: splitModels.value,
+    simpleProvider: simpleProvider.value,
+    simpleModel: simpleModel.value,
+    selectedAgentSurface: selectedAgentSurface.value,
+    verifyPlanCompletion: verifyPlanCompletion.value,
+    simpleBuildOutput: simpleBuildOutput.value,
+  });
+  if (_settings === null && Object.values(_seedSettings).some((v) => v !== null)) {
+    persistAiSettings(_snapshotSettings());
   }
 
   // Throttled save. localStorage writes are sync + main-thread; coalescing
@@ -268,11 +375,7 @@ export const useAiStore = defineStore("ai", () => {
         persistAiState(
           {
             messages: messages.value,
-            selectedProvider: selectedProvider.value,
-            selectedModel: selectedModel.value,
             agentModeAccepted: agentModeAccepted.value,
-            selectedAgentSurface: selectedAgentSurface.value,
-            verifyPlanCompletion: verifyPlanCompletion.value,
           },
           undefined,
           _scopedFlowId(flowStore.flowId),
@@ -280,6 +383,17 @@ export const useAiStore = defineStore("ai", () => {
       },
       isStreaming ? PERSIST_THROTTLE_MS : 0,
     );
+  };
+
+  // Device-wide settings get their own writer: never throttled (a user
+  // click, not a token stream) and never keyed by flow.
+  let settingsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  const queuePersistSettings = (): void => {
+    if (settingsSaveTimer !== null) clearTimeout(settingsSaveTimer);
+    settingsSaveTimer = setTimeout(() => {
+      settingsSaveTimer = null;
+      persistAiSettings(_snapshotSettings());
+    }, 0);
   };
 
   // `mode` lives in sessionStorage, not the localStorage chat blob,
@@ -295,12 +409,22 @@ export const useAiStore = defineStore("ai", () => {
   // "streaming" state and route the user-message push through the slow
   // throttle path.
   watch(messages, queuePersist, { deep: true, flush: "sync" });
-  watch(selectedProvider, queuePersist, { flush: "sync" });
-  watch(selectedModel, queuePersist, { flush: "sync" });
-  watch(selectedAgentSurface, queuePersist, { flush: "sync" });
-  watch(verifyPlanCompletion, queuePersist, { flush: "sync" });
   watch(streamingState, queuePersist, { flush: "sync" });
   watch(agentModeAccepted, queuePersist, { flush: "sync" });
+  watch(
+    [
+      selectedProvider,
+      selectedModel,
+      splitModels,
+      simpleProvider,
+      simpleModel,
+      selectedAgentSurface,
+      verifyPlanCompletion,
+      simpleBuildOutput,
+    ],
+    queuePersistSettings,
+    { flush: "sync" },
+  );
 
   // Flow switch handler. Persist the *outgoing* flow's chat under its
   // own key BEFORE clearing `messages.value`, then load the *incoming*
@@ -329,11 +453,7 @@ export const useAiStore = defineStore("ai", () => {
       persistAiState(
         {
           messages: messages.value,
-          selectedProvider: selectedProvider.value,
-          selectedModel: selectedModel.value,
           agentModeAccepted: agentModeAccepted.value,
-          selectedAgentSurface: selectedAgentSurface.value,
-          verifyPlanCompletion: verifyPlanCompletion.value,
         },
         undefined,
         outgoing,
@@ -341,28 +461,12 @@ export const useAiStore = defineStore("ai", () => {
 
       const loaded = loadPersistedAiState(undefined, incoming);
       messages.value = loaded.messages;
-      // Loaded provider/model take precedence ONLY when present; absent
-      // values keep the user's current pick so a fresh-flow switch
-      // doesn't reset the picker mid-session.
-      if (loaded.selectedProvider !== null) {
-        selectedProvider.value = loaded.selectedProvider;
-      }
-      if (loaded.selectedModel !== null) {
-        selectedModel.value = loaded.selectedModel;
-      }
-      // ``mode`` is session-global (sessionStorage), NOT per-flow, so
-      // a flow switch doesn't touch it. Only ``agentModeAccepted``
-      // resets per-flow ("Continue as agent" is a
+      // Provider/model, the simple tier and the agent toggles are
+      // device-wide settings — a flow switch never touches them. ``mode``
+      // is session-global (sessionStorage), also untouched. Only
+      // ``agentModeAccepted`` resets per-flow ("Continue as agent" is a
       // conversation-scoped commitment, not a session-scoped one).
       agentModeAccepted.value = loaded.agentModeAccepted ?? false;
-      // selectedAgentSurface is a per-flow session preference. Fall
-      // back to the store's default when the flow has no persisted
-      // value.
-      selectedAgentSurface.value = loaded.selectedAgentSurface ?? "agent_live";
-      // verifyPlanCompletion is per-flow alongside the surface picker.
-      // Falls back to off (default) when the incoming flow has no
-      // persisted value.
-      verifyPlanCompletion.value = loaded.verifyPlanCompletion ?? false;
       promotionBanner.value = null;
       streamError.value = null;
 
@@ -418,25 +522,128 @@ export const useAiStore = defineStore("ai", () => {
     agentModeAccepted.value = false;
   };
 
+  // Build the synthetic "local" provider entry surfaced in the chat picker.
+  // Shaped like an AiProvider so the existing picker template renders it
+  // unchanged. The chat MODEL dropdown reads ``credential.models`` first, so we
+  // list every INSTALLED catalog model there (not just the selected one);
+  // ``defaultModel`` is the currently-selected id so the dropdown opens on it.
+  const _localProviderEntry = (status: LocalModelStatus): AiProvider => {
+    const installedIds = status.models.filter((m) => m.installed).map((m) => m.id);
+    return {
+      provider: LOCAL_PROVIDER_ID,
+      supportsTools: false,
+      supportsStreaming: true,
+      defaultModel: status.selectedModelId,
+      surfaces: {},
+      status: "configured",
+      credential: {
+        provider: LOCAL_PROVIDER_ID,
+        hasKey: false,
+        apiBase: null,
+        defaultModel: status.selectedModelId,
+        models: installedIds,
+        lastTestedAt: null,
+        lastTestStatus: null,
+        lastTestError: null,
+        createdAt: null,
+        updatedAt: null,
+      },
+    };
+  };
+
+  // Single writer for local-model status. Keeps three things in lockstep so the
+  // Models card and the On-device card can never disagree about which local
+  // model is active: (1) ``localModelStatus``, (2) the synthetic ``local`` entry
+  // in ``providers`` (added when something is installed, dropped otherwise),
+  // (3) the selected/simple model id WHEN that tier is local — the local model
+  // is a single global runtime fact ("whatever's loaded on-device"), so any tier
+  // pointed at ``local`` mirrors it rather than carrying its own pick. Call this
+  // from every place that mutates local status (load, select, start/stop,
+  // install, delete, ctx-size) so both cards reflect the change instantly.
+  const applyLocalModelStatus = (status: LocalModelStatus | null): void => {
+    localModelStatus.value = status;
+    const withoutLocal = providers.value.filter((p) => p.provider !== LOCAL_PROVIDER_ID);
+    providers.value =
+      status && status.anyModelInstalled
+        ? [...withoutLocal, _localProviderEntry(status)]
+        : withoutLocal;
+    if (status && status.anyModelInstalled) {
+      // A tier set to ``local`` always uses the single loaded model, so keep
+      // its stored model id honest (the UI shows it read-only, but the
+      // persisted selection + chat picker read this).
+      if (selectedProvider.value === LOCAL_PROVIDER_ID) {
+        selectedModel.value = status.selectedModelId;
+      }
+      if (simpleProvider.value === LOCAL_PROVIDER_ID) {
+        simpleModel.value = status.selectedModelId;
+      }
+    }
+  };
+
   const loadProviders = async (): Promise<void> => {
     providersLoading.value = true;
     providersError.value = null;
     try {
-      const list = await fetchAiProviders();
+      // Fetch BYOK providers and the local-model status concurrently. The
+      // local status is best-effort: a failure (or AI disabled) just omits
+      // the synthetic entry rather than failing the whole picker.
+      const [list, localStatus] = await Promise.all([
+        fetchAiProviders(),
+        fetchLocalModelStatus().catch(() => null),
+      ]);
       providers.value = list;
+      aiDisabled.value = false;
+      // Inject/refresh the synthetic ``local`` entry through the single writer
+      // so the Models card and On-device card stay one source of truth.
+      applyLocalModelStatus(localStatus);
+      // A saved pick the provider no longer offers (a class default that
+      // moved with a release, saved to localStorage by an older build) resets
+      // to the provider's current default, so a better default reaches users
+      // who never picked a model. A pick from the user's curated list stays.
+      selectedModel.value = _offeredOrDefault(selectedProvider.value, selectedModel.value);
+      simpleModel.value = _offeredOrDefault(simpleProvider.value, simpleModel.value);
       if (selectedProvider.value === null) {
-        const first = list.find((p) => p.status === "configured" || p.status === "env_fallback");
+        const first = providers.value.find(
+          (p) => p.status === "configured" || p.status === "env_fallback",
+        );
         if (first) {
           selectedProvider.value = first.provider;
           selectedModel.value = first.credential?.defaultModel ?? first.defaultModel ?? null;
         }
       }
     } catch (err) {
+      aiDisabled.value = err instanceof AiDisabledError;
       providersError.value = err instanceof Error ? err.message : String(err);
       providers.value = [];
     } finally {
       providersLoading.value = false;
     }
+  };
+
+  // Models a provider offers: its curated list (e.g. several models behind
+  // one OpenRouter key) plus its default, deduped. The one rule every model
+  // picker (Settings → AI, the chat drawer, ⌘K) renders from, resolved
+  // against ``providers`` so the synthetic ``local`` entry and its installed
+  // models are included.
+  const modelsForProvider = (name: string | null): string[] => {
+    if (!name) return [];
+    const meta = providers.value.find((p) => p.provider === name);
+    if (!meta) return [];
+    const set = new Set<string>();
+    meta.credential?.models?.forEach((m) => set.add(m));
+    const def = meta.credential?.defaultModel ?? meta.defaultModel;
+    if (def) set.add(def);
+    return Array.from(set);
+  };
+
+  // ``model`` when provider ``name`` offers it (``modelsForProvider``), else
+  // the provider's current default. Unknown provider → unchanged.
+  const _offeredOrDefault = (name: string | null, model: string | null): string | null => {
+    if (!name) return model;
+    const meta = providers.value.find((p) => p.provider === name);
+    if (!meta) return model;
+    if (model !== null && modelsForProvider(name).includes(model)) return model;
+    return meta.credential?.defaultModel ?? meta.defaultModel ?? null;
   };
 
   const setSelectedProvider = (name: string): void => {
@@ -449,19 +656,91 @@ export const useAiStore = defineStore("ai", () => {
 
   const setSelectedModel = (model: string | null): void => {
     selectedModel.value = model;
+    // For the local provider, picking a model in the dropdown must flip the
+    // server-side selection (sidecar), so the next chat/generate boots THAT
+    // model. ``manager.ensure_running`` recycles onto the selected id, so a
+    // not-yet-running pick starts on first use — no separate Start needed.
+    // Fire-and-forget; refresh status so the settings card reflects the switch.
+    if (selectedProvider.value === LOCAL_PROVIDER_ID && model) {
+      void selectLocalModel(model)
+        .then((status) => {
+          applyLocalModelStatus(status);
+        })
+        .catch((err) => {
+          console.warn("ai-store: selectLocalModel failed", err);
+        });
+    }
   };
 
-  const setSelectedAgentSurface = (
-    surface: "agent_complex" | "agent_staged" | "agent_live",
-  ): void => {
+  const setSimpleModel = (model: string | null): void => {
+    simpleModel.value = model;
+  };
+
+  const setSimpleProvider = (name: string): void => {
+    simpleProvider.value = name;
+    const meta = providers.value.find((p) => p.provider === name);
+    // Default the simple model to the new provider's default so the picker
+    // opens on a valid model rather than an empty preset.
+    simpleModel.value = meta ? (meta.credential?.defaultModel ?? meta.defaultModel ?? null) : null;
+  };
+
+  const setSplitModels = (on: boolean): void => {
+    splitModels.value = on;
+    // Seed the simple tier from the main selection the first time it's enabled
+    // so toggling on is a no-op until the user actually changes it.
+    if (on && simpleProvider.value === null) {
+      simpleProvider.value = selectedProvider.value;
+      simpleModel.value = selectedModel.value;
+    }
+  };
+
+  // Surfaces driven by the *simple* tier (cheap/fast) when ``splitModels`` is
+  // on. Everything else is *complex*. Mirrors the backend surface names
+  // (``cron``, ``settings_autocomplete``); keep in lockstep with the backend
+  // ``surface_models`` keys those endpoints resolve against.
+  const _SIMPLE_SURFACES = new Set<string>(["cron", "settings_autocomplete"]);
+
+  // Resolve the (provider, model) pair that actually runs for a given AI
+  // surface — the source of truth call sites send to the backend. Simple
+  // surfaces use the simple tier only when ``splitModels`` is on (falling back
+  // to the main provider). ``null`` model → let the backend resolve the
+  // provider's per-surface preset.
+  const resolveSurface = (surface: string): { provider: string | null; model: string | null } => {
+    const useSimple = splitModels.value && _SIMPLE_SURFACES.has(surface);
+    if (useSimple) {
+      return {
+        provider: simpleProvider.value ?? selectedProvider.value,
+        model: simpleModel.value,
+      };
+    }
+    return { provider: selectedProvider.value, model: selectedModel.value };
+  };
+
+  // Resolve the concrete model id that runs for a surface (for display, e.g.
+  // a badge). Falls through to the provider's per-surface preset / default
+  // when no tier model is pinned. ``null`` → no provider / AI disabled.
+  const modelForSurface = (surface: string): string | null => {
+    const { provider, model } = resolveSurface(surface);
+    if (model) return model;
+    if (provider === null) return null;
+    const meta = providers.value.find((p) => p.provider === provider);
+    if (!meta) return null;
+    return meta.surfaces?.[surface] ?? meta.credential?.defaultModel ?? meta.defaultModel ?? null;
+  };
+
+  const setSelectedAgentSurface = (surface: PersistedAgentSurface): void => {
     selectedAgentSurface.value = surface;
   };
 
   // Opt-in verify-completion mode setter. Mirror of the surface setter
-  // so the AiAssistant.vue checkbox flips the flag through the same
-  // store-action pattern as the other agent settings.
+  // so the Settings → AI → Assistant checkbox flips the flag through the
+  // same store-action pattern as the other agent settings.
   const setVerifyPlanCompletion = (value: boolean): void => {
     verifyPlanCompletion.value = value;
+  };
+
+  const setSimpleBuildOutput = (value: PersistedSimpleBuildOutput): void => {
+    simpleBuildOutput.value = value;
   };
 
   const abortStream = (): void => {
@@ -498,11 +777,14 @@ export const useAiStore = defineStore("ai", () => {
   // streaming/abort lifecycle.
   interface StreamedSurfaceOptions {
     userVisibleText: string;
-    streamFn: (handlers: {
-      onChunk: (delta: string) => void;
-      onDone: () => void;
-      onError: (message: string) => void;
-    }, signal: AbortSignal) => Promise<void>;
+    streamFn: (
+      handlers: {
+        onChunk: (delta: string) => void;
+        onDone: () => void;
+        onError: (message: string) => void;
+      },
+      signal: AbortSignal,
+    ) => Promise<void>;
     /** Optional post-success side effect; receives the final assistant text. */
     onSuccess?: (finalContent: string) => void;
   }
@@ -656,10 +938,14 @@ export const useAiStore = defineStore("ai", () => {
 
     activeAbort = new AbortController();
     let sawErrorEvent = false;
+    // The local model is a resolvable provider (id "local") on the backend, so
+    // it rides the SAME streamChat path as cloud providers — and therefore gets
+    // the flow context (flow_id / selection / mentions) the backend builds via
+    // render_prompt_context. No local-specific branch here.
     try {
       await streamChat(
         {
-          provider: selectedProvider.value,
+          provider: selectedProvider.value!,
           model: selectedModel.value,
           messages: wireMessages,
           flow_id: activeFlowId,
@@ -864,8 +1150,15 @@ export const useAiStore = defineStore("ai", () => {
     // it (force-agent, handled by AiAssistant.vue's handleSend before
     // this store action runs).
     const flowStore = useFlowStore();
+    // The local model can't drive the tool-calling agent (no function
+    // calling on a 1.5B model), so never auto-promote it — local always
+    // routes to plain chat here, and to one-shot generation via the
+    // explicit "Generate flow" action (``generateFlowFromComposer``).
     const wantsClassification =
-      !agentModeAccepted.value && mode.value === "auto" && flowStore.flowId !== null;
+      !agentModeAccepted.value &&
+      mode.value === "auto" &&
+      flowStore.flowId !== null &&
+      !isLocalSelected.value;
     // ``ChatRole`` is already ``"user" | "assistant"`` (no "system" — those
     // come from the server, never the chat trail), so the cast to
     // ``RouteHistoryEntry`` is shape-compatible without a runtime guard.
@@ -888,8 +1181,10 @@ export const useAiStore = defineStore("ai", () => {
     // re-classifying. We still gate on a flow being loaded; otherwise
     // dispatching the agent would surface a confusing "Open a flow
     // first" error from ``_dispatchPromotedAgent`` for what looks
-    // like a normal chat.
-    if (agentModeAccepted.value && flowStore.flowId !== null) {
+    // like a normal chat. Never fires for the local model — it can't
+    // drive the agent, so a leftover accept from a prior cloud session
+    // must not hijack a local chat send.
+    if (agentModeAccepted.value && flowStore.flowId !== null && !isLocalSelected.value) {
       await _dispatchPromotedAgent(text, "session set to continue as agent");
       return;
     }
@@ -1206,36 +1501,172 @@ export const useAiStore = defineStore("ai", () => {
     });
   };
 
+  // Simple-build mode (universal — local or cloud). The model emits a whole
+  // flow in one response; the backend registers it as a GraphDiff. We do NOT
+  // open the diff-review panel — instead the assistant bubble carries the diff
+  // id so it can render an inline "Add to canvas" button (``addBuiltFlow``).
+  // Non-streaming, so we push a synthetic user/assistant pair and settle the
+  // assistant message on done/error.
+  const generateFlowFromComposer = async (rawText: string): Promise<void> => {
+    const text = rawText.trim();
+    if (!text) return;
+    if (streamingState.value === "streaming") return;
+    if (selectedProvider.value === null) {
+      streamError.value = "Pick a provider first.";
+      streamingState.value = "error";
+      return;
+    }
+    const flowStore = useFlowStore();
+    if (flowStore.flowId === null || flowStore.flowId === -1) {
+      streamError.value = "Open a flow before generating.";
+      streamingState.value = "error";
+      return;
+    }
+    openAiDrawer();
+
+    const userMessage: ChatMessage = {
+      id: nextMessageId(),
+      createdAt: Date.now(),
+      role: "user",
+      content: `[Build] ${text}`,
+    };
+    const assistantPlaceholder: ChatMessage = {
+      id: nextMessageId(),
+      createdAt: Date.now(),
+      role: "assistant",
+      content: "",
+      pending: true,
+    };
+    messages.value.push(userMessage, assistantPlaceholder);
+    const reactivePlaceholder = messages.value[messages.value.length - 1];
+
+    streamingState.value = "streaming";
+    streamError.value = null;
+    try {
+      const result = await generateFlow(
+        flowStore.flowId,
+        text,
+        selectedProvider.value,
+        selectedModel.value,
+        simpleBuildOutput.value === "json" ? "simple" : "code",
+      );
+      reactivePlaceholder.pending = false;
+      streamingState.value = "idle";
+      if (result.answer !== null || result.diffId === null) {
+        // Not a pipeline description — the model replied instead of building.
+        reactivePlaceholder.content =
+          result.answer ??
+          "That doesn't describe a pipeline to build. Describe the steps, or switch to Chat mode to ask about the flow.";
+        return;
+      }
+      reactivePlaceholder.buildDiffId = result.diffId;
+      reactivePlaceholder.buildOpCount = result.opCount;
+      reactivePlaceholder.buildCode = result.code;
+      const lines = [
+        `Built a flow with ${result.opCount} node(s). Click "Add to canvas" to insert it.`,
+      ];
+      if (result.warnings.length > 0) {
+        lines.push("", "Notes:", ...result.warnings.map((w) => `• ${w}`));
+      }
+      reactivePlaceholder.content = lines.join("\n");
+    } catch (err) {
+      reactivePlaceholder.pending = false;
+      const rawDetail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data
+        ?.detail;
+      let detail: string;
+      if (isGenerateFlowFailure(rawDetail)) {
+        // Code mode: the script still failed after its repair round. Keep the
+        // script and the line so the bubble can show where.
+        reactivePlaceholder.buildCode = rawDetail.code;
+        reactivePlaceholder.buildCodeLine = rawDetail.line;
+        detail = rawDetail.line
+          ? `line ${rawDetail.line}: ${rawDetail.message}`
+          : rawDetail.message;
+      } else if (typeof rawDetail === "string") {
+        detail = rawDetail;
+      } else {
+        detail = err instanceof Error ? err.message : String(err);
+      }
+      reactivePlaceholder.error = detail;
+      reactivePlaceholder.content = `Generation failed: ${detail}`;
+      streamingState.value = "error";
+      streamError.value = detail;
+    }
+  };
+
+  // Apply a Simple-build result onto the canvas. Called by the inline
+  // "Add to canvas" button; applies the staged diff via the existing accept
+  // route, then signals the canvas to re-fetch. Idempotent-ish: marks the
+  // message ``buildAdded`` so the button can't double-fire.
+  const addBuiltFlow = async (messageId: number): Promise<void> => {
+    const msg = messages.value.find((m) => m.id === messageId);
+    if (!msg || !msg.buildDiffId || msg.buildAdded) return;
+    const flowStore = useFlowStore();
+    if (flowStore.flowId === null || flowStore.flowId === -1) return;
+    try {
+      await acceptDiff(msg.buildDiffId, { flow_id: flowStore.flowId });
+      msg.buildAdded = true;
+      try {
+        flowStore.requestReload();
+      } catch (reloadErr) {
+        console.warn("ai-store: requestReload after addBuiltFlow failed", reloadErr);
+      }
+    } catch (err) {
+      const detail =
+        (err as { detail?: string })?.detail ?? (err instanceof Error ? err.message : String(err));
+      streamError.value = `Couldn't add the flow: ${detail}`;
+      streamingState.value = "error";
+    }
+  };
+
   return {
     // state
     providers,
     providersLoading,
     providersError,
+    aiDisabled,
     selectedProvider,
     selectedModel,
+    splitModels,
+    simpleProvider,
+    simpleModel,
     messages,
     streamingState,
     streamError,
     mode,
     agentModeAccepted,
     promotionBanner,
+    localModelStatus,
     // computed
     isAiOpen,
     isStreaming,
     configuredProviders,
     hasConfiguredProvider,
+    modelForSurface,
+    modelsForProvider,
+    resolveSurface,
+    isLocalSelected,
+    canSetupLocal,
     // actions
+    generateFlowFromComposer,
+    addBuiltFlow,
     openAiDrawer,
     closeAiDrawer,
     toggleAiDrawer,
     clearMessages,
     loadProviders,
+    applyLocalModelStatus,
     setSelectedProvider,
     setSelectedModel,
+    setSimpleModel,
+    setSimpleProvider,
+    setSplitModels,
     selectedAgentSurface,
     setSelectedAgentSurface,
     verifyPlanCompletion,
     setVerifyPlanCompletion,
+    simpleBuildOutput,
+    setSimpleBuildOutput,
     // Exposed so ai-agent-store's status watcher can flip it to
     // "agent" when a run terminates.
     lastInteractionKind,

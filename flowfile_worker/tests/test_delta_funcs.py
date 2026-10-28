@@ -25,17 +25,18 @@ from flowfile_worker.funcs import (
     _get_delta_size_bytes,
     get_delta_history,
     materialize_catalog_table_task,
+    optimize_catalog_table_task,
     read_delta_version_preview,
     read_table_metadata,
+    vacuum_catalog_table_task,
     write_delta,
 )
 from shared.delta_utils import format_delta_timestamp
 from shared.storage_config import storage
+from tests.conftest import INTERNAL_AUTH_HEADERS
 
 
-# ---------------------------------------------------------------------------
 # Fixtures
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
@@ -79,12 +80,10 @@ def versioned_delta(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def worker_client(tmp_path) -> TestClient:
-    return TestClient(main.app)
+    return TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
 
 
-# ---------------------------------------------------------------------------
 # _get_delta_size_bytes
-# ---------------------------------------------------------------------------
 
 
 class TestGetDeltaSizeBytes:
@@ -97,9 +96,7 @@ class TestGetDeltaSizeBytes:
         assert _get_delta_size_bytes(delta_path) == fs_size
 
 
-# ---------------------------------------------------------------------------
 # format_delta_timestamp
-# ---------------------------------------------------------------------------
 
 
 class TestFormatDeltaTimestamp:
@@ -122,9 +119,7 @@ class TestFormatDeltaTimestamp:
         assert "2023" in result
 
 
-# ---------------------------------------------------------------------------
 # read_table_metadata
-# ---------------------------------------------------------------------------
 
 
 class TestReadTableMetadata:
@@ -138,9 +133,7 @@ class TestReadTableMetadata:
         assert names == {"id", "value"}
 
 
-# ---------------------------------------------------------------------------
 # get_delta_history
-# ---------------------------------------------------------------------------
 
 
 class TestGetDeltaHistory:
@@ -160,9 +153,7 @@ class TestGetDeltaHistory:
         assert len(result.history) == 1
 
 
-# ---------------------------------------------------------------------------
 # read_delta_version_preview
-# ---------------------------------------------------------------------------
 
 
 class TestReadDeltaVersionPreview:
@@ -182,9 +173,7 @@ class TestReadDeltaVersionPreview:
         assert len(result.rows) == 1
 
 
-# ---------------------------------------------------------------------------
 # write_delta (multiprocessing function)
-# ---------------------------------------------------------------------------
 
 
 class TestWriteDelta:
@@ -215,7 +204,6 @@ class TestWriteDelta:
         assert result["size_bytes"] > 0
         assert len(result["schema"]) == 2
 
-        # Verify the table is readable
         df = pl.read_delta(output_path)
         assert df.height == 3
 
@@ -237,10 +225,90 @@ class TestWriteDelta:
 
         assert progress.value == -1
 
+    def test_write_delta_partitioned(self, tmp_path):
+        from deltalake import DeltaTable
 
-# ---------------------------------------------------------------------------
+        lf = pl.LazyFrame({"a": [1, 2, 3], "b": ["x", "y", "x"]})
+        output_path = str(tmp_path / "part_out")
+        progress = mp_context.Value("i", 0)
+        error_message = mp_context.Array("c", 1024)
+        queue = Queue(maxsize=1)
+
+        write_delta(
+            polars_serializable_object=lf.serialize(),
+            progress=progress,
+            error_message=error_message,
+            queue=queue,
+            file_path="",
+            output_path=output_path,
+            mode="overwrite",
+            partition_by=["b"],
+        )
+
+        assert progress.value == 100
+        assert DeltaTable(output_path).metadata().partition_columns == ["b"]
+
+
+# optimize / vacuum catalog tasks
+
+
+class TestOptimizeVacuumTasks:
+    def test_optimize_task(self, delta_path):
+        # add a second file so compaction has something to do
+        pl.DataFrame({"id": [4], "value": [40.0]}).write_delta(str(delta_path), mode="append")
+        progress = mp_context.Value("i", 0)
+        error_message = mp_context.Array("c", 1024)
+        queue = Queue(maxsize=1)
+
+        optimize_catalog_table_task(
+            table_path=str(delta_path),
+            z_order_columns=None,
+            progress=progress,
+            error_message=error_message,
+            queue=queue,
+        )
+
+        assert progress.value == 100
+        result = queue.get(timeout=5)
+        assert isinstance(result["metrics"], dict)
+        assert result["size_bytes"] > 0
+
+    def test_vacuum_task_dry_run(self, delta_path):
+        progress = mp_context.Value("i", 0)
+        error_message = mp_context.Array("c", 1024)
+        queue = Queue(maxsize=1)
+
+        vacuum_catalog_table_task(
+            table_path=str(delta_path),
+            retention_hours=0,
+            dry_run=True,
+            progress=progress,
+            error_message=error_message,
+            queue=queue,
+        )
+
+        assert progress.value == 100
+        result = queue.get(timeout=5)
+        assert isinstance(result["files_removed"], list)
+        assert result["file_count"] == len(result["files_removed"])
+
+    def test_optimize_task_missing_table(self, tmp_path):
+        progress = mp_context.Value("i", 0)
+        error_message = mp_context.Array("c", 1024)
+        queue = Queue(maxsize=1)
+
+        optimize_catalog_table_task(
+            table_path=str(tmp_path / "does_not_exist"),
+            z_order_columns=None,
+            progress=progress,
+            error_message=error_message,
+            queue=queue,
+        )
+
+        assert progress.value == -1
+
+
 # materialize_catalog_table_task (now writes delta)
-# ---------------------------------------------------------------------------
 
 
 class TestMaterializeCatalogTableTask:
@@ -305,9 +373,48 @@ class TestMaterializeCatalogTableTask:
         assert progress.value == -1
 
 
-# ---------------------------------------------------------------------------
+# _drain_then_join
+
+
+def _put_large_payload(queue):
+    # ~200KB: well past the OS pipe buffer, so a join-before-get would deadlock
+    queue.put({"files_removed": ["x" * 100 for _ in range(2000)]})
+
+
+class TestDrainThenJoin:
+    def test_large_payload_does_not_deadlock(self):
+        from flowfile_worker.routes import _drain_then_join
+
+        queue = mp_context.Queue(maxsize=1)
+        p = mp_context.Process(target=_put_large_payload, args=(queue,))
+        p.start()
+        result = _drain_then_join(p, queue)
+        assert result is not None
+        assert len(result["files_removed"]) == 2000
+
+    def test_child_error_returns_none(self, tmp_path):
+        from flowfile_worker.routes import _drain_then_join
+
+        progress = mp_context.Value("i", 0)
+        error_message = mp_context.Array("c", 1024)
+        queue = mp_context.Queue(maxsize=1)
+        p = mp_context.Process(
+            target=optimize_catalog_table_task,
+            kwargs={
+                "table_path": str(tmp_path / "does_not_exist"),
+                "z_order_columns": None,
+                "progress": progress,
+                "error_message": error_message,
+                "queue": queue,
+            },
+        )
+        p.start()
+        result = _drain_then_join(p, queue)
+        assert result is None
+        assert progress.value == -1
+
+
 # Worker Routes
-# ---------------------------------------------------------------------------
 
 
 class TestWorkerRoutes:
@@ -388,6 +495,41 @@ class TestWorkerRoutes:
         data = resp.json()
         assert len(data["rows"]) == 1
 
+    def test_delta_version_preview_missing_version_404(self, worker_client, versioned_delta):
+        """A version outside the table's history returns 404, not a 500."""
+        resp = worker_client.post(
+            "/catalog/delta_version_preview",
+            json={"table_path": "versioned", "version": 99, "n_rows": 100},
+        )
+        assert resp.status_code == 404
+
+    def test_delta_preview(self, worker_client, versioned_delta):
+        resp = worker_client.post(
+            "/catalog/delta_preview",
+            json={"table_path": "versioned", "n_rows": 100},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "version" not in data  # non-versioned response shape
+        assert data["columns"] == ["v"]
+        assert len(data["rows"]) == 2  # latest version (the overwrite)
+
+    def test_delta_preview_n_rows(self, worker_client, versioned_delta):
+        resp = worker_client.post(
+            "/catalog/delta_preview",
+            json={"table_path": "versioned", "n_rows": 1},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["rows"]) == 1  # page is bounded
+
+    def test_delta_preview_path_traversal(self, worker_client):
+        resp = worker_client.post(
+            "/catalog/delta_preview",
+            json={"table_path": "../etc/passwd"},
+        )
+        assert resp.status_code == 400
+
     def test_table_metadata_path_traversal(self, worker_client):
         """Path with separators should be rejected as 400."""
         resp = worker_client.post(
@@ -402,4 +544,29 @@ class TestWorkerRoutes:
             "/catalog/table_metadata",
             json={"table_path": "/nonexistent/path"},
         )
+        assert resp.status_code == 400
+
+    def test_optimize_route(self, worker_client, delta_path):
+        resp = worker_client.post("/catalog/optimize", json={"table_path": "test_delta"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "metrics" in data
+        assert data["size_bytes"] > 0
+
+    def test_vacuum_route_dry_run(self, worker_client, delta_path):
+        resp = worker_client.post(
+            "/catalog/vacuum",
+            json={"table_path": "test_delta", "retention_hours": 0, "dry_run": True},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "files_removed" in data
+        assert data["file_count"] == len(data["files_removed"])
+
+    def test_optimize_route_path_traversal(self, worker_client):
+        resp = worker_client.post("/catalog/optimize", json={"table_path": "../escape"})
+        assert resp.status_code == 400
+
+    def test_vacuum_route_path_traversal(self, worker_client):
+        resp = worker_client.post("/catalog/vacuum", json={"table_path": "../escape"})
         assert resp.status_code == 400

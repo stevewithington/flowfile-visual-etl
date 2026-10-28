@@ -3,34 +3,66 @@ import gc
 import json
 import os
 import uuid
+from queue import Empty
 
-import polars as pl
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
+from deltalake.exceptions import DeltaError
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
-from flowfile_worker import CACHE_DIR, PROCESS_MEMORY_USAGE, funcs, models, mp_context, status_dict, status_dict_lock
+from flowfile_worker import (
+    CACHE_DIR,
+    PROCESS_MEMORY_USAGE,
+    funcs,
+    models,
+    mp_context,
+    pool,
+    status_dict,
+    status_dict_lock,
+)
+from flowfile_worker.auth import verify_internal_token
 from flowfile_worker.configs import logger
 from flowfile_worker.create import FileType, table_creator_factory_method
 from flowfile_worker.create.models import ReceivedTable
 from flowfile_worker.external_sources.google_analytics_source.main import read_google_analytics
 from flowfile_worker.external_sources.google_analytics_source.models import GoogleAnalyticsReadSettings
 from flowfile_worker.external_sources.kafka_source.main import read_kafka
+from flowfile_worker.external_sources.rest_api_source.main import read_rest_api
+from flowfile_worker.external_sources.rest_api_source.models import RestApiReadSettings
 from flowfile_worker.external_sources.sql_source.main import read_sql_source
 from flowfile_worker.external_sources.sql_source.models import DatabaseReadSettings
 from flowfile_worker.spawner import (
     process_manager,
     start_apply_model_process,
+    start_custom_node_process,
     start_fuzzy_process,
     start_generic_process,
     start_process,
     start_train_model_process,
 )
+from shared.delta_utils import validate_catalog_uri
 from shared.kafka.models import KafkaReadSettings
 from shared.storage_config import storage
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(verify_internal_token)])
 
 # Re-use the single validation helper from funcs (backed by shared.delta_utils).
 _validate_catalog_path = funcs._validate_catalog_path
+
+
+def _resolve_catalog_route(
+    table_path: str, storage_iface: "models.CatalogStorageInterface | None"
+) -> tuple[str, str | None, dict | None]:
+    """Guard the bare table name and resolve a catalog route's storage target.
+
+    Returns ``(resolved_target, base_uri, storage_options)``: a local path + ``None`` when
+    *storage_iface* is ``None``, else an object-storage URI plus decrypted ``storage_options``.
+    """
+    if storage_iface is None:
+        return str(_validate_catalog_path(table_path)), None, None
+    return (
+        validate_catalog_uri(table_path, storage_iface.base_uri),
+        storage_iface.base_uri,
+        storage_iface.connection.get_storage_options(),
+    )
 
 
 def create_and_get_default_cache_dir(flowfile_flow_id: int) -> str:
@@ -43,15 +75,12 @@ def create_and_get_default_cache_dir(flowfile_flow_id: int) -> str:
 async def submit_query(request: Request, background_tasks: BackgroundTasks) -> models.Status:
     """Accept raw binary data with metadata in headers for efficient transfer."""
     try:
-        # Read raw bytes directly from request body - no base64 decoding needed
         polars_serializable_object = await request.body()
 
-        # Get metadata from headers
         task_id = request.headers.get("X-Task-Id") or str(uuid.uuid4())
         operation_type = request.headers.get("X-Operation-Type", "store")
         flow_id = int(request.headers.get("X-Flow-Id", "1"))
         node_id = request.headers.get("X-Node-Id", "-1")
-        # Try to parse node_id as int, fall back to string
         try:
             node_id = int(node_id)
         except ValueError:
@@ -59,7 +88,6 @@ async def submit_query(request: Request, background_tasks: BackgroundTasks) -> m
 
         logger.info(f"Processing query with operation: {operation_type}")
 
-        # Extract extra kwargs from header if present (used by write_parquet, etc.)
         kwargs_str = request.headers.get("X-Kwargs")
         kwargs = json.loads(kwargs_str) if kwargs_str else {}
 
@@ -94,15 +122,12 @@ async def submit_query(request: Request, background_tasks: BackgroundTasks) -> m
 async def store_sample(request: Request, background_tasks: BackgroundTasks) -> models.Status:
     """Accept raw binary data with metadata in headers for efficient transfer."""
     try:
-        # Read raw bytes directly from request body - no base64 decoding needed
         polars_serializable_object = await request.body()
 
-        # Get metadata from headers
         task_id = request.headers.get("X-Task-Id") or str(uuid.uuid4())
         sample_size = int(request.headers.get("X-Sample-Size", "100"))
         flow_id = int(request.headers.get("X-Flow-Id", "1"))
         node_id = request.headers.get("X-Node-Id", "-1")
-        # Try to parse node_id as int, fall back to string
         try:
             node_id = int(node_id)
         except ValueError:
@@ -247,6 +272,7 @@ def write_results(polars_script_write: models.PolarsScriptWrite, background_task
                 write_mode=polars_script_write.write_mode,
                 sheet_name=polars_script_write.sheet_name,
                 delimiter=polars_script_write.delimiter,
+                compression=polars_script_write.compression,
             ),
         )
         logger.info(f"Started write task: {task_id} with type: {polars_script_write.data_type}")
@@ -374,6 +400,41 @@ def store_google_analytics_result(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.post("/store_rest_api_read_result")
+def store_rest_api_result(
+    rest_api_read_settings: RestApiReadSettings, background_tasks: BackgroundTasks
+) -> models.Status:
+    """Fetch from a REST API in the background and persist it as an Arrow IPC file.
+
+    Follows the same offload pattern as ``store_google_analytics_read_result`` /
+    ``store_database_read_result``: the HTTP round-trips, pagination, and retries
+    run in a worker subprocess so the core's event loop never blocks on the API.
+    """
+    logger.info("Processing REST API source operation for url: %s", rest_api_read_settings.url)
+    try:
+        task_id = str(uuid.uuid4())
+        file_path = os.path.join(
+            create_and_get_default_cache_dir(rest_api_read_settings.flowfile_flow_id), f"{task_id}.arrow"
+        )
+        status = models.Status(background_task_id=task_id, status="Starting", file_ref=file_path, result_type="polars")
+        status_dict[task_id] = status
+        logger.info("Starting REST API read task: %s", task_id)
+        background_tasks.add_task(
+            start_generic_process,
+            func_ref=read_rest_api,
+            file_ref=file_path,
+            flowfile_flow_id=rest_api_read_settings.flowfile_flow_id,
+            flowfile_node_id=rest_api_read_settings.flowfile_node_id,
+            task_id=task_id,
+            kwargs={"settings": rest_api_read_settings},
+        )
+        return status
+
+    except Exception as e:
+        logger.error("Error processing REST API source: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.get("/kafka_offsets/{task_id}")
 def get_kafka_offsets(task_id: str):
     """Return deferred Kafka offset data for a completed task.
@@ -417,6 +478,10 @@ def create_table(
         models.Status: Status object tracking the table creation
     """
     logger.info(f"Creating table of type: {file_type}")
+    if received_table.scan_mode == "directory":
+        # Mirrors core's create_from_path_worker guard: no worker reader can execute a glob,
+        # so refuse here instead of stat'ing a pattern as if it were a file.
+        raise HTTPException(status_code=422, detail="Directory scan mode is not supported by the worker file reader.")
     try:
         task_id = str(uuid.uuid4())
         file_ref = os.path.join(create_and_get_default_cache_dir(flowfile_flow_id), f"{task_id}.arrow")
@@ -445,8 +510,9 @@ def create_table(
 def resolve_virtual_table(payload: models.ResolveVirtualTableRequest) -> models.ResolveVirtualTableResponse:
     """Materialise a flow-virtual table from a serialised polars plan.
 
-    Idempotent on ``(table_id, source_versions_hash)`` — repeated calls return
-    the same IPC file without re-executing the producer plan.
+    Idempotent on ``(table_id, source_versions_hash)`` for real fingerprints —
+    repeated calls return the same IPC file without re-executing the producer
+    plan. A ``noversions`` hash always rebuilds (no fingerprint, no freshness proof).
     """
     try:
         return funcs.resolve_virtual_table(payload)
@@ -459,11 +525,15 @@ def resolve_virtual_table(payload: models.ResolveVirtualTableRequest) -> models.
 def catalog_sql_query(payload: models.SqlQueryRequest) -> models.SqlQueryResponse:
     """Execute a SQL query against catalog tables (physical + virtual)."""
     try:
+        base_uri = payload.storage.base_uri if payload.storage is not None else None
+        storage_options = payload.storage.connection.get_storage_options() if payload.storage is not None else None
         result = funcs.execute_sql_query(
             payload.query,
             payload.tables,
             payload.max_rows,
             virtual_refs=payload.virtual_refs,
+            base_uri=base_uri,
+            storage_options=storage_options,
         )
         return models.SqlQueryResponse(**result)
     except ValueError as e:
@@ -484,16 +554,20 @@ def materialize_catalog_table(payload: models.CatalogMaterializeRequest) -> mode
             detail={"error_type": "unsupported_file_type", "message": f"Unsupported file type: {ext}"},
         )
 
-    dest_dir = storage.catalog_tables_directory
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
     # Generate a directory name for the Delta table (not a .parquet filename)
     if payload.table_name:
         dir_name = f"{payload.table_name}_{uuid.uuid4().hex[:8]}"
     else:
         dir_name = f"catalog_{uuid.uuid4().hex}"
 
-    dest_path = str(dest_dir / dir_name)
+    if payload.storage is not None:
+        dest_path = validate_catalog_uri(dir_name, payload.storage.base_uri)
+        storage_options = payload.storage.connection.get_storage_options()
+    else:
+        dest_dir = storage.catalog_tables_directory
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = str(dest_dir / dir_name)
+        storage_options = None
 
     progress = mp_context.Value("i", 0)
     error_message = mp_context.Array("c", 1024)
@@ -507,6 +581,7 @@ def materialize_catalog_table(payload: models.CatalogMaterializeRequest) -> mode
             "progress": progress,
             "error_message": error_message,
             "queue": queue,
+            "storage_options": storage_options,
         },
     )
     p.start()
@@ -539,6 +614,231 @@ def materialize_catalog_table(payload: models.CatalogMaterializeRequest) -> mode
         gc.collect()
 
 
+def _drain_then_join(p, queue) -> dict | None:
+    """Read the subprocess result *before* joining: a child cannot exit until its
+    queued payload fits through the pipe (~64KB), so join-first deadlocks on large
+    results (e.g. a vacuum's file list)."""
+    result = None
+    while True:
+        try:
+            result = queue.get(timeout=0.5)
+            break
+        except Empty:
+            if not p.is_alive():
+                try:
+                    result = queue.get(timeout=1)
+                except Empty:
+                    pass
+                break
+    p.join()
+    return result
+
+
+@router.post("/catalog/optimize", response_model=models.CatalogOptimizeResponse)
+def optimize_catalog_table(payload: models.CatalogOptimizeRequest) -> models.CatalogOptimizeResponse:
+    """Compact (and optionally Z-order) a Delta catalog table in a spawned subprocess."""
+    try:
+        resolved_path, _, storage_options = _resolve_catalog_route(payload.table_path, payload.storage)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+    queue = mp_context.Queue(maxsize=1)
+    p = mp_context.Process(
+        target=funcs.optimize_catalog_table_task,
+        kwargs={
+            "table_path": resolved_path,
+            "z_order_columns": payload.z_order_columns,
+            "progress": progress,
+            "error_message": error_message,
+            "queue": queue,
+            "storage_options": storage_options,
+        },
+    )
+    p.start()
+    result = _drain_then_join(p, queue)
+    try:
+        with progress.get_lock():
+            final_progress = progress.value
+        if final_progress != 100 or result is None:
+            with error_message.get_lock():
+                err = error_message.value.decode().rstrip("\x00")
+            logger.error(f"Catalog optimize subprocess failed: {err}")
+            raise HTTPException(
+                status_code=500,
+                detail={"error_type": "optimize_failure", "message": err or "subprocess returned no result"},
+            )
+        return models.CatalogOptimizeResponse(metrics=result.get("metrics", {}), size_bytes=result.get("size_bytes"))
+    finally:
+        del p, progress, error_message, queue
+        gc.collect()
+
+
+@router.post("/catalog/vacuum", response_model=models.CatalogVacuumResponse)
+def vacuum_catalog_table(payload: models.CatalogVacuumRequest) -> models.CatalogVacuumResponse:
+    """Vacuum tombstoned files from a Delta catalog table in a spawned subprocess."""
+    try:
+        resolved_path, _, storage_options = _resolve_catalog_route(payload.table_path, payload.storage)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+    queue = mp_context.Queue(maxsize=1)
+    p = mp_context.Process(
+        target=funcs.vacuum_catalog_table_task,
+        kwargs={
+            "table_path": resolved_path,
+            "retention_hours": payload.retention_hours,
+            "dry_run": payload.dry_run,
+            "progress": progress,
+            "error_message": error_message,
+            "queue": queue,
+            "storage_options": storage_options,
+        },
+    )
+    p.start()
+    result = _drain_then_join(p, queue)
+    try:
+        with progress.get_lock():
+            final_progress = progress.value
+        if final_progress != 100 or result is None:
+            with error_message.get_lock():
+                err = error_message.value.decode().rstrip("\x00")
+            logger.error(f"Catalog vacuum subprocess failed: {err}")
+            raise HTTPException(
+                status_code=500,
+                detail={"error_type": "vacuum_failure", "message": err or "subprocess returned no result"},
+            )
+        return models.CatalogVacuumResponse(
+            files_removed=result.get("files_removed", []),
+            file_count=result.get("file_count", 0),
+            size_bytes=result.get("size_bytes"),
+        )
+    finally:
+        del p, progress, error_message, queue
+        gc.collect()
+
+
+def _raise_typed_edit_error(err: str, fallback_error_type: str) -> None:
+    """Map the edit tasks' encoded failures to typed HTTP errors (409 stale / 422 invalid)."""
+    if err.startswith("STALE_WRITE:"):
+        parts = err.split(":", 2)
+        expected = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else None
+        current = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else None
+        raise HTTPException(
+            status_code=409,
+            detail={"error_type": "stale_write", "expected": expected, "current": current},
+        )
+    if err.startswith("EDIT_INVALID:"):
+        raise HTTPException(
+            status_code=422,
+            detail={"error_type": "edit_invalid", "message": err.removeprefix("EDIT_INVALID:")},
+        )
+    raise HTTPException(
+        status_code=500,
+        detail={"error_type": fallback_error_type, "message": err or "subprocess returned no result"},
+    )
+
+
+@router.post("/catalog/apply_edits", response_model=models.CatalogApplyEditsResponse)
+def apply_catalog_table_edits(payload: models.CatalogApplyEditsRequest) -> models.CatalogApplyEditsResponse:
+    """Apply keyed row edits (upserts / deletes / new columns) to a Delta catalog table."""
+    try:
+        resolved_path, _, storage_options = _resolve_catalog_route(payload.table_path, payload.storage)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+    queue = mp_context.Queue(maxsize=1)
+    p = mp_context.Process(
+        target=funcs.apply_catalog_table_edits_task,
+        kwargs={
+            "table_path": resolved_path,
+            "key_columns": payload.key_columns,
+            "expected_version": payload.expected_version,
+            "upsert_columns": payload.upsert_columns,
+            "upsert_rows": payload.upsert_rows,
+            "new_columns": [c.model_dump() for c in payload.new_columns],
+            "delete_keys": payload.delete_keys,
+            "commit_metadata": payload.commit_metadata,
+            "progress": progress,
+            "error_message": error_message,
+            "queue": queue,
+            "storage_options": storage_options,
+        },
+    )
+    p.start()
+    result = _drain_then_join(p, queue)
+    try:
+        with progress.get_lock():
+            final_progress = progress.value
+        if final_progress != 100 or result is None:
+            with error_message.get_lock():
+                err = error_message.value.decode(errors="replace").rstrip("\x00")
+            logger.error(f"Catalog apply_edits subprocess failed: {err}")
+            _raise_typed_edit_error(err, "edit_failure")
+        return models.CatalogApplyEditsResponse(
+            rows_upserted=result.get("rows_upserted", 0),
+            rows_deleted=result.get("rows_deleted", 0),
+            new_version=result.get("new_version"),
+            column_schema=result.get("schema", []),
+            row_count=result.get("row_count", 0),
+            column_count=result.get("column_count", 0),
+            size_bytes=result.get("size_bytes"),
+        )
+    finally:
+        del p, progress, error_message, queue
+        gc.collect()
+
+
+@router.post("/catalog/add_key_column", response_model=models.CatalogAddKeyColumnResponse)
+def add_catalog_key_column(payload: models.CatalogAddKeyColumnRequest) -> models.CatalogAddKeyColumnResponse:
+    """Rewrite a Delta catalog table with a sequential row-id column appended."""
+    try:
+        resolved_path, _, storage_options = _resolve_catalog_route(payload.table_path, payload.storage)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+    queue = mp_context.Queue(maxsize=1)
+    p = mp_context.Process(
+        target=funcs.add_catalog_key_column_task,
+        kwargs={
+            "table_path": resolved_path,
+            "column_name": payload.column_name,
+            "expected_version": payload.expected_version,
+            "progress": progress,
+            "error_message": error_message,
+            "queue": queue,
+            "storage_options": storage_options,
+        },
+    )
+    p.start()
+    result = _drain_then_join(p, queue)
+    try:
+        with progress.get_lock():
+            final_progress = progress.value
+        if final_progress != 100 or result is None:
+            with error_message.get_lock():
+                err = error_message.value.decode(errors="replace").rstrip("\x00")
+            logger.error(f"Catalog add_key_column subprocess failed: {err}")
+            _raise_typed_edit_error(err, "add_key_column_failure")
+        return models.CatalogAddKeyColumnResponse(
+            new_version=result.get("new_version"),
+            column_schema=result.get("schema", []),
+            row_count=result.get("row_count", 0),
+            column_count=result.get("column_count", 0),
+            size_bytes=result.get("size_bytes"),
+        )
+    finally:
+        del p, progress, error_message, queue
+        gc.collect()
+
+
 @router.post("/catalog/table_metadata", response_model=models.TableMetadataResponse)
 def read_table_metadata(payload: models.TableMetadataRequest) -> models.TableMetadataResponse:
     """Read schema, row_count, column_count, size_bytes from a table path.
@@ -546,8 +846,8 @@ def read_table_metadata(payload: models.TableMetadataRequest) -> models.TableMet
     This offloads metadata reading from the core process to the worker.
     """
     try:
-        _validate_catalog_path(payload.table_path)
-        result = funcs.read_table_metadata(payload.table_path)
+        _, base_uri, storage_options = _resolve_catalog_route(payload.table_path, payload.storage)
+        result = funcs.read_table_metadata(payload.table_path, base_uri=base_uri, storage_options=storage_options)
         column_schema = [models.ColumnSchema(name=s["name"], dtype=s["dtype"]) for s in result["schema"]]
         return models.TableMetadataResponse(
             column_schema=column_schema,
@@ -566,8 +866,10 @@ def read_table_metadata(payload: models.TableMetadataRequest) -> models.TableMet
 def get_delta_history(payload: models.DeltaHistoryRequest) -> models.DeltaHistoryResponse:
     """Read version history from a Delta table."""
     try:
-        _validate_catalog_path(payload.table_path)
-        return funcs.get_delta_history(payload.table_path, payload.limit)
+        _, base_uri, storage_options = _resolve_catalog_route(payload.table_path, payload.storage)
+        return funcs.get_delta_history(
+            payload.table_path, payload.limit, base_uri=base_uri, storage_options=storage_options
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
@@ -579,12 +881,33 @@ def get_delta_history(payload: models.DeltaHistoryRequest) -> models.DeltaHistor
 def get_delta_version_preview(payload: models.DeltaVersionPreviewRequest) -> models.DeltaVersionPreviewResponse:
     """Preview data from a Delta table at a specific version."""
     try:
-        _validate_catalog_path(payload.table_path)
-        return funcs.read_delta_version_preview(payload.table_path, payload.version, payload.n_rows)
+        _, base_uri, storage_options = _resolve_catalog_route(payload.table_path, payload.storage)
+        return funcs.read_delta_version_preview(
+            payload.table_path, payload.version, payload.n_rows, base_uri=base_uri, storage_options=storage_options
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except (FileNotFoundError, DeltaError) as e:
+        # Version outside retained history or its data files were vacuumed away.
+        logger.info(f"Delta version {payload.version} unavailable: {str(e)}")
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        logger.error(f"Error reading delta version preview: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/catalog/delta_preview", response_model=models.DeltaPreviewResponse)
+def get_delta_preview(payload: models.DeltaPreviewRequest) -> models.DeltaPreviewResponse:
+    """Preview data from a Delta table (latest version)."""
+    try:
+        _, base_uri, storage_options = _resolve_catalog_route(payload.table_path, payload.storage)
+        return funcs.read_delta_preview(
+            payload.table_path, payload.n_rows, base_uri=base_uri, storage_options=storage_options
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        logger.error(f"Error reading delta version preview: {str(e)}", exc_info=True)
+        logger.error(f"Error reading delta preview: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -695,13 +1018,12 @@ def validate_result(task_id: str) -> bool | None:
     logger.debug(f"Validating result for task: {task_id}")
     status = status_dict.get(task_id)
     if status.status == "Completed" and status.result_type == "polars":
-        try:
-            pl.scan_ipc(status.file_ref)
-            logger.debug(f"Validation successful for task: {task_id}")
+        # Not pl.scan_ipc: scanning is lazy and succeeds on a path that no longer
+        # exists, which made this probe - and core's results_exists - always say yes.
+        if os.path.exists(status.file_ref):
             return True
-        except Exception as e:
-            logger.error(f"Validation failed for task {task_id}: {str(e)}")
-            return False
+        logger.error(f"Validation failed for task {task_id}: result file is gone ({status.file_ref})")
+        return False
     return True
 
 
@@ -730,38 +1052,6 @@ def get_status(task_id: str) -> models.Status:
     return status
 
 
-@router.get("/fetch_results/{task_id}")
-async def fetch_results(task_id: str):
-    """Fetch results for a completed task.
-
-    Args:
-        task_id: Unique identifier of the task
-
-    Returns:
-        dict: Task ID and serialized result data
-
-    Raises:
-        HTTPException: If result not found or error occurred
-    """
-    logger.debug(f"Fetching results for task: {task_id}")
-    status = status_dict.get(task_id)
-    if not status:
-        logger.warning(f"Result not found: {task_id}")
-        raise HTTPException(status_code=404, detail="Result not found")
-    if status.status == "Processing":
-        return Response(status_code=202, content="Result not ready yet")
-    if status.status == "Error":
-        logger.error(f"Task error: {status.error_message}")
-        raise HTTPException(status_code=404, detail=f"An error occurred during processing: {status.error_message}")
-    try:
-        lf = pl.scan_parquet(status.file_ref)
-        # Return raw bytes - Pydantic/FastAPI will handle serialization
-        return {"task_id": task_id, "result": lf.serialize()}
-    except Exception as e:
-        logger.error(f"Error reading results: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error reading results") from e
-
-
 @router.get("/memory_usage/{task_id}")
 async def memory_usage(task_id: str):
     """Get memory usage for a specific task.
@@ -784,9 +1074,7 @@ async def memory_usage(task_id: str):
 
 
 @router.post("/train_ml_model")
-async def train_ml_model(
-    polars_script: models.TrainModelInput, background_tasks: BackgroundTasks
-) -> models.Status:
+async def train_ml_model(polars_script: models.TrainModelInput, background_tasks: BackgroundTasks) -> models.Status:
     """Fit a regression model and write its serialised bytes to ``staging_path``.
 
     Core has already called ``ArtifactService.prepare_upload`` and reserved the
@@ -829,9 +1117,7 @@ async def train_ml_model(
 
 
 @router.post("/apply_ml_model")
-async def apply_ml_model(
-    polars_script: models.ApplyModelInput, background_tasks: BackgroundTasks
-) -> models.Status:
+async def apply_ml_model(polars_script: models.ApplyModelInput, background_tasks: BackgroundTasks) -> models.Status:
     """Score input data using a previously trained model artifact."""
     logger.info("Starting apply_ml_model task: model_path=%s", polars_script.model_path)
     try:
@@ -909,6 +1195,44 @@ async def add_fuzzy_join(polars_script: models.FuzzyJoinInput, background_tasks:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.post("/execute_custom_node")
+async def execute_custom_node(
+    custom_node_input: models.CustomNodeExecuteInput, background_tasks: BackgroundTasks
+) -> models.Status:
+    """Execute a user custom node's process() in a spawned subprocess.
+
+    The result payload (output paths + row counts, preview/logs for dry runs)
+    comes back as JSON via the status endpoint (result_type="other").
+    """
+    logger.info("Starting custom node execution")
+    try:
+        default_cache_dir = create_and_get_default_cache_dir(custom_node_input.flowfile_flow_id)
+        custom_node_input.task_id = (
+            str(uuid.uuid4()) if custom_node_input.task_id is None else custom_node_input.task_id
+        )
+        cache_dir = custom_node_input.cache_dir if custom_node_input.cache_dir is not None else default_cache_dir
+
+        file_path = os.path.join(cache_dir, f"{custom_node_input.task_id}.arrow")
+        status = models.Status(
+            background_task_id=custom_node_input.task_id,
+            status="Starting",
+            file_ref=file_path,
+            result_type="other",
+        )
+        status_dict[custom_node_input.task_id] = status
+        background_tasks.add_task(
+            start_custom_node_process,
+            custom_node_input=custom_node_input,
+            file_ref=file_path,
+            task_id=custom_node_input.task_id,
+        )
+        logger.info(f"Started custom node task: {custom_node_input.task_id}")
+        return status
+    except Exception as e:
+        logger.error(f"Error starting custom node execution: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.delete("/clear_task/{task_id}")
 def clear_task(task_id: str):
     """
@@ -931,7 +1255,6 @@ def clear_task(task_id: str):
         if os.path.exists(status.file_ref):
             os.remove(status.file_ref)
             logger.debug(f"Removed file: {status.file_ref}")
-        # Also remove Kafka offset sidecar if present
         sidecar = status.file_ref + ".offsets.json"
         if os.path.exists(sidecar):
             os.remove(sidecar)
@@ -943,6 +1266,30 @@ def clear_task(task_id: str):
         PROCESS_MEMORY_USAGE.pop(task_id, None)
         logger.info(f"Successfully cleared task: {task_id}")
     return {"message": f"Task {task_id} has been cleared."}
+
+
+def _active_task_count() -> int:
+    """Tasks currently in flight on this worker, pooled and spawned alike."""
+    with status_dict_lock:
+        return sum(1 for status in status_dict.values() if status.status in ("Starting", "Processing"))
+
+
+@router.get("/pool")
+def get_pool_state() -> dict:
+    """Live warm-pool state + config, for core's /system/worker_pool admin proxy."""
+    return {**pool.task_pool.describe(), "active_tasks": _active_task_count()}
+
+
+@router.post("/pool")
+def set_pool_state(payload: models.PoolConfigInput) -> dict:
+    """Resize the warm pool at runtime (0 disables) and save it for future boots.
+
+    Core admin-gates access. FLOWFILE_WORKER_POOL_SIZE, when set, still wins at
+    the next boot (operator override) - the response's env_override says so.
+    """
+    pool.task_pool.resize(payload.size)
+    pool.persist_size(payload.size)
+    return {**pool.task_pool.describe(), "active_tasks": _active_task_count()}
 
 
 @router.post("/cancel_task/{task_id}")

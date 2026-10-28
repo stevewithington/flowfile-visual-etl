@@ -1,4 +1,3 @@
-<!-- nodeButton.vue - add this right after your button -->
 <template>
   <div class="component-wrapper">
     <div class="status-indicator" :class="nodeResult?.statusIndicator">
@@ -6,7 +5,7 @@
     </div>
 
     <button :class="['node-button', { selected: isSelected }]" @click="onClick">
-      <img :src="getImageUrl(props.imageSrc)" :alt="props.title" width="40" />
+      <img :src="iconUrl" :alt="props.title" width="40" />
     </button>
   </div>
 </template>
@@ -14,9 +13,10 @@
 <script setup lang="ts">
 import { defineProps, defineEmits, computed, onMounted, ref, nextTick, watch } from "vue";
 import type { Component } from "vue"; // <-- Import as a TYPE, not a value
-import { getImageUrl } from "../../../features/designer/utils";
+import { useNodeIconUrl } from "../../../composables/useCustomNodeIcon";
 import { useNodeStore } from "../../../stores/column-store";
 import { NodeTitleInfo } from "./nodeInterfaces";
+import { deriveNodeStatus, nodeStatusTooltip, type NodeStatusOutput } from "./nodeStatus";
 const description = ref<string>("");
 const nodeStore = useNodeStore();
 
@@ -29,126 +29,22 @@ const props = defineProps<{
   nodeTitleInfo: NodeTitleInfo;
 }>();
 
+// Built-in glyphs resolve to bundled assets; custom-node icons come from the
+// JWT-gated endpoint via an authed blob fetch.
+const iconUrl = useNodeIconUrl(() => props.imageSrc);
+
 const isSelected = computed(() => {
   return nodeStore.node_id == props.nodeId;
 });
 
-interface ResultOutput {
-  success?: boolean;
-  statusIndicator: "success" | "failure" | "unknown" | "warning" | "running";
-  error?: string;
-  hasRun: boolean;
-}
+const nodeResult = computed<NodeStatusOutput | undefined>(() =>
+  deriveNodeStatus(
+    nodeStore.getNodeResult(props.nodeId),
+    nodeStore.getNodeValidation(props.nodeId),
+  ),
+);
 
-const nodeResult = computed<ResultOutput | undefined>(() => {
-  const nodeResult = nodeStore.getNodeResult(props.nodeId);
-  const nodeValidation = nodeStore.getNodeValidation(props.nodeId);
-
-  // Check if node is currently running (has start timestamp but not completed)
-  if (nodeResult && nodeResult.is_running) {
-    return {
-      success: undefined,
-      statusIndicator: "running",
-      hasRun: false,
-      error: undefined,
-    };
-  }
-
-  if (nodeResult && !nodeResult.is_running) {
-    if (nodeValidation) {
-      // Case 1: nodeResult is success, nodeValidation is not success, and validation is after result -> warning
-      if (
-        nodeResult.success === true &&
-        !nodeValidation.isValid &&
-        nodeValidation.validationTime > nodeResult.start_timestamp
-      ) {
-        return {
-          success: true,
-          statusIndicator: "warning",
-          error: nodeValidation.error,
-          hasRun: true,
-        };
-      }
-      // Case 2: nodeResult and nodeValidation both success -> success
-      if (nodeResult.success === true && nodeValidation.isValid) {
-        return {
-          success: true,
-          statusIndicator: "success",
-          error: nodeResult.error || nodeValidation.error,
-          hasRun: true,
-        };
-      }
-      if (
-        nodeResult.success === false &&
-        nodeValidation.isValid &&
-        nodeValidation.validationTime > nodeResult.start_timestamp
-      ) {
-        return {
-          success: false,
-          statusIndicator: "unknown",
-          error: nodeResult.error || nodeValidation.error,
-          hasRun: true,
-        };
-      }
-      if (
-        nodeResult.success === false &&
-        (!nodeValidation.isValid || !nodeValidation.validationTime)
-      ) {
-        return {
-          success: false,
-          statusIndicator: "failure",
-          error: nodeResult.error || nodeValidation.error,
-          hasRun: true,
-        };
-      }
-    }
-    // Handle completed but no validation case
-    return {
-      success: nodeResult.success ?? false,
-      statusIndicator: nodeResult.success ? "success" : "failure",
-      error: nodeResult.error,
-      hasRun: true,
-    };
-  }
-
-  // Handle incomplete node cases
-  if (nodeValidation) {
-    if (!nodeValidation.isValid) {
-      return {
-        success: false,
-        statusIndicator: "warning",
-        error: nodeValidation.error,
-        hasRun: false,
-      };
-    }
-    if (nodeValidation.isValid) {
-      return {
-        success: true,
-        statusIndicator: "unknown",
-        error: nodeValidation.error,
-        hasRun: false,
-      };
-    }
-  }
-
-  return undefined; // Default case
-});
-
-const tooltipContent = computed(() => {
-  switch (nodeResult.value?.statusIndicator) {
-    case "success":
-      return "Operation successful";
-    case "failure":
-      return "Operation failed: \n" + (nodeResult.value?.error || "No error message available");
-    case "warning":
-      return "Operation warning: \n" + (nodeResult.value?.error || "No warning message available");
-    case "running":
-      return "Operation in progress...";
-    case "unknown":
-    default:
-      return "Status unknown";
-  }
-});
+const tooltipContent = computed(() => nodeStatusTooltip(nodeResult.value));
 
 const getNodeDescription = async () => {
   description.value = await nodeStore.getNodeDescription(props.nodeId);
@@ -212,6 +108,13 @@ onMounted(() => {
   background-color: var(--color-text-muted);
 }
 
+/* Hollow ring: deliberately empty, distinct from the solid "unknown" dot. */
+.status-indicator.skipped::before {
+  box-sizing: border-box;
+  background-color: transparent;
+  border: 2px solid #8a8f98;
+}
+
 .status-indicator.running::before {
   background-color: #0909ca;
   animation: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
@@ -238,17 +141,23 @@ onMounted(() => {
 
 .tooltip-text {
   visibility: hidden;
-  width: 120px;
+  width: max-content;
+  max-width: 300px;
   background-color: var(--color-gray-800);
   color: var(--color-text-inverse);
-  text-align: center;
+  text-align: left;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   border-radius: 6px;
-  padding: 5px 0;
+  padding: 8px 12px;
+  box-shadow: var(--shadow-md);
   position: absolute;
-  z-index: 1;
-  bottom: 100%;
+  z-index: 10;
+  bottom: calc(100% + 6px);
   left: 50%;
-  margin-left: -60px;
+  transform: translateX(-50%);
   opacity: 0;
   transition: opacity 0.3s;
 }

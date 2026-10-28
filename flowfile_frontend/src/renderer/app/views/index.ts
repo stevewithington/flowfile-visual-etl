@@ -1,5 +1,3 @@
-// Re-export all views for convenient imports
-
 // Auth
 export { default as LoginView } from "./LoginView/LoginView.vue";
 
@@ -23,8 +21,5 @@ export { default as GoogleAnalyticsConnectionView } from "./GoogleAnalyticsConne
 // Database
 export { default as DatabaseView } from "./DatabaseView/DatabaseView.vue";
 
-// Documentation
-export { default as DocumentationView } from "./DocumentationView/DocumentationView.vue";
-
-// AI Providers
-export { default as AiSettingsTab } from "./AiProvidersView/AiSettingsTab.vue";
+// AI settings
+export { default as AiSettingsView } from "./AiSettingsView/AiSettingsView.vue";

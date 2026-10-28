@@ -34,6 +34,16 @@
       </el-popover>
     </div>
 
+    <div v-if="predictionWarning" class="prediction-warning-banner">
+      <span class="material-icons prediction-warning-banner__icon" aria-hidden="true">warning</span>
+      <span class="prediction-warning-banner__text">
+        {{ predictionWarning }}
+        <el-button link type="primary" size="small" @click="activeTab = 'output-schema'">
+          Or declare the expected columns in the Schema Validator
+        </el-button>
+      </span>
+    </div>
+
     <el-tabs v-model="activeTab">
       <el-tab-pane label="Main Settings" name="main">
         <slot></slot>
@@ -59,7 +69,11 @@
                 </span>
               </div>
             </div>
-            <el-switch v-model="localSettings.cache_results" @change="handleSettingChange" />
+            <el-switch
+              v-model="localSettings.cache_results"
+              size="small"
+              @change="handleSettingChange"
+            />
           </div>
 
           <div class="setting-group">
@@ -120,7 +134,11 @@
                 Guarantee data quality with automatic schema enforcement and validation
               </span>
             </div>
-            <el-switch v-model="outputFieldConfig.enabled" @change="handleOutputConfigChange" />
+            <el-switch
+              v-model="outputFieldConfig.enabled"
+              size="small"
+              @change="handleOutputConfigChange"
+            />
           </div>
 
           <template v-if="outputFieldConfig.enabled">
@@ -159,6 +177,7 @@
               </div>
               <el-switch
                 v-model="outputFieldConfig.validate_data_types"
+                size="small"
                 @change="handleOutputConfigChange"
               />
             </div>
@@ -287,10 +306,27 @@ const emit = defineEmits<{
 }>();
 /* eslint-enable no-undef */
 
-// Loading state for async operations
 const isLoadingSchema = ref(false);
 
+// Column prediction blocked by an un-run kernel node (backend warning text).
+// The store slot holds whichever node fetched last, so gate on this drawer's id.
+const predictionWarning = computed(() => {
+  const data = nodeStore.currentNodeData;
+  if (!data || String(data.node_id) !== String(props.modelValue.node_id)) return null;
+  return data.prediction_warning ?? null;
+});
+
 const activeTab = ref("main");
+
+// Lets a node's main-tab content (rendered in the default slot) send the user to
+// the General Settings tab, where the Cache Results toggle lives. Exposed via a
+// template ref rather than provide/inject because slot content is a sibling of
+// this component in the tree, not a descendant, so inject wouldn't reach it.
+const openCacheSetting = () => {
+  activeTab.value = "general";
+};
+defineExpose({ openCacheSetting });
+
 const referenceError = ref<string | null>(null);
 const isValidatingReference = ref(false);
 let validationTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -319,9 +355,7 @@ const aiNodeName = computed<string | undefined>(() => {
   return typeof label === "string" && label.length > 0 ? label : undefined;
 });
 
-// Watch for tab changes to trigger save when switching to Output Schema
 watch(activeTab, (newTab, oldTab) => {
-  // When switching to Output Schema tab from any other tab, request a save
   if (newTab === "output-schema" && oldTab !== "output-schema") {
     emit("request-save");
   }
@@ -352,7 +386,6 @@ watch(
         node_reference: newValue.node_reference ?? "",
       };
 
-      // Update output field config if it exists
       if (newValue.output_field_config) {
         Object.assign(outputFieldConfig, newValue.output_field_config);
       }
@@ -393,19 +426,16 @@ const validateReferenceLocally = (value: string): string | null => {
 };
 
 const handleReferenceInput = (value: string) => {
-  // Clear any pending validation
   if (validationTimeout) {
     clearTimeout(validationTimeout);
   }
 
-  // Run local validation immediately
   const localError = validateReferenceLocally(value);
   if (localError) {
     referenceError.value = localError;
     return;
   }
 
-  // If local validation passes, debounce server-side uniqueness check
   referenceError.value = null;
   if (value && value !== "") {
     isValidatingReference.value = true;
@@ -427,21 +457,18 @@ const handleReferenceInput = (value: string) => {
 };
 
 const handleReferenceBlur = async () => {
-  // Clear any pending validation
   if (validationTimeout) {
     clearTimeout(validationTimeout);
   }
 
   const value = localSettings.value.node_reference || "";
 
-  // Run local validation
   const localError = validateReferenceLocally(value);
   if (localError) {
     referenceError.value = localError;
     return;
   }
 
-  // If non-empty and passes local validation, do final server validation and save
   if (value !== "") {
     isValidatingReference.value = true;
     try {
@@ -458,7 +485,6 @@ const handleReferenceBlur = async () => {
     }
   }
 
-  // Save the reference if validation passed
   if (!referenceError.value) {
     try {
       await nodeStore.setNodeReference(props.modelValue.node_id, value);
@@ -493,7 +519,6 @@ const removeField = (index: number) => {
 
 const loadFieldsFromSchema = async () => {
   try {
-    // Validate that we have a valid node to work with
     if (!props.modelValue || !props.modelValue.node_id) {
       console.error("Cannot load schema: Invalid or missing node data");
       return;
@@ -501,11 +526,8 @@ const loadFieldsFromSchema = async () => {
 
     isLoadingSchema.value = true;
 
-    // Request parent component to save current state and wait for completion
-    // The parent component's saveSettings() should return a promise
     const saveResult = emit("request-save");
 
-    // Wait for the save to complete if it returns a promise
     if (saveResult instanceof Promise) {
       await saveResult;
     }
@@ -513,11 +535,11 @@ const loadFieldsFromSchema = async () => {
     // Give the backend a moment to process and update the schema
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    // Get the node data from the store with updated schema
-    const nodeData = await nodeStore.getNodeData(props.modelValue.node_id, false);
+    // Auto-detect needs the node's computed output schema, so opt back into
+    // include_output (settings opens skip it for speed).
+    const nodeData = await nodeStore.getNodeData(props.modelValue.node_id, false, true);
 
     if (nodeData?.main_output?.table_schema) {
-      // Load fields from the schema
       outputFieldConfig.fields = nodeData.main_output.table_schema.map((col: any) => ({
         name: col.name,
         data_type: col.data_type,
@@ -534,6 +556,28 @@ const loadFieldsFromSchema = async () => {
 </script>
 
 <style scoped>
+.prediction-warning-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-2, 8px);
+  margin: var(--spacing-2, 8px) var(--spacing-2, 8px) 0;
+  padding: var(--spacing-2, 8px) var(--spacing-3, 12px);
+  border: 1px solid var(--color-warning);
+  border-radius: 6px;
+  background: var(--color-warning-light);
+  font-size: var(--font-size-xs, 12px);
+  color: var(--color-warning-dark);
+}
+
+.prediction-warning-banner__icon {
+  font-size: 16px;
+  line-height: 1.3;
+}
+
+.prediction-warning-banner__text {
+  flex: 1;
+}
+
 .settings-wrapper {
   width: 100%;
   height: 100%;

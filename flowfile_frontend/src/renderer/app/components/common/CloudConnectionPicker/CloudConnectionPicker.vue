@@ -6,14 +6,37 @@
       <p>Loading connections...</p>
     </div>
     <div v-else>
-      <select id="connection-select" :value="modelValue" class="form-control" @change="onChange">
-        <option :value="null">{{ noConnectionLabel }}</option>
-        <option v-for="conn in connections" :key="conn.connectionName" :value="conn">
+      <select
+        id="connection-select"
+        :value="connectionSelectValue(modelValue, unavailableConnection)"
+        class="form-control"
+        @change="onChange"
+      >
+        <option :value="NO_CONNECTION_VALUE" :disabled="noConnection.disabled">
+          {{ noConnection.label }}
+        </option>
+        <option v-if="unavailableConnection" :value="unavailableConnection" disabled>
+          {{ unavailableConnection }} (unavailable)
+        </option>
+        <option v-for="conn in connections" :key="conn.connectionName" :value="conn.connectionName">
           {{ conn.connectionName }} ({{ getStorageTypeLabel(conn.storageType) }} -
           {{ getAuthMethodLabel(conn.authMethod) }})
         </option>
       </select>
-      <div v-if="!modelValue" class="helper-text">
+      <div v-if="unavailableConnection" class="warning-text">
+        <i class="fa-solid fa-triangle-exclamation" />
+        Connection "{{ unavailableConnection }}" is no longer available. Pick another connection, or
+        this node will fail when it runs.
+      </div>
+      <div
+        v-else-if="!modelValue && noConnection.warning"
+        class="warning-text"
+        data-testid="no-connection-warning"
+      >
+        <i class="fa-solid fa-triangle-exclamation" />
+        {{ noConnection.warning }}
+      </div>
+      <div v-else-if="!modelValue" class="helper-text">
         <i class="fa-solid fa-info-circle" />
         {{ helperText }}
       </div>
@@ -22,36 +45,59 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from "vue";
 import type { FullCloudStorageConnectionInterface } from "../../../views/CloudConnectionView/CloudConnectionTypes";
 import {
   getAuthMethodLabel,
   getStorageTypeLabel,
 } from "../../../views/CloudConnectionView/cloudConnectionFormatters";
+import { useMultiUser } from "../../../composables/useMultiUser";
+import { storageTypeForUri } from "../../../utils/storagePath";
+import {
+  NO_CONNECTION_VALUE,
+  ambientCredentialsChoice,
+  connectionSelectValue,
+  resolveConnection,
+  type NoConnectionChoice,
+} from "./connectionOptions";
 
 const props = withDefaults(
   defineProps<{
     modelValue: FullCloudStorageConnectionInterface | null;
     connections: FullCloudStorageConnectionInterface[];
+    unavailableConnection?: string | null;
     loading?: boolean;
     label?: string;
     noConnectionLabel?: string;
     helperText?: string;
+    // "No connection" means the server's own cloud credentials (cloud storage nodes).
+    ambientCredentials?: boolean;
+    // The node's path: its scheme picks whose ambient credentials "No connection" uses.
+    resourcePath?: string | null;
   }>(),
   {
+    unavailableConnection: null,
     loading: false,
     label: "Cloud Storage Connection",
     noConnectionLabel: "No connection (use local credentials)",
     helperText: "Will use local AWS CLI credentials or environment variables",
+    ambientCredentials: false,
+    resourcePath: null,
   },
+);
+
+const { isMultiUser } = useMultiUser();
+
+const noConnection = computed<NoConnectionChoice>(() =>
+  props.ambientCredentials
+    ? ambientCredentialsChoice(isMultiUser.value, storageTypeForUri(props.resourcePath ?? ""))
+    : { label: props.noConnectionLabel, warning: "", disabled: false },
 );
 
 const emit = defineEmits(["update:modelValue", "change"]);
 
 function onChange(event: Event) {
-  const select = event.target as HTMLSelectElement;
-  const idx = select.selectedIndex;
-  // Index 0 is the "no connection" option (null); the rest map to connections by offset.
-  const value = idx === 0 ? null : (props.connections[idx - 1] ?? null);
+  const value = resolveConnection(props.connections, (event.target as HTMLSelectElement).value);
   emit("update:modelValue", value);
   emit("change", value);
 }
@@ -68,13 +114,13 @@ label {
   margin-bottom: 0.25rem;
   font-size: 0.875rem;
   font-weight: 500;
-  color: #4a5568;
+  color: var(--color-text-secondary);
 }
 
 .form-control {
   width: 100%;
   padding: 0.5rem;
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--color-border-primary);
   border-radius: 4px;
   font-size: 0.875rem;
   box-sizing: border-box;
@@ -82,7 +128,7 @@ label {
 
 select.form-control {
   appearance: none;
-  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%234a5568' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 0.5rem center;
   background-size: 1em;
@@ -95,11 +141,25 @@ select.form-control {
   gap: 0.5rem;
   margin-top: 0.5rem;
   font-size: 0.8125rem;
-  color: #718096;
+  color: var(--color-text-tertiary);
 }
 
 .helper-text i {
-  color: #4299e1;
+  color: var(--color-accent-dark);
+  font-size: 0.875rem;
+}
+
+.warning-text {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  font-size: 0.8125rem;
+  color: var(--color-warning-dark);
+}
+
+.warning-text i {
+  color: var(--color-warning);
   font-size: 0.875rem;
 }
 
@@ -113,15 +173,15 @@ select.form-control {
 
 .loading-state p {
   margin: 0;
-  color: #718096;
+  color: var(--color-text-tertiary);
   font-size: 0.875rem;
 }
 
 .loading-spinner {
   width: 2rem;
   height: 2rem;
-  border: 2px solid #e2e8f0;
-  border-top-color: #4299e1;
+  border: 2px solid var(--color-border-primary);
+  border-top-color: var(--color-accent);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }

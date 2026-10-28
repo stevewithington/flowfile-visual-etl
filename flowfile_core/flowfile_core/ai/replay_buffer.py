@@ -47,11 +47,8 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_CAP: int = 64
-"""Plan §5.6 default — last 64 frames per session."""
 
 _REWRITE_THRESHOLD_FACTOR: int = 2
-"""Rewrite the on-disk NDJSON when its line count exceeds ``cap * factor``.
-Set to 2 so the rewrite amortises across half the cap's worth of appends."""
 
 _BufferKey = tuple[int, str]
 
@@ -238,7 +235,7 @@ class ReplayBuffer:
         Cursor matched on the integer step suffix (``"{sid}.<step>"``); the
         session-id portion is intentionally **ignored** for cross-restart
         resumes where the cursor's session id is identical-by-construction
-        but a future workstream might want a stricter match.
+        but a stricter match may be worth adding later.
         """
         key = self._key(flow_id, session_id)
         with self._lock_for(key):
@@ -284,9 +281,7 @@ class ReplayBuffer:
             self._buffers.clear()
 
 
-# --------------------------------------------------------------------------- #
-# Process-wide default                                                         #
-# --------------------------------------------------------------------------- #
+# Process-wide default
 
 
 _DEFAULT_BUFFER: ReplayBuffer | None = None

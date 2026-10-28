@@ -9,6 +9,7 @@ from contextlib import contextmanager
 import boto3
 from botocore.client import Config
 
+from test_utils.docker_images import is_image_present
 from test_utils.s3.data_generator import populate_test_data
 from test_utils.s3.demo_data_generator import create_demo_data
 
@@ -21,8 +22,14 @@ MINIO_ACCESS_KEY = os.environ.get("TEST_MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.environ.get("TEST_MINIO_SECRET_KEY", "minioadmin")
 MINIO_CONTAINER_NAME = os.environ.get("TEST_MINIO_CONTAINER", "test-minio-s3")
 MINIO_ENDPOINT_URL = f"http://{MINIO_HOST}:{MINIO_PORT}"
+# MinIO deleted minio/minio from Docker Hub after going source-only; this is the
+# last community image, mirrored into GHCR in case the quay copy goes too.
+DEFAULT_MINIO_IMAGE = "ghcr.io/edwardvaneechoud/flowfile-test-minio:RELEASE.2025-09-07T16-13-09Z"
+UPSTREAM_MINIO_IMAGE = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
+MINIO_IMAGE = os.environ.get("TEST_MINIO_IMAGE", DEFAULT_MINIO_IMAGE)
+# An explicit override is honoured as-is; only the default falls back.
+MINIO_IMAGE_FALLBACK = "" if "TEST_MINIO_IMAGE" in os.environ else UPSTREAM_MINIO_IMAGE
 
-# Operating system detection
 IS_MACOS = os.uname().sysname == 'Darwin' if hasattr(os, 'uname') else False
 IS_WINDOWS = os.name == 'nt'
 
@@ -77,16 +84,14 @@ def stop_minio_container() -> bool:
         try:
             subprocess.run(["docker", "volume", "rm", volume_name], check=False, capture_output=True)
         except Exception:
-            pass  # Ignore errors if volume doesn't exist
+            pass
         return True
 
     logger.info(f"Stopping and cleaning up container '{container_name}' and volume '{volume_name}'...")
     try:
-        # Stop and remove the container
         subprocess.run(["docker", "stop", container_name], check=True, capture_output=True)
         subprocess.run(["docker", "rm", container_name], check=True, capture_output=True)
 
-        # Remove the associated volume to clear all data
         subprocess.run(["docker", "volume", "rm", volume_name], check=True, capture_output=True)
 
         logger.info("✅ MinIO container and data volume successfully removed.")
@@ -104,7 +109,6 @@ def create_test_buckets():
     """Create test buckets and populate with sample data"""
     client = get_minio_client()
 
-    # Create test buckets
     buckets = ['test-bucket', 'flowfile-test', 'sample-data', 'worker-test-bucket', 'demo-bucket']
     for bucket in buckets:
         try:
@@ -128,12 +132,10 @@ def is_docker_available() -> bool:
         logger.info("Skipping Docker on macOS/Windows in CI environment")
         return False
 
-    # If docker executable is not in PATH
     if shutil.which("docker") is None:
         logger.warning("Docker executable not found in PATH")
         return False
 
-    # Try a simple docker command
     try:
         result = subprocess.run(
             ["docker", "info"],
@@ -153,6 +155,47 @@ def is_docker_available() -> bool:
         return False
 
 
+# Auth/existence failures never succeed on a retry; registry 5xx and rate limits do.
+_PERMANENT_PULL_ERRORS = ("denied", "unauthorized", "not found", "manifest unknown")
+
+
+def _image_available(image: str, attempts: int = 3) -> bool:
+    """True if the image is already local or can be pulled, retrying transient pull failures."""
+    if is_image_present(image):
+        return True
+    for attempt in range(1, attempts + 1):
+        logger.info(f"Pulling {image} (attempt {attempt}/{attempts})...")
+        try:
+            result = subprocess.run(["docker", "pull", image], capture_output=True, timeout=600)
+        except subprocess.SubprocessError as exc:
+            logger.warning(f"docker pull {image} errored: {exc}")
+        else:
+            if result.returncode == 0:
+                return True
+            error = result.stderr.decode(errors="replace").strip() or "(no stderr)"
+            logger.warning(f"docker pull {image} failed: {error}")
+            if any(marker in error.lower() for marker in _PERMANENT_PULL_ERRORS):
+                return False
+        if attempt < attempts:
+            time.sleep(2 * attempt)
+    return False
+
+
+def resolve_minio_image() -> str:
+    """The configured image, falling back to the upstream copy when unreachable."""
+    if _image_available(MINIO_IMAGE):
+        return MINIO_IMAGE
+    if MINIO_IMAGE_FALLBACK and _image_available(MINIO_IMAGE_FALLBACK):
+        logger.warning(f"{MINIO_IMAGE} unavailable, using {MINIO_IMAGE_FALLBACK}")
+        return MINIO_IMAGE_FALLBACK
+    logger.error(
+        f"No MinIO image could be pulled ({MINIO_IMAGE}"
+        + (f", {MINIO_IMAGE_FALLBACK}" if MINIO_IMAGE_FALLBACK else "")
+        + "); set TEST_MINIO_IMAGE to a reachable image."
+    )
+    return MINIO_IMAGE
+
+
 def start_minio_container() -> bool:
     """Start MinIO container with initialization"""
     if is_container_running(MINIO_CONTAINER_NAME):
@@ -160,7 +203,6 @@ def start_minio_container() -> bool:
         return True
 
     try:
-        # Start MinIO with volume for persistence
         subprocess.run([
             "docker", "run", "-d",
             "--name", MINIO_CONTAINER_NAME,
@@ -169,10 +211,9 @@ def start_minio_container() -> bool:
             "-e", f"MINIO_ROOT_USER={MINIO_ACCESS_KEY}",
             "-e", f"MINIO_ROOT_PASSWORD={MINIO_SECRET_KEY}",
             "-v", f"{MINIO_CONTAINER_NAME}-data:/data",
-            "minio/minio", "server", "/data", "--console-address", ":9001"
+            resolve_minio_image(), "server", "/data", "--console-address", ":9001"
         ], check=True)
 
-        # Wait for MinIO to be ready
         if wait_for_minio():
             create_test_buckets()
             populate_test_data(endpoint_url=MINIO_ENDPOINT_URL,

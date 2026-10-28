@@ -1,15 +1,13 @@
 import os
-from base64 import encodebytes
 from collections.abc import Callable, Iterable
 from typing import Any
 
 import polars as pl
-import requests
 
 from flowfile_core.configs import logger
-from flowfile_core.configs.settings import AVAILABLE_RAM, WORKER_URL
-from flowfile_core.flowfile.flow_data_engine.subprocess_operations import ExternalDfFetcher, Status
-from flowfile_core.utils.utils import standardize_col_dtype
+from flowfile_core.configs.settings import AVAILABLE_RAM
+from flowfile_core.flowfile.flow_data_engine.subprocess_operations import ExternalDfFetcher
+from shared.excel_writer import write_excel_output
 
 
 def get_data_type(vals: Iterable[Any]):
@@ -79,13 +77,21 @@ def cache_polars_frame_to_temp(_df: pl.LazyFrame | pl.DataFrame, tempdir: str = 
         raise Exception("Could not cache the data")
 
 
-def define_pl_col_transformation(col_name: str, col_type: pl.DataType) -> pl.Expr:
-    if col_type == pl.Datetime:
+def define_pl_col_transformation(
+    col_name: str, col_type: pl.DataType, source_type: pl.DataType | None = None
+) -> pl.Expr:
+    """Cast one column, parsing dates out of text but casting everything else directly.
+
+    ``str.to_date`` / ``str.to_datetime`` raise on a non-string input, so they are only used
+    when the source column is text (or its type is unknown, which keeps the historical
+    behaviour for callers that do not pass ``source_type``).
+    """
+    from_text = source_type is None or source_type == pl.String
+    if col_type == pl.Datetime and from_text:
         return pl.col(col_name).str.to_datetime(strict=False)
-    elif col_type == pl.Date:
+    if col_type == pl.Date and from_text:
         return pl.col(col_name).str.to_date(strict=False)
-    else:
-        return pl.col(col_name).cast(col_type, strict=False)
+    return pl.col(col_name).cast(col_type, strict=False)
 
 
 def execute_write_method(
@@ -95,11 +101,9 @@ def execute_write_method(
     sheet_name: str = None,
     delimiter: str = None,
     write_mode: str = "create",
+    compression: str = None,
 ):
-    if data_type == "excel":
-        logger.info("Writing as excel file")
-        write_method(path, worksheet=sheet_name)
-    elif data_type == "csv":
+    if data_type == "csv":
         logger.info("Writing as csv file")
         if write_mode == "append":
             with open(path, "ab") as f:
@@ -108,37 +112,14 @@ def execute_write_method(
             write_method(path, separator=delimiter, quote_style="always")
     elif data_type == "parquet":
         logger.info("Writing as parquet file")
-        write_method(path)
-
-
-def write_output(
-    _df: pl.LazyFrame,
-    data_type: str,
-    path: str,
-    write_mode: str,
-    sheet_name: str = None,
-    delimiter: str = None,
-    flow_id: int = -1,
-    node_id: int | str = -1,
-) -> Status:
-    serializable_df = _df.serialize()
-    r = requests.post(
-        f"{WORKER_URL}/write_results/",
-        json={
-            "operation": encodebytes(serializable_df).decode(),
-            "data_type": data_type,
-            "path": path,
-            "write_mode": write_mode,
-            "sheet_name": sheet_name,
-            "delimiter": delimiter,
-            "flowfile_node_id": node_id,
-            "flowfile_flow_id": flow_id,
-        },
-    )
-    if r.ok:
-        return Status(**r.json())
-    else:
-        raise Exception(f"Could not cache the data, {r.text}")
+        write_method(path, compression=compression) if compression else write_method(path)
+    elif data_type == "ndjson":
+        logger.info("Writing as ndjson file")
+        # check_extension=False: compressed ndjson otherwise requires a .gz/.zst suffix.
+        write_method(path, compression=compression, check_extension=False) if compression else write_method(path)
+    elif data_type in ("ipc", "avro"):
+        logger.info(f"Writing as {data_type} file")
+        write_method(path, compression=compression) if compression else write_method(path)
 
 
 def local_write_output(
@@ -148,10 +129,15 @@ def local_write_output(
     write_mode: str,
     sheet_name: str = None,
     delimiter: str = None,
+    compression: str = None,
     flow_id: int = -1,
     node_id: int | str = -1,
 ):
     is_lazy = isinstance(_df, pl.LazyFrame)
+    if data_type == "excel":
+        frame = _df.collect() if is_lazy else _df
+        write_excel_output(frame, path=path, sheet_name=sheet_name, write_mode=write_mode)
+        return None
     sink_method_str = "sink_" + data_type
     write_method_str = "write_" + data_type
     has_sink_method = hasattr(_df, sink_method_str)
@@ -172,23 +158,8 @@ def local_write_output(
             sheet_name=sheet_name,
             delimiter=delimiter,
             write_mode=write_mode,
+            compression=compression,
         )
-
-
-def create_pl_df_type_save(raw_data: Iterable[Iterable], orient: str = "row") -> pl.DataFrame:
-    """
-        orient : {'col', 'row'}, default None
-        Whether to interpret two-dimensional data as columns or as rows. If None,
-        the orientation is inferred by matching the columns and data dimensions. If
-        this does not yield conclusive results, column orientation is used.
-    :param raw_data: iterables with values
-    :param orient:
-    :return: polars dataframe
-    """
-    if orient == "row":
-        raw_data = zip(*raw_data, strict=False)
-    raw_data = [standardize_col_dtype(values) for values in raw_data]
-    return pl.DataFrame(raw_data, orient="col")
 
 
 def find_first_positions(lst: list[str]) -> dict[str, int]:

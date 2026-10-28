@@ -1,6 +1,20 @@
-import { ref, type Ref } from "vue";
+import { ref, watch, type Ref } from "vue";
+import { ElMessage } from "element-plus";
 import type { NodeBase } from "../types/node.types";
+import type { GraphOperation } from "../types/flow.types";
 import { useNodeStore } from "../stores/node-store";
+import { useEditorStore } from "../stores/editor-store";
+import { useFlowStore } from "../stores/flow-store";
+import { deleteConnectionOperations, type EdgeLike } from "../utils/graphOperations";
+import { extractSaveErrorMessage } from "./saveError";
+import {
+  isSettingsConflict,
+  loadedSettingsFingerprint,
+  resolveSettingsConflict,
+} from "./settingsConflict";
+import { removeCommittedEdges } from "./useDragAndDrop";
+
+export { extractSaveErrorMessage };
 
 /**
  * Options for configuring the useNodeSettings composable
@@ -23,12 +37,6 @@ export interface UseNodeSettingsOptions<T extends NodeBase> {
    * Useful for validation, refreshing data, or other post-save operations.
    */
   onAfterSave?: () => void | Promise<void>;
-
-  /**
-   * Optional callback to set up validation function for the node.
-   * Called after save to register the validation function with the store.
-   */
-  getValidationFunc?: () => (() => void) | undefined;
 
   /**
    * Whether to automatically set is_setup to true before saving.
@@ -55,10 +63,23 @@ export interface UseNodeSettingsReturn {
   saveSettings: () => Promise<boolean>;
 
   /**
+   * Save settings together with extra graph operations as one atomic undo step
+   * (e.g. dropping the edges a settings change invalidates).
+   */
+  saveSettingsWithOperations: (label: string, operations: GraphOperation[]) => Promise<boolean>;
+
+  /**
+   * Save settings and delete the canvas edges the change invalidates, as one undo step.
+   * The edges leave the canvas only once core accepted the save.
+   */
+  saveSettingsDroppingEdges: (label: string, edges: EdgeLike[]) => Promise<boolean>;
+
+  /**
    * Push node data - standard method called when drawer closes.
    * This is the method that should be exposed via defineExpose.
    */
-  pushNodeData: () => Promise<void>;
+  /** Resolves false when the save was refused, so a caller can skip its success state. */
+  pushNodeData: () => Promise<boolean>;
 
   /**
    * Handle updates from genericNodeSettings component.
@@ -88,7 +109,7 @@ export interface UseNodeSettingsReturn {
  * } = useNodeSettings({
  *   nodeRef: nodeFilter,
  *   onAfterSave: async () => {
- *     await validateNode();
+ *     await refreshPreview();
  *   }
  * });
  *
@@ -110,22 +131,38 @@ export interface UseNodeSettingsReturn {
 export function useNodeSettings<T extends NodeBase>(
   options: UseNodeSettingsOptions<T>,
 ): UseNodeSettingsReturn {
-  const { nodeRef, onBeforeSave, onAfterSave, getValidationFunc, autoSetIsSetup = true } = options;
+  const { nodeRef, onBeforeSave, onAfterSave, autoSetIsSetup = true } = options;
 
   const nodeStore = useNodeStore();
   const isSaving = ref(false);
 
+  // The settings as last loaded or saved; reassigning nodeRef is a load, in-place changes are edits.
+  const snapshot = (): string | null => (nodeRef.value ? JSON.stringify(nodeRef.value) : null);
+  let cleanSnapshot: string | null = null;
+  // "Discard mine" on a conflict: the draft is gone, so a leave no longer waits on it.
+  let discarded = false;
+  watch(
+    nodeRef,
+    () => {
+      cleanSnapshot = snapshot();
+    },
+    { immediate: true },
+  );
+
   /**
    * Save settings to the backend.
    * Can be called without closing the drawer.
+   * Resolves true when nothing is loaded yet: there is nothing to save, so a leave is never blocked.
    */
-  const saveSettings = async (): Promise<boolean> => {
+  const save = async (batch?: {
+    label: string;
+    operations: GraphOperation[];
+  }): Promise<boolean> => {
     if (!nodeRef.value) {
-      console.warn("useNodeSettings: Cannot save - nodeRef is null");
-      return false;
+      console.warn("useNodeSettings: nothing to save - nodeRef is null");
+      return true;
     }
 
-    // Run before save callback
     if (onBeforeSave) {
       const shouldContinue = await onBeforeSave();
       if (shouldContinue === false) {
@@ -135,44 +172,75 @@ export function useNodeSettings<T extends NodeBase>(
 
     isSaving.value = true;
 
+    const saved = async (): Promise<boolean> => {
+      cleanSnapshot = snapshot();
+      // Covers saves outside a leave, such as the request-save on the output-schema tab.
+      useEditorStore().disarmRefusedSave();
+      if (onAfterSave) {
+        await onAfterSave();
+      }
+      return true;
+    };
+
     try {
-      // Auto-set is_setup flag if enabled
       if (autoSetIsSetup && nodeRef.value.is_setup !== undefined) {
         nodeRef.value.is_setup = true;
       }
 
-      // Save to backend
-      await nodeStore.updateSettings(nodeRef);
-
-      // Run after save callback
-      if (onAfterSave) {
-        await onAfterSave();
-      }
-
-      // Register validation function if provided
-      if (getValidationFunc) {
-        const validateFunc = getValidationFunc();
-        if (validateFunc && nodeRef.value) {
-          nodeStore.setNodeValidateFunc(nodeRef.value.node_id, validateFunc);
-        }
-      }
-
-      return true;
+      // The fingerprint the node loaded with: core refuses the save when the settings moved since.
+      const fingerprint = loadedSettingsFingerprint(nodeRef.value.node_id);
+      await (fingerprint
+        ? nodeStore.updateSettings(nodeRef, undefined, batch, { expectedFingerprint: fingerprint })
+        : nodeStore.updateSettings(nodeRef, undefined, batch));
+      return await saved();
     } catch (error) {
+      if (isSettingsConflict(error)) {
+        const outcome = await resolveSettingsConflict(error, async () => {
+          await nodeStore.updateSettings(nodeRef, undefined, batch);
+        });
+        if (outcome === "saved") return await saved();
+        if (outcome === "discarded") {
+          discarded = true;
+          useEditorStore().disarmRefusedSave();
+        }
+        return false;
+      }
       console.error("useNodeSettings: Error saving settings:", error);
+      ElMessage.error({ message: extractSaveErrorMessage(error), showClose: true, duration: 6000 });
       return false;
     } finally {
       isSaving.value = false;
     }
   };
 
+  const saveSettings = (): Promise<boolean> => save();
+
+  const saveSettingsWithOperations = (
+    label: string,
+    operations: GraphOperation[],
+  ): Promise<boolean> => save(operations.length > 0 ? { label, operations } : undefined);
+
+  const saveSettingsDroppingEdges = async (label: string, edges: EdgeLike[]): Promise<boolean> => {
+    if (!(await saveSettingsWithOperations(label, deleteConnectionOperations(edges)))) return false;
+    const vfInstance = useFlowStore().vueFlowInstance;
+    // Any collapsed-group proxy among them goes too: it only stood for these edges.
+    if (vfInstance) {
+      removeCommittedEdges(
+        vfInstance.removeEdges,
+        edges.map((edge) => edge.id),
+      );
+    }
+    return true;
+  };
+
   /**
    * Push node data - called when drawer closes.
    * This wraps saveSettings for the standard drawer lifecycle.
+   * A refused save of settings unchanged since load resolves true, so a fresh node never blocks leaving;
+   * so does a draft the user discarded over a conflict.
    */
-  const pushNodeData = async (): Promise<void> => {
-    await saveSettings();
-  };
+  const pushNodeData = async (): Promise<boolean> =>
+    (await saveSettings()) || discarded || (cleanSnapshot !== null && snapshot() === cleanSnapshot);
 
   /**
    * Handle updates from genericNodeSettings component.
@@ -181,7 +249,6 @@ export function useNodeSettings<T extends NodeBase>(
   const handleGenericSettingsUpdate = (updatedNode: NodeBase): void => {
     if (!nodeRef.value) return;
 
-    // Sync NodeBase properties
     nodeRef.value.cache_results = updatedNode.cache_results;
     nodeRef.value.description = updatedNode.description;
     nodeRef.value.output_field_config = updatedNode.output_field_config;
@@ -194,7 +261,6 @@ export function useNodeSettings<T extends NodeBase>(
       nodeRef.value.pos_y = updatedNode.pos_y;
     }
 
-    // Copy any additional properties that exist on both objects
     for (const key in updatedNode) {
       if (
         key in nodeRef.value &&
@@ -212,6 +278,8 @@ export function useNodeSettings<T extends NodeBase>(
   return {
     isSaving,
     saveSettings,
+    saveSettingsWithOperations,
+    saveSettingsDroppingEdges,
     pushNodeData,
     handleGenericSettingsUpdate,
   };

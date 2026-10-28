@@ -4,8 +4,12 @@ import type {
   DockerStatus,
   ExecuteCellRequest,
   ExecuteResult,
+  FlavourInfo,
+  ImageFlavour,
   KernelConfig,
   KernelInfo,
+  KernelMatchBatchResponse,
+  KernelMatchResponse,
   KernelMemoryInfo,
 } from "../types";
 
@@ -42,6 +46,20 @@ export class KernelApi {
     } catch (error) {
       console.error("API Error: Failed to create kernel:", error);
       const errorMsg = (error as any).response?.data?.detail || "Failed to create kernel";
+      throw new Error(errorMsg);
+    }
+  }
+
+  static async update(kernelId: string, update: { packages: string[] }): Promise<KernelInfo> {
+    try {
+      const response = await axios.patch<KernelInfo>(
+        `${API_BASE_URL}/${encodeURIComponent(kernelId)}`,
+        update,
+      );
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to update kernel:", error);
+      const errorMsg = (error as any).response?.data?.detail || "Failed to update kernel";
       throw new Error(errorMsg);
     }
   }
@@ -89,13 +107,65 @@ export class KernelApi {
     }
   }
 
+  // Errors deliberately throw raw: callers fall back to the plain kernel list
+  // when matching is unavailable.
+  static async matchKernels(
+    dependencies: string[],
+    nodeName?: string,
+  ): Promise<KernelMatchResponse> {
+    const response = await axios.post<KernelMatchResponse>(`${API_BASE_URL}/match`, {
+      dependencies,
+      node_name: nodeName ?? null,
+    });
+    return response.data;
+  }
+
+  // Errors throw raw — readiness badges simply don't render when unavailable.
+  static async matchKernelsBatch(
+    items: Record<string, string[]>,
+  ): Promise<KernelMatchBatchResponse> {
+    const response = await axios.post<KernelMatchBatchResponse>(`${API_BASE_URL}/match/batch`, {
+      items,
+    });
+    return response.data;
+  }
+
+  static async listFlavours(): Promise<FlavourInfo[]> {
+    try {
+      const response = await axios.get<FlavourInfo[]>(`${API_BASE_URL}/flavours`);
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to load kernel flavours:", error);
+      return [];
+    }
+  }
+
+  static async pullImage(flavour: ImageFlavour): Promise<{ pull_state: string }> {
+    try {
+      const response = await axios.post<{ pull_state: string }>(
+        `${API_BASE_URL}/images/${encodeURIComponent(flavour)}/pull`,
+      );
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to start image pull:", error);
+      const errorMsg = (error as any).response?.data?.detail || "Failed to start image pull";
+      throw new Error(errorMsg);
+    }
+  }
+
   static async getDockerStatus(): Promise<DockerStatus> {
     try {
       const response = await axios.get<DockerStatus>(`${API_BASE_URL}/docker-status`);
-      return response.data;
+      // Tolerate older backends that don't yet return `images`.
+      return { ...response.data, images: response.data.images ?? [] };
     } catch (error) {
       console.error("API Error: Failed to check Docker status:", error);
-      return { available: false, image_available: false, error: "Failed to reach server" };
+      return {
+        available: false,
+        image_available: false,
+        images: [],
+        error: "Failed to reach server",
+      };
     }
   }
 
@@ -137,6 +207,22 @@ export class KernelApi {
       return response.data;
     } catch {
       return [];
+    }
+  }
+
+  static async getArtifactPreview(
+    kernelId: string,
+    flowId: number,
+    name: string,
+  ): Promise<DisplayOutput | null> {
+    try {
+      const response = await axios.get<DisplayOutput | null>(
+        `${API_BASE_URL}/${encodeURIComponent(kernelId)}/artifact_preview`,
+        { params: { flow_id: flowId, name } },
+      );
+      return response.data ?? null;
+    } catch {
+      return null;
     }
   }
 

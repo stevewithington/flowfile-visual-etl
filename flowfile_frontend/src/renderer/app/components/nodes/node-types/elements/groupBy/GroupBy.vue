@@ -1,387 +1,408 @@
 <template>
-  <div v-if="dataLoaded && nodeGroupBy">
+  <div v-if="dataLoaded && nodeGroupBy" class="column-picker-host">
     <generic-node-settings
       v-model="nodeGroupBy"
       @update:model-value="handleGenericSettingsUpdate"
       @request-save="saveSettings"
     >
-      <div class="listbox-wrapper">
-        <ul v-if="dataLoaded" class="listbox">
-          <template
-            v-for="(col_schema, index) in nodeData?.main_input?.table_schema"
-            :key="col_schema.name"
-          >
-            <li
-              :class="{ 'is-selected': selectedColumns.includes(col_schema.name) }"
-              draggable="true"
-              @click="handleItemClick(index, col_schema.name, $event)"
-              @contextmenu="openContextMenu(index, col_schema.name, $event)"
-              @dragstart="onDragStart(col_schema.name, $event)"
-              @dragover.prevent
-              @drop="onDrop(index)"
-            >
-              {{ col_schema.name }} ({{ col_schema.data_type }})
-            </li>
-          </template>
-        </ul>
-      </div>
-      <div
-        v-if="showContextMenu"
-        ref="contextMenuRef"
-        class="context-menu"
-        :style="{
-          top: contextMenuPosition.y + 'px',
-          left: contextMenuPosition.x + 'px',
-        }"
+      <column-picker-card
+        ref="picker"
+        :columns="columns"
+        :usage-chips="usageChips"
+        :used-count="usedCount"
+        :column-menu-options="columnMenuOptions"
+        :drop-zones="dropZones"
+        :row-count="rows.length"
+        :settings-count="settingsCountLabel"
+        settings-label="Group by settings"
+        @drop="onDrop"
+        @column-action="onColumnAction"
+        @remove-rows="removeRows"
+        @reveal="flashRows"
+        @drag-change="draggingNames = $event"
       >
-        <button @click="setAggregations('groupby', selectedColumns)">Group by</button>
-        <template v-for="option in singleColumnAggOptions" :key="option.value">
+        <template #selection-actions="{ selectedNames, openMenu }">
           <button
-            v-if="singleColumnSelected"
-            @click="setAggregations(option.value, selectedColumns)"
+            class="btn btn-sm btn-ghost"
+            type="button"
+            title="Add the selected columns as group-by keys"
+            @mousedown.prevent
+            @click="addRows(selectedNames, 'groupby')"
           >
-            {{ option.label }}
+            Group by
+          </button>
+          <button
+            class="btn btn-sm btn-ghost"
+            type="button"
+            title="Aggregate the selected columns"
+            @mousedown.prevent
+            @click="openMenu(selectedNames, $event, 'aggregate')"
+          >
+            Aggregate ▾
           </button>
         </template>
-      </div>
 
-      <div class="listbox-subtitle">Settings</div>
+        <template #row-actions="{ column, openMenu }">
+          <button
+            type="button"
+            class="btn btn-sm btn-ghost btn-icon"
+            :title="`Group by ${column.name}`"
+            :aria-label="`Group by ${column.name}`"
+            @mousedown.prevent
+            @click.stop="addRows([column.name], 'groupby')"
+          >
+            <span class="material-icons" aria-hidden="true">add</span>
+          </button>
+          <button
+            type="button"
+            class="btn btn-sm btn-ghost btn-icon"
+            :title="`Aggregate ${column.name}…`"
+            :aria-label="`Aggregate ${column.name}`"
+            @mousedown.prevent
+            @click.stop="openMenu([column.name], $event, 'aggregate')"
+          >
+            <span class="material-icons" aria-hidden="true">functions</span>
+          </button>
+        </template>
 
-      <div v-if="dataLoaded" class="table-wrapper" @dragover.prevent @drop="onDropInTable">
-        <table class="styled-table">
-          <thead>
-            <tr>
-              <th>Field</th>
-              <th>Action</th>
-              <th>Output Field Name</th>
-            </tr>
-          </thead>
-          <tbody>
-            <template v-for="(item, index) in groupByInput.agg_cols" :key="index">
-              <tr @contextmenu.prevent="openRowContextMenu($event, index)">
-                <td>{{ item.old_name }}</td>
+        <template #strip>
+          <button
+            v-if="duplicateNames.size > 0"
+            type="button"
+            class="picker-flag"
+            :title="`Output names must be unique: ${[...duplicateNames].join(', ')}`"
+            @mousedown.prevent
+            @click="revealDuplicates"
+          >
+            {{ pluralize(duplicateNames.size, "duplicate name") }}
+          </button>
+        </template>
+
+        <template #empty>
+          Drag columns here, or hover a column and use
+          <span class="material-icons" aria-label="add">add</span> /
+          <span class="material-icons" aria-label="aggregate">functions</span>
+        </template>
+
+        <template
+          #settings="{ isRowSelected, activeZone, onRowClick, onRowContextMenu, onRowMouseDown }"
+        >
+          <table class="styled-table column-list group-by-agg-table">
+            <colgroup>
+              <col />
+              <col style="width: 112px" />
+              <col />
+              <col style="width: 34px" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Field</th>
+                <th class="picker-control-header">Action</th>
+                <th class="picker-control-header">Output name</th>
+                <th aria-label="Remove" />
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="(item, index) in rows"
+                :key="index"
+                :class="{
+                  'is-new': flashedRows.has(index),
+                  'is-selected': isRowSelected(index),
+                  'is-stale': !columnNames.has(item.old_name),
+                  'is-drop-after': activeZone !== null && index === rows.length - 1,
+                }"
+                @mousedown="onRowMouseDown"
+                @click="onRowClick(index, $event)"
+                @contextmenu="onRowContextMenu($event, index)"
+              >
+                <td
+                  class="picker-field-cell agg-field-cell"
+                  :title="
+                    columnNames.has(item.old_name)
+                      ? item.old_name
+                      : `${item.old_name} is no longer in the input`
+                  "
+                >
+                  {{ item.old_name }}
+                </td>
                 <td>
-                  <el-select v-model="item.agg" size="small">
+                  <el-select
+                    :model-value="item.agg"
+                    size="small"
+                    @update:model-value="setAgg(item, $event)"
+                  >
                     <el-option
-                      v-for="aggOption in aggOptions"
+                      v-for="aggOption in AGG_OPTIONS"
                       :key="aggOption"
-                      :label="aggOption"
+                      :label="aggLabel(aggOption)"
                       :value="aggOption"
                     />
                   </el-select>
                 </td>
                 <td>
-                  <el-input v-model="item.new_name" class="w-50 m-2" size="small" />
+                  <input
+                    v-model="item.new_name"
+                    class="inline-input"
+                    :class="{ 'is-duplicate': isDuplicateName(item) }"
+                    type="text"
+                    :placeholder="outputNameFor(item.old_name, item.agg)"
+                    :aria-label="`Output name for ${item.old_name}`"
+                    :title="
+                      isDuplicateName(item)
+                        ? 'Another row already uses this output name'
+                        : item.new_name || undefined
+                    "
+                    v-bind="NO_AUTOFILL"
+                  />
+                </td>
+                <td class="row-tools-cell">
+                  <span class="row-tools">
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-ghost btn-icon row-remove"
+                      :title="`Remove ${item.old_name}`"
+                      :aria-label="`Remove ${aggLabel(item.agg)} of ${item.old_name}`"
+                      @mousedown.prevent
+                      @click="removeRow(index)"
+                    >
+                      <span class="material-icons" aria-hidden="true">close</span>
+                    </button>
+                  </span>
                 </td>
               </tr>
-            </template>
-          </tbody>
-        </table>
-      </div>
-      <div
-        v-if="showContextMenuRemove"
-        class="context-menu"
-        :style="{
-          top: contextMenuPosition.y + 'px',
-          left: contextMenuPosition.x + 'px',
-        }"
-      >
-        <button @click="removeRow">Remove</button>
-      </div>
+            </tbody>
+          </table>
+        </template>
+      </column-picker-card>
     </generic-node-settings>
   </div>
   <CodeLoader v-else />
 </template>
 
 <script lang="ts" setup>
-import { ref, onMounted, onUnmounted, computed, nextTick } from "vue";
-import { GroupByInput, NodeGroupBy, AggOption, GroupByOption } from "../../../baseNode/nodeInput";
+import { ref, computed, onUnmounted } from "vue";
 import { CodeLoader } from "vue-content-loader";
-import { NodeData } from "../../../baseNode/nodeInterfaces";
+import type { AggColl, FileColumn, NodeGroupBy } from "../../../baseNode/nodeInput";
+import type { NodeData } from "../../../baseNode/nodeInterfaces";
 import { useNodeStore } from "../../../../../stores/node-store";
 import { useNodeSettings } from "../../../../../composables/useNodeSettings";
+import { NO_AUTOFILL } from "../../../../../utils/noAutofill";
 import GenericNodeSettings from "../../../baseNode/genericNodeSettings.vue";
+import ColumnPickerCard from "../../../baseNode/selectComponents/ColumnPickerCard.vue";
+import type { ContextMenuOption } from "../../../../common";
+import {
+  capUsageChips,
+  pluralize,
+  withoutRows,
+  type DropZoneSpec,
+  type UsageChip,
+} from "../../../baseNode/selectComponents/columnPicker";
+import {
+  AGG_OPTIONS,
+  AGGREGATE_OPTIONS,
+  addAggRows,
+  aggLabel,
+  defaultAggFor,
+  duplicateOutputNames,
+  effectiveOutputName,
+  outputNameFor,
+  renamedForAgg,
+  usageByColumn,
+  usesByAgg,
+  type AggKind,
+} from "./groupByLogic";
 
 const nodeStore = useNodeStore();
 const nodeGroupBy = ref<null | NodeGroupBy>(null);
+const nodeData = ref<null | NodeData>(null);
+const dataLoaded = ref(false);
+const picker = ref<InstanceType<typeof ColumnPickerCard> | null>(null);
 
-// Use the standardized node settings composable
 const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSettings({
   nodeRef: nodeGroupBy,
+  onBeforeSave: () => {
+    // The backend only defaults a missing name, so a blank field gets its placeholder here.
+    rows.value.forEach((row) => {
+      row.new_name = effectiveOutputName(row);
+    });
+    return true;
+  },
   onAfterSave: async () => {
-    await instantValidate();
-  },
-  getValidationFunc: () => {
-    if (nodeGroupBy.value?.groupby_input) {
-      return validateNode;
-    }
-    return undefined;
+    validateConfig();
   },
 });
-const showContextMenu = ref(false);
-const showContextMenuRemove = ref(false);
-const dataLoaded = ref(false);
-const contextMenuPosition = ref({ x: 0, y: 0 });
-const contextMenuColumn = ref<string | null>(null);
-const contextMenuRef = ref<HTMLElement | null>(null);
-const selectedColumns = ref<string[]>([]);
-const nodeData = ref<null | NodeData>(null);
-const aggOptions: (AggOption | GroupByOption)[] = [
-  "groupby",
-  "sum",
-  "max",
-  "median",
-  "min",
-  "count",
-  "n_unique",
-  "first",
-  "last",
-  "concat",
-];
-const firstSelectedIndex = ref<number | null>(null);
-const draggedColumnName = ref<string | null>(null);
 
-const groupByInput = ref<GroupByInput>({
-  agg_cols: [],
+const columns = computed<FileColumn[]>(() => nodeData.value?.main_input?.table_schema ?? []);
+const rows = computed<AggColl[]>(() => nodeGroupBy.value?.groupby_input?.agg_cols ?? []);
+const usage = computed(() => usageByColumn(rows.value));
+const columnNames = computed(() => new Set(columns.value.map((column) => column.name)));
+/** Rows for columns the input no longer has do not count as "in use". */
+const usedCount = computed(
+  () => [...usage.value.keys()].filter((name) => columnNames.value.has(name)).length,
+);
+const duplicateNames = computed(() => duplicateOutputNames(rows.value));
+const isDuplicateName = (item: AggColl) => duplicateNames.value.has(effectiveOutputName(item));
+
+const settingsCountLabel = computed(() => {
+  if (rows.value.length === 0) return "";
+  const keys = rows.value.filter((row) => row.agg === "groupby").length;
+  return `${pluralize(keys, "key")} · ${pluralize(rows.value.length - keys, "aggregation")}`;
 });
 
-const onDragStart = (columnName: string, event: DragEvent) => {
-  draggedColumnName.value = columnName;
-  event.dataTransfer?.setData("text/plain", columnName);
-};
-
-const onDrop = (index: number) => {
-  if (draggedColumnName.value) {
-    const colSchema = nodeData.value?.main_input?.table_schema;
-    if (colSchema) {
-      const fromIndex = colSchema.findIndex((col) => col.name === draggedColumnName.value);
-      if (fromIndex !== -1 && fromIndex !== index) {
-        const [movedColumn] = colSchema.splice(fromIndex, 1);
-        colSchema.splice(index, 0, movedColumn);
-      }
-    }
-    draggedColumnName.value = null;
-  }
-};
-
-const onDropInTable = () => {
-  if (!draggedColumnName.value) return;
-  const column = draggedColumnName.value;
-  const alreadyGroupedBy = groupByInput.value.agg_cols.some(
-    (row) => row.old_name === column && row.agg === "groupby",
+const usageChips = (name: string): UsageChip[] =>
+  capUsageChips(
+    usesByAgg(usage.value.get(name) ?? []).map((use) => ({
+      label: use.agg === "groupby" ? "key" : use.agg,
+      title: `Show the ${aggLabel(use.agg)} ${use.rows.length === 1 ? "row" : "rows"}`,
+      isKey: use.agg === "groupby",
+      rows: use.rows,
+    })),
   );
-  if (!alreadyGroupedBy) {
-    groupByInput.value.agg_cols.push({
-      old_name: column,
-      agg: "groupby",
-      new_name: column,
-    });
+
+// ----- feedback -----
+
+const flashedRows = ref(new Set<number>());
+let flashTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Highlights rows briefly — the feedback for "where did it go?". */
+const flashRows = (indices: number[]) => {
+  flashedRows.value = new Set(indices);
+  if (flashTimer) clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => {
+    flashedRows.value = new Set();
+  }, 1200);
+};
+
+const revealRows = (indices: number[]) => {
+  if (indices.length > 0) void picker.value?.reveal(indices);
+};
+
+const revealDuplicates = () => {
+  revealRows(rows.value.flatMap((row, index) => (isDuplicateName(row) ? [index] : [])));
+};
+
+// ----- edits -----
+
+const addRows = (names: string[], agg: AggKind) => {
+  const input = nodeGroupBy.value?.groupby_input;
+  if (!input || names.length === 0) return;
+  const result = addAggRows(input.agg_cols, names, agg);
+  input.agg_cols = result.rows;
+  revealRows([...result.added, ...result.existing]);
+  picker.value?.clearSelection();
+};
+
+const addDefaultAggregations = (names: string[]) => {
+  const input = nodeGroupBy.value?.groupby_input;
+  if (!input) return;
+  const touched: number[] = [];
+  for (const name of names) {
+    const column = columns.value.find((col) => col.name === name);
+    const result = addAggRows(input.agg_cols, [name], defaultAggFor(column?.data_type));
+    input.agg_cols = result.rows;
+    touched.push(...result.added, ...result.existing);
   }
-  draggedColumnName.value = null;
+  revealRows(touched);
+  picker.value?.clearSelection();
 };
 
-const openRowContextMenu = (event: MouseEvent, index: number) => {
-  event.preventDefault();
-  contextMenuPosition.value = { x: event.clientX, y: event.clientY };
-  contextMenuRowIndex.value = index; // Save the index of the row where the context menu was opened
-  showContextMenuRemove.value = true;
+const setAgg = (item: AggColl, next: string) => {
+  item.new_name = renamedForAgg(item, next);
+  item.agg = next;
 };
 
-const removeRow = () => {
-  if (contextMenuRowIndex.value !== null) {
-    groupByInput.value.agg_cols.splice(contextMenuRowIndex.value, 1);
-  }
-  showContextMenuRemove.value = false; // Hide the context menu after removing the row
-  contextMenuRowIndex.value = null; // Reset the saved index
+const removeRows = (indices: number[]) => {
+  const input = nodeGroupBy.value?.groupby_input;
+  if (input) input.agg_cols = withoutRows(input.agg_cols, indices);
+  flashedRows.value = new Set();
 };
 
-const contextMenuRowIndex = ref<number | null>(null); // New ref to keep track of which row is being interacted with
+const removeRow = (index: number) => picker.value?.removeRows([index]);
 
-const singleColumnSelected = computed(() => selectedColumns.value.length == 1);
+// ----- menus, drops -----
 
-const openContextMenu = (clickedIndex: number, columnName: string, event: MouseEvent) => {
-  event.preventDefault();
-  event.stopPropagation(); // Stop click event from propagating
-  if (!selectedColumns.value.includes(columnName)) {
-    selectedColumns.value = [columnName];
-  }
-  contextMenuPosition.value = { x: event.clientX, y: event.clientY };
-  showContextMenu.value = true;
+const aggregateMenuOptions: ContextMenuOption[] = AGGREGATE_OPTIONS.map((option) => ({
+  label: option.label,
+  action: option.value,
+}));
+
+const columnMenuOptions = (_names: string[], variant: string): ContextMenuOption[] =>
+  variant === "aggregate"
+    ? aggregateMenuOptions
+    : [{ label: "Group by", action: "groupby" }, ...aggregateMenuOptions];
+
+const onColumnAction = (action: string, names: string[]) => addRows(names, action as AggKind);
+
+const draggingNames = ref<string[]>([]);
+
+const dragAggHint = computed(() => {
+  const aggs = new Set(
+    draggingNames.value.map((name) =>
+      defaultAggFor(columns.value.find((col) => col.name === name)?.data_type),
+    ),
+  );
+  return [...aggs].join(" / ");
+});
+
+const dropZones = computed<DropZoneSpec[]>(() => [
+  { value: "groupby", label: "Group by" },
+  { value: "aggregate", label: `Aggregate · ${dragAggHint.value}` },
+]);
+
+const onDrop = (names: string[], zone: string) => {
+  if (zone === "groupby") addRows(names, "groupby");
+  else addDefaultAggregations(names);
 };
 
-const setAggregations = (aggType: AggOption | GroupByOption, columns: string[] | null) => {
-  if (columns) {
-    columns.forEach((column) => {
-      const new_column_name = aggType !== "groupby" ? column + "_" + aggType : column;
-
-      groupByInput.value.agg_cols.push({
-        old_name: column,
-        agg: aggType,
-        new_name: new_column_name,
-      });
-    });
-  }
-  showContextMenu.value = false; // Hide the context menu after selection
-  contextMenuColumn.value = null;
-};
-
-const handleItemClick = (clickedIndex: number, columnName: string, event: MouseEvent) => {
-  if (event.shiftKey && firstSelectedIndex.value !== null) {
-    const range = getRange(firstSelectedIndex.value, clickedIndex);
-    selectedColumns.value = range
-      .map((index) => nodeData.value?.main_input?.columns[index])
-      .filter((col): col is string => col !== undefined);
-  } else {
-    if (firstSelectedIndex.value === clickedIndex) {
-      selectedColumns.value = [];
-    } else {
-      firstSelectedIndex.value = clickedIndex;
-      selectedColumns.value = [columnName];
-    }
-  }
-};
-
-interface SingleColumnAggOption {
-  value: AggOption;
-  label: string;
-}
-
-const singleColumnAggOptions: SingleColumnAggOption[] = [
-  { value: "count", label: "Count" },
-  { value: "max", label: "Max" },
-  { value: "median", label: "Median" },
-  { value: "min", label: "Min" },
-  { value: "sum", label: "Sum" },
-  { value: "n_unique", label: "N_unique" },
-  { value: "first", label: "First" },
-  { value: "last", label: "Last" },
-  { value: "concat", label: "Concat" },
-];
-
-const getRange = (start: number, end: number) => {
-  return start < end
-    ? [...Array(end - start + 1).keys()].map((i) => i + start)
-    : [...Array(start - end + 1).keys()].map((i) => i + end);
-};
-
-const loadData = async (nodeId: number) => {
-  nodeData.value = await nodeStore.getNodeData(nodeId, false);
-  nodeGroupBy.value = nodeData.value?.setting_input;
-  if (nodeData.value) {
-    if (nodeGroupBy.value) {
-      if (nodeGroupBy.value.groupby_input) {
-        groupByInput.value = nodeGroupBy.value.groupby_input;
-      } else {
-        nodeGroupBy.value.groupby_input = groupByInput.value;
-      }
-    }
-  }
-};
+// ----- lifecycle -----
 
 const loadNodeData = async (nodeId: number) => {
-  loadData(nodeId);
+  nodeData.value = await nodeStore.getNodeData(nodeId, false);
+  const settings = nodeData.value?.setting_input ?? null;
+  if (settings) {
+    if (!settings.groupby_input) settings.groupby_input = { agg_cols: [] };
+    if (!settings.groupby_input.agg_cols) settings.groupby_input.agg_cols = [];
+  }
+  nodeGroupBy.value = settings;
   dataLoaded.value = true;
+  validateConfig();
 };
 
-const handleClickOutside = (event: MouseEvent) => {
-  if (!contextMenuRef.value?.contains(event.target as Node)) {
-    showContextMenu.value = false;
-    contextMenuColumn.value = null;
-    showContextMenuRemove.value = false;
+// Missing-column warnings come from the backend settings validation; this only
+// covers configuration completeness the backend does not check.
+const validateConfig = () => {
+  if (!nodeGroupBy.value) return;
+  const nodeId = nodeGroupBy.value.node_id;
+  if (rows.value.length === 0) {
+    nodeStore.setNodeValidation(nodeId, {
+      isValid: false,
+      error: "Please select at least one field.",
+    });
+  } else if (duplicateNames.value.size > 0) {
+    nodeStore.setNodeValidation(nodeId, {
+      isValid: false,
+      error: `Output names must be unique: ${[...duplicateNames.value].join(", ")}`,
+    });
+  } else {
+    nodeStore.setNodeValidation(nodeId, { isValid: true, error: "" });
   }
 };
 
-const getMissingColumns = (availableColumns: string[], usedColumns: string[]): string[] => {
-  const availableSet = new Set(availableColumns);
-  return Array.from(new Set(usedColumns.filter((usedColumn) => !availableSet.has(usedColumn))));
-};
-
-const missingColumns = computed(() => {
-  if (nodeData.value && nodeData.value.main_input?.columns) {
-    return getMissingColumns(
-      nodeData.value.main_input?.columns,
-      groupByInput.value.agg_cols.map((col) => col.old_name),
-    );
-  }
-  return [];
+onUnmounted(() => {
+  if (flashTimer) clearTimeout(flashTimer);
 });
-
-const calculateMissingColumns = (): string[] => {
-  if (nodeData.value && nodeData.value.main_input?.columns) {
-    return getMissingColumns(
-      nodeData.value.main_input?.columns,
-      groupByInput.value.agg_cols.map((col) => col.old_name),
-    );
-  }
-  return [];
-};
-
-const validateNode = async () => {
-  if (nodeGroupBy.value?.groupby_input) {
-    await loadData(Number(nodeGroupBy.value.node_id));
-  }
-  const missingColumnsLocal = calculateMissingColumns();
-  if (missingColumnsLocal.length > 0 && nodeGroupBy.value) {
-    nodeStore.setNodeValidation(nodeGroupBy.value.node_id, {
-      isValid: false,
-      error: `The fields ${missingColumns.value.join(", ")} are missing in the available columns.`,
-    });
-  } else if (nodeGroupBy.value?.groupby_input.agg_cols.length == 0) {
-    nodeStore.setNodeValidation(nodeGroupBy.value.node_id, {
-      isValid: false,
-      error: "Please select at least one field.",
-    });
-  } else if (nodeGroupBy.value) {
-    nodeStore.setNodeValidation(nodeGroupBy.value.node_id, {
-      isValid: true,
-      error: "",
-    });
-  }
-};
-
-const instantValidate = async () => {
-  if (missingColumns.value.length > 0 && nodeGroupBy.value) {
-    nodeStore.setNodeValidation(nodeGroupBy.value.node_id, {
-      isValid: false,
-      error: `The fields ${missingColumns.value.join(", ")} are missing in the available columns.`,
-    });
-  } else if (nodeGroupBy.value?.groupby_input.agg_cols.length == 0) {
-    nodeStore.setNodeValidation(nodeGroupBy.value.node_id, {
-      isValid: false,
-      error: "Please select at least one field.",
-    });
-  } else if (nodeGroupBy.value) {
-    nodeStore.setNodeValidation(nodeGroupBy.value.node_id, {
-      isValid: true,
-      error: "",
-    });
-  }
-};
 
 defineExpose({
   loadNodeData,
   pushNodeData,
   saveSettings,
 });
-
-onMounted(async () => {
-  await nextTick();
-  window.addEventListener("click", handleClickOutside);
-});
-
-onUnmounted(() => {
-  window.removeEventListener("click", handleClickOutside);
-});
 </script>
 
 <style scoped>
-/* Context menu styles are now centralized in styles/components/_context-menu.css */
-
-.table-wrapper {
-  max-height: 300px;
-  box-shadow: var(--shadow-sm);
-  border-radius: var(--border-radius-lg);
-  overflow: auto;
-  margin: var(--spacing-1);
+.group-by-agg-table .inline-input.is-duplicate {
+  border-color: var(--color-danger);
+  box-shadow: 0 0 0 2px var(--color-focus-ring-error);
 }
 </style>

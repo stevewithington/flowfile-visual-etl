@@ -13,9 +13,19 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Any
 
-# ---------------------------------------------------------------------------
+from flowfile_frame._console_source import console_function_source
+
 # Low-level extraction helpers
-# ---------------------------------------------------------------------------
+
+
+def _read_source(func) -> str | None:
+    """``inspect.getsource(func)``, else the text a console recorded (``_console_source``); ``None`` if neither."""
+    try:
+        return inspect.getsource(func)
+    except OSError:
+        return console_function_source(func)
+    except TypeError:
+        return None
 
 
 def _get_function_source(func) -> tuple[str | None, bool]:
@@ -25,17 +35,13 @@ def _get_function_source(func) -> tuple[str | None, bool]:
     Returns:
         tuple: (source_code, is_module_level)
     """
-    try:
-        source = inspect.getsource(func)
-
-        if func.__name__ == "<lambda>":
-            return None, False
-
-        is_module_level = func.__code__.co_flags & 0x10 == 0
-        source = textwrap.dedent(source)
-        return source, is_module_level
-    except (OSError, TypeError):
+    source = _read_source(func)
+    if source is None or func.__name__ == "<lambda>":
         return None, False
+
+    is_module_level = func.__code__.co_flags & 0x10 == 0
+    source = textwrap.dedent(source)
+    return source, is_module_level
 
 
 def _is_safely_representable(value: Any) -> bool:
@@ -62,9 +68,8 @@ def _extract_lambda_source(func) -> tuple[str | None, str | None]:
     Returns:
         (function_definition_source, function_name) or (None, None) on failure.
     """
-    try:
-        source = inspect.getsource(func)
-    except (OSError, TypeError):
+    source = _read_source(func)
+    if source is None:
         return None, None
 
     source = textwrap.dedent(source).strip()
@@ -78,7 +83,6 @@ def _extract_lambda_source(func) -> tuple[str | None, str | None]:
     if not lambdas:
         return None, None
 
-    # Match the lambda to our function based on argument names
     expected_args = list(func.__code__.co_varnames[: func.__code__.co_argcount])
     matched_lambda = None
     for lambda_node in lambdas:
@@ -95,7 +99,6 @@ def _extract_lambda_source(func) -> tuple[str | None, str | None]:
     args_str = ast.unparse(matched_lambda.args)
     body_str = ast.unparse(matched_lambda.body)
 
-    # Capture closure variables
     closure_defs: list[str] = []
     if func.__code__.co_freevars and func.__closure__:
         for var_name, cell in zip(func.__code__.co_freevars, func.__closure__, strict=False):
@@ -107,23 +110,19 @@ def _extract_lambda_source(func) -> tuple[str | None, str | None]:
             if _is_safely_representable(value):
                 closure_defs.append(f"{var_name} = {repr(value)}")
             elif callable(value) and hasattr(value, "__name__") and value.__name__ != "<lambda>":
-                # Closure variable is a named function — extract its source
                 source, _ = _get_function_source(value)
                 if source:
                     closure_defs.append(source)
                 else:
                     return None, None
             elif callable(value) and hasattr(value, "__name__") and value.__name__ == "<lambda>":
-                # Closure variable is itself a lambda — recurse
                 inner_def, inner_name = _extract_lambda_source(value)
                 if inner_def and inner_name:
-                    # Assign the generated function to the variable name used in the outer lambda
                     closure_defs.append(inner_def)
                     closure_defs.append(f"{var_name} = {inner_name}")
                 else:
                     return None, None
             else:
-                # Cannot safely serialize this closure variable
                 return None, None
 
     lines: list[str] = []
@@ -136,9 +135,7 @@ def _extract_lambda_source(func) -> tuple[str | None, str | None]:
     return "\n".join(lines), func_name
 
 
-# ---------------------------------------------------------------------------
 # High-level resolution
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -182,9 +179,7 @@ def resolve_callable(func: Any) -> ResolvedCallable:
     return ResolvedCallable(source=None, name=repr(func), resolved=False)
 
 
-# ---------------------------------------------------------------------------
 # Batch argument processing
-# ---------------------------------------------------------------------------
 
 
 @dataclass

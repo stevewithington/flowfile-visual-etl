@@ -92,6 +92,34 @@
       </div>
     </div>
 
+    <div class="card mb-3">
+      <div class="card-header">
+        <h3 class="card-title">Kafka Syncs</h3>
+        <button
+          class="btn btn-primary"
+          :disabled="connections.length === 0"
+          @click="showCreateSync = true"
+        >
+          <i class="fa-solid fa-rotate"></i> Create Sync
+        </button>
+      </div>
+      <div class="card-content">
+        <div class="info-box">
+          <i class="fa-solid fa-info-circle"></i>
+          <div>
+            <p><strong>What is a Kafka sync?</strong></p>
+            <p>
+              A sync creates a flow that streams messages from a Kafka topic into a catalog table.
+              The flow appears in the Catalog, where you can schedule it to run automatically.
+            </p>
+            <p v-if="connections.length === 0" class="hint-text">
+              Add a Kafka connection above before creating a sync.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Add/Edit Modal -->
     <el-dialog
       v-model="dialogVisible"
@@ -138,12 +166,19 @@
         </div>
       </template>
     </el-dialog>
+
+    <CreateSyncModal
+      :visible="showCreateSync"
+      @close="showCreateSync = false"
+      @created="handleSyncCreated"
+    />
   </div>
 </template>
 
 <script lang="ts" setup>
 import { ref, onMounted } from "vue";
-import { ElDialog, ElButton, ElMessage } from "element-plus";
+import { useRouter } from "vue-router";
+import { ElDialog, ElButton, ElMessage, ElMessageBox } from "element-plus";
 import {
   fetchKafkaConnections,
   createKafkaConnection,
@@ -153,6 +188,9 @@ import {
 } from "./api";
 import type { KafkaConnectionOut, KafkaConnectionCreate } from "./KafkaConnectionTypes";
 import KafkaConnectionSettings from "./KafkaConnectionSettings.vue";
+import CreateSyncModal from "./CreateSyncModal.vue";
+
+const router = useRouter();
 
 // State
 const connections = ref<KafkaConnectionOut[]>([]);
@@ -166,8 +204,22 @@ const testingConnectionId = ref<number | null>(null);
 const connectionToDelete = ref<KafkaConnectionOut | null>(null);
 const activeConnection = ref<KafkaConnectionCreate | undefined>(undefined);
 const editingConnectionId = ref<number | null>(null);
+const showCreateSync = ref(false);
 
-// Fetch connections
+const handleSyncCreated = async (flowId: number) => {
+  showCreateSync.value = false;
+  try {
+    await ElMessageBox.confirm(
+      "The sync flow was added to your Catalog. Set up a schedule so it runs automatically?",
+      "Sync created",
+      { confirmButtonText: "Set up schedule", cancelButtonText: "Later", type: "success" },
+    );
+    router.push({ name: "catalog", query: { tab: "schedules", scheduleFlowId: String(flowId) } });
+  } catch {
+    // "Later" — stay on the Kafka page; the sync is already created.
+  }
+};
+
 const fetchConnections = async () => {
   isLoading.value = true;
   try {
@@ -180,7 +232,6 @@ const fetchConnections = async () => {
   }
 };
 
-// Show add modal
 const showAddModal = () => {
   isEditing.value = false;
   editingConnectionId.value = null;
@@ -188,7 +239,6 @@ const showAddModal = () => {
   dialogVisible.value = true;
 };
 
-// Show edit modal
 const showEditModal = (connection: KafkaConnectionOut) => {
   isEditing.value = true;
   editingConnectionId.value = connection.id;
@@ -208,13 +258,11 @@ const showEditModal = (connection: KafkaConnectionOut) => {
   dialogVisible.value = true;
 };
 
-// Show delete confirmation
 const showDeleteModal = (connection: KafkaConnectionOut) => {
   connectionToDelete.value = connection;
   deleteDialogVisible.value = true;
 };
 
-// Handle form submit
 const handleFormSubmit = async (connection: KafkaConnectionCreate) => {
   isSubmitting.value = true;
   try {
@@ -235,7 +283,6 @@ const handleFormSubmit = async (connection: KafkaConnectionCreate) => {
   }
 };
 
-// Handle test connection
 const handleTestConnection = async (connectionId: number) => {
   testingConnectionId.value = connectionId;
   try {
@@ -252,7 +299,6 @@ const handleTestConnection = async (connectionId: number) => {
   }
 };
 
-// Handle delete connection
 const handleDeleteConnection = async () => {
   if (!connectionToDelete.value) return;
 
@@ -270,7 +316,6 @@ const handleDeleteConnection = async () => {
   }
 };
 
-// Dialog close handlers
 const handleCloseDialog = (done: () => void) => {
   if (isSubmitting.value) return;
   done();
@@ -281,7 +326,6 @@ const handleCloseDeleteDialog = (done: () => void) => {
   done();
 };
 
-// Load connections on mount
 onMounted(() => {
   fetchConnections();
 });

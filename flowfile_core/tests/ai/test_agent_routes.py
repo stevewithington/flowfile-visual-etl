@@ -45,9 +45,7 @@ from flowfile_core.configs.settings import FEATURE_FLAG_AI
 from flowfile_core.flowfile.flow_graph import FlowGraph
 from flowfile_core.schemas import input_schema, schemas
 
-# --------------------------------------------------------------------------- #
-# Test helpers #
-# --------------------------------------------------------------------------- #
+# Test helpers
 
 
 def _flow_settings(flow_id: int = 1) -> schemas.FlowSettings:
@@ -123,6 +121,7 @@ def authed_client() -> Iterator[TestClient]:
 def registered_flow() -> Iterator[FlowGraph]:
     flow = _flow_with_orders()
     flow_file_handler._flows[flow.flow_id] = flow
+    flow_file_handler._register_user_session(1, flow.flow_id)
     try:
         yield flow
     finally:
@@ -157,9 +156,7 @@ def _filter_args() -> dict[str, Any]:
     }
 
 
-# --------------------------------------------------------------------------- #
-# Start #
-# --------------------------------------------------------------------------- #
+# Start
 
 
 def test_start_streams_planner_events(
@@ -285,7 +282,7 @@ def test_start_persists_selected_node_ids_on_session(
     session = sessions.get_session("w57-selected-roundtrip", user_id=1)
     assert session is not None
     assert session.selected_node_ids == [1, 2]
-    # Pinned defaults to empty until a future workstream wires it.
+    # Pinned defaults to empty until it is wired up.
     assert session.pinned_node_ids == []
 
 
@@ -318,12 +315,72 @@ def test_start_defaults_selected_node_ids_to_empty_when_omitted(
     assert session.selected_node_ids == []
 
 
+def test_start_omitted_max_steps_uses_session_default(
+    authed_client: TestClient,
+    registered_flow: FlowGraph,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting ``max_steps`` leaves the session at the default 32 and marks it
+    non-explicit (so plan auto-scaling stays enabled)."""
+    fake = _FakeProvider(
+        tool_calls_per_step=[[ToolCall(id="t1", name="flowfile.graph.add_filter", arguments=_filter_args())]]
+    )
+    monkeypatch.setattr(agent_routes_module, "get_configured_provider", lambda *_a, **_kw: fake)
+
+    response = authed_client.post(
+        "/ai/agent/start",
+        json={
+            "flow_id": 1,
+            "prompt": "filter to EU",
+            "surface": "agent_complex",
+            "provider": "anthropic",
+            "session_id": "max-steps-default",
+        },
+    )
+    assert response.status_code == 200
+    response.text  # noqa: B018
+    session = sessions.get_session("max-steps-default", user_id=1)
+    assert session is not None
+    assert session.max_steps == 32
+    assert session.max_steps_explicit is False
+
+
+def test_start_explicit_max_steps_is_respected_and_marked(
+    authed_client: TestClient,
+    registered_flow: FlowGraph,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied ``max_steps`` is stored verbatim and flagged explicit
+    so it becomes a hard ceiling (no plan auto-scale past it)."""
+    fake = _FakeProvider(
+        tool_calls_per_step=[[ToolCall(id="t1", name="flowfile.graph.add_filter", arguments=_filter_args())]]
+    )
+    monkeypatch.setattr(agent_routes_module, "get_configured_provider", lambda *_a, **_kw: fake)
+
+    response = authed_client.post(
+        "/ai/agent/start",
+        json={
+            "flow_id": 1,
+            "prompt": "filter to EU",
+            "surface": "agent_complex",
+            "provider": "anthropic",
+            "session_id": "max-steps-explicit",
+            "max_steps": 12,
+        },
+    )
+    assert response.status_code == 200
+    response.text  # noqa: B018
+    session = sessions.get_session("max-steps-explicit", user_id=1)
+    assert session is not None
+    assert session.max_steps == 12
+    assert session.max_steps_explicit is True
+
+
 def test_start_422_session_id_collision(
     authed_client: TestClient,
     registered_flow: FlowGraph,
     patch_provider: _FakeProvider,
 ) -> None:
-    # Pre-register a session with a known id.
     snap = sessions.capture_graph_snapshot(registered_flow)
     sessions.register_session(
         sessions.AgentSession(
@@ -347,9 +404,7 @@ def test_start_422_session_id_collision(
     assert response.status_code == 422
 
 
-# --------------------------------------------------------------------------- #
-# Resume #
-# --------------------------------------------------------------------------- #
+# Resume
 
 
 def test_resume_discard_returns_json(
@@ -376,7 +431,6 @@ def test_resume_discard_returns_json(
     body = response.json()
     assert body["status"] == "discarded"
     assert body["session_id"] == sess.session_id
-    # Popped from store.
     assert sessions.get_session(sess.session_id) is None
 
 
@@ -385,7 +439,7 @@ def test_resume_continue_streams(
     registered_flow: FlowGraph,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake = _FakeProvider(tool_calls_per_step=[])  # just an empty/stop turn
+    fake = _FakeProvider(tool_calls_per_step=[])
     monkeypatch.setattr(agent_routes_module, "get_configured_provider", lambda *_a, **_kw: fake)
 
     snap = sessions.capture_graph_snapshot(registered_flow)
@@ -406,7 +460,7 @@ def test_resume_continue_streams(
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     body = response.text
-    assert "event: info" in body  # the resume re-snapshot info event
+    assert "event: info" in body
     assert "event: complete" in body
 
 
@@ -463,9 +517,7 @@ def test_resume_404_cross_user(
     assert response.status_code == 404
 
 
-# --------------------------------------------------------------------------- #
-# Abort #
-# --------------------------------------------------------------------------- #
+# Abort
 
 
 def test_abort_idempotent_on_completed(authed_client: TestClient, registered_flow: FlowGraph) -> None:
@@ -511,9 +563,7 @@ def test_abort_flips_running_session(authed_client: TestClient, registered_flow:
     assert sessions.get_session(sess.session_id).status == "aborted"
 
 
-# --------------------------------------------------------------------------- #
-# Get state #
-# --------------------------------------------------------------------------- #
+# Get state
 
 
 def test_get_state_404_unknown(authed_client: TestClient) -> None:
@@ -540,14 +590,11 @@ def test_get_state_returns_snapshot(authed_client: TestClient, registered_flow: 
     assert body["status"] == "running"
     assert body["step_count"] == 2
     assert body["staged_count"] == 0
-    # Internal fields not exposed.
     assert "messages" not in body
     assert "snapshot" not in body
 
 
-# --------------------------------------------------------------------------- #
-# Feature flag #
-# --------------------------------------------------------------------------- #
+# Feature flag
 
 
 def test_503_when_feature_flag_off(
@@ -558,26 +605,21 @@ def test_503_when_feature_flag_off(
     original = FEATURE_FLAG_AI.value
     FEATURE_FLAG_AI.set(False)
     try:
-        # Start
         r1 = authed_client.post(
             "/ai/agent/start",
             json={"flow_id": 1, "prompt": "x", "provider": "anthropic"},
         )
         assert r1.status_code == 503
 
-        # Abort
         r2 = authed_client.post("/ai/agent/anything/abort")
         assert r2.status_code == 503
 
-        # Get
         r3 = authed_client.get("/ai/agent/anything")
         assert r3.status_code == 503
 
-        # Resume
         r4 = authed_client.post("/ai/agent/anything/resume", json={"action": "discard"})
         assert r4.status_code == 503
 
-        # Followup
         r5 = authed_client.post(
             "/ai/agent/anything/followup",
             json={"action": "user_message", "message": "x"},
@@ -587,9 +629,7 @@ def test_503_when_feature_flag_off(
         FEATURE_FLAG_AI.set(original)
 
 
-# --------------------------------------------------------------------------- #
-# Followup endpoint #
-# --------------------------------------------------------------------------- #
+# Followup endpoint
 
 
 def _completed_session(flow_id: int = 1, *, status: str = "completed") -> sessions.AgentSession:
@@ -646,10 +686,9 @@ def test_w49_followup_user_message_streams_sse(
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     body = response.text
-    assert "event: info" in body  # the followup-resume preamble info event
+    assert "event: info" in body
     assert "event: complete" in body or "event: awaiting_user_input" in body
 
-    # Conversation history now carries the synthetic user message.
     refreshed = sessions.get_session(sess.session_id, user_id=1)
     assert refreshed is not None
     user_msgs = [m for m in refreshed.messages if m.role == "user"]
@@ -713,7 +752,6 @@ def test_w49_followup_rejected_diff_generic_fallback_when_no_note(
     assert refreshed is not None
     rejection_msgs = [m for m in refreshed.messages if m.role == "user" and "rejected" in (m.content or "").lower()]
     assert rejection_msgs
-    # Generic placeholder is included.
     assert "no specific reason" in rejection_msgs[-1].content.lower()
 
 
@@ -741,7 +779,7 @@ def test_w49_followup_404_cross_user(
     snap = sessions.capture_graph_snapshot(registered_flow)
     sess = sessions.AgentSession(
         flow_id=1,
-        user_id=2,  # different user
+        user_id=2,
         user_prompt="x",
         provider_name="anthropic",
         snapshot=snap,

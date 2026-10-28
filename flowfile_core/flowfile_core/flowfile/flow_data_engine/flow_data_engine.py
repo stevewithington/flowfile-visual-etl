@@ -1,4 +1,3 @@
-# Standard library imports
 from __future__ import annotations
 
 import logging
@@ -14,21 +13,17 @@ if TYPE_CHECKING:
     from flowfile_core.flowfile.flow_node.multi_output import NamedOutputs
 
 import polars as pl
-
-# Third-party imports
 from loky import Future
 from pl_fuzzy_frame_match import FuzzyMapping, fuzzy_match_dfs
+from pl_fuzzy_frame_match.output_column_name_utils import set_name_in_fuzzy_mappings
 from polars.exceptions import PanicException
 from polars_expr_transformer import simple_function_to_expr as to_expr
 from polars_grouper import graph_solver
 from pyarrow import Table as PaTable
 from pyarrow.parquet import ParquetFile
 
-# Local imports - Core
 from flowfile_core.configs import logger
 from flowfile_core.configs.flow_logger import NodeLogger
-
-# Local imports - Flow File Components
 from flowfile_core.flowfile.flow_data_engine import utils
 from flowfile_core.flowfile.flow_data_engine.cloud_storage_reader import (
     CloudStorageReader,
@@ -45,12 +40,16 @@ from flowfile_core.flowfile.flow_data_engine.flow_file_column.utils import (
     cast_str_to_polars_type,
     get_polars_type,
 )
+from flowfile_core.flowfile.flow_data_engine.formula_entries import FormulaEntry, apply_formula_entries
 from flowfile_core.flowfile.flow_data_engine.fuzzy_matching.prepare_for_fuzzy_match import prepare_for_fuzzy_match
+from flowfile_core.flowfile.flow_data_engine.hierarchy import explode_hierarchy_frame
 from flowfile_core.flowfile.flow_data_engine.join import (
     get_col_name_to_delete,
+    get_duplicate_output_problems,
+    get_join_map_problems,
+    get_shared_output_name_problems,
     get_undo_rename_mapping_join,
     rename_df_table_for_join,
-    verify_join_map_integrity,
     verify_join_select_integrity,
 )
 from flowfile_core.flowfile.flow_data_engine.polars_code_parser import polars_code_parser
@@ -58,7 +57,6 @@ from flowfile_core.flowfile.flow_data_engine.sample_data import create_fake_data
 from flowfile_core.flowfile.flow_data_engine.subprocess_operations.subprocess_operations import (
     ExternalCreateFetcher,
     ExternalDfFetcher,
-    ExternalExecutorTracker,
     ExternalFuzzyMatchFetcher,
     fetch_unique_values,
 )
@@ -76,8 +74,31 @@ from shared.cloud_storage import (
 )
 from shared.cloud_storage.utils import normalize_delta_path
 from shared.cloud_storage.writers import write_to_cloud
+from shared.db_writer import write_dataframe_to_database
+from shared.path_utils import (
+    DirectoryScanUnsupportedError,
+    assert_directory_scan_supported,
+    is_url,
+    refuse_cloud_path,
+)
 
 T = TypeVar("T", pl.DataFrame, pl.LazyFrame)
+
+# Stamped by the cloud readers so __len__/get_number_of_records never query the
+# provider for a count; a placeholder, never a real total.
+CLOUD_PLACEHOLDER_RECORD_COUNT = 6_666_666
+
+
+def _minimal_field_dtype(field: input_schema.MinimalFieldInfo) -> pl.DataType | None:
+    """Polars dtype for a RawData column, or None (let polars infer) when it needs an inner type.
+
+    Nested types (List/Struct/Array) can't be instantiated from a bare name, so
+    nested data is inferred rather than rejected.
+    """
+    try:
+        return FlowfileColumn.create_from_minimal_field_info(field).get_polars_type().pl_datatype
+    except TypeError:
+        return None
 
 
 def _handle_duplication_join_keys(
@@ -128,22 +149,6 @@ def _handle_duplication_join_keys(
     return left_df, right_df, reverse_actions
 
 
-def ensure_right_unselect_for_semi_and_anti_joins(join_input: transform_schemas.JoinInput) -> None:
-    """Modifies JoinInput for semi/anti joins to not keep right-side columns.
-
-    For 'semi' and 'anti' joins, Polars only returns columns from the left
-    DataFrame. This function enforces that behavior by modifying the `join_input`
-    in-place, setting the `keep` flag to `False` for all columns in the
-    right-side selection.
-
-    Args:
-        join_input: The JoinInput settings object to modify.
-    """
-    if join_input.how in ("semi", "anti"):
-        for jk in join_input.right_select.renames:
-            jk.keep = False
-
-
 def get_select_columns(full_select_input: list[transform_schemas.SelectInput]) -> list[str]:
     """Extracts a list of column names to be selected from a SelectInput list.
 
@@ -158,6 +163,63 @@ def get_select_columns(full_select_input: list[transform_schemas.SelectInput]) -
         A list of column names to be selected.
     """
     return [v.old_name for v in full_select_input if (v.keep or v.join_key) and v.is_available]
+
+
+def _build_window_expr(
+    w: transform_schemas.WindowFunctionInput, partition_by: list[str]
+) -> pl.Expr:
+    """Builds a Polars expression for a single window-function operation.
+
+    Expected to be applied after any ``order_by`` sort has been performed on
+    the frame; tile and cumulative operations rely on row position rather
+    than on ``order_by`` inside ``over()``.
+    """
+
+    def over(expr: pl.Expr) -> pl.Expr:
+        return expr.over(partition_by) if partition_by else expr
+
+    func = w.function
+
+    if func.startswith("rolling_"):
+        behavior = w.edge_behavior or "require_full"
+        kwargs: dict[str, Any] = {"window_size": w.window_size}
+        if behavior in ("partial", "fill_zero"):
+            kwargs["min_samples"] = 1
+        elif w.min_periods is not None:
+            kwargs["min_samples"] = w.min_periods
+        expr = getattr(pl.col(w.column), func)(**kwargs)
+        if behavior == "fill_zero":
+            expr = expr.fill_null(0)
+        return over(expr).alias(w.new_column_name)
+
+    if func.startswith("cum_") or transform_schemas.is_aggregate_window_function(func):
+        expr = getattr(pl.col(w.column), func)()
+        return over(expr).alias(w.new_column_name)
+
+    if func == "rank":
+        expr = pl.col(w.column).rank(method=w.rank_method or "ordinal")
+        return over(expr).alias(w.new_column_name)
+
+    if func == "tile":
+        n = int(w.number_of_groups)
+        if partition_by:
+            group_len = pl.len().over(partition_by)
+            pos = pl.int_range(pl.len()).over(partition_by)
+        else:
+            group_len = pl.len()
+            pos = pl.int_range(pl.len())
+        big_size = (group_len + n - 1) // n  # ceil(N/n)
+        threshold = (group_len % n) * big_size
+        small_size = pl.max_horizontal(group_len // n, pl.lit(1))
+        tile = (
+            pl.when(pos < threshold)
+            .then(pos // big_size + 1)
+            .otherwise((pos - threshold) // small_size + (group_len % n) + 1)
+            .cast(pl.Int64)
+        )
+        return tile.alias(w.new_column_name)
+
+    raise ValueError(f"Unsupported window function: {func!r}")
 
 
 @dataclass
@@ -337,13 +399,7 @@ class FlowDataEngine:
         Args:
             raw_data: An instance of `RawData` containing the data and schema.
         """
-        flowfile_schema = list(FlowfileColumn.create_from_minimal_field_info(c) for c in raw_data.columns)
-        polars_schema = pl.Schema(
-            [
-                (flowfile_column.column_name, flowfile_column.get_polars_type().pl_datatype)
-                for flowfile_column in flowfile_schema
-            ]
-        )
+        polars_schema = [(field.name, _minimal_field_dtype(field)) for field in raw_data.columns]
         try:
             df = pl.DataFrame(raw_data.data, polars_schema, strict=False)
         except TypeError as e:
@@ -404,8 +460,8 @@ class FlowDataEngine:
         write_settings = settings.write_settings
         logger.info(f"Writing to {connection.storage_type} storage: {write_settings.resource_path}")
 
+        # Executes in this process, so the plan is never serialized: the plain options are safe here.
         storage_options = CloudStorageReader.get_storage_options(connection)
-        credential_provider = CloudStorageReader.get_credential_provider(connection)
         use_pyarrow = CloudStorageReader.use_pyarrow_for_gcs(connection)
 
         write_to_cloud(
@@ -416,22 +472,38 @@ class FlowDataEngine:
             write_mode=write_settings.write_mode,
             compression=write_settings.parquet_compression,
             separator=write_settings.csv_delimiter,
-            credential_provider=credential_provider,
+            partition_by=write_settings.partition_by,
             use_pyarrow=use_pyarrow,
             logger=logger,
         )
 
+    def to_database_obj(self, *, database_type: str, uri: str, table_name: str, if_exists: str) -> None:
+        """Writes the DataFrame to a SQL database in-process (local execution path)."""
+        logger.info(f"Writing to {database_type} table {table_name}")
+        write_dataframe_to_database(
+            self.collect(),
+            database_type=database_type,
+            uri=uri,
+            table_name=table_name,
+            if_exists=if_exists,
+        )
+
     @classmethod
-    def from_cloud_storage_obj(cls, settings: cloud_storage_schemas.CloudStorageReadSettingsInternal) -> FlowDataEngine:
+    def from_cloud_storage_obj(
+        cls, settings: cloud_storage_schemas.CloudStorageReadSettingsInternal, user_id: int | None = None
+    ) -> FlowDataEngine:
         """Creates a FlowDataEngine from an object in cloud storage.
 
         This method supports reading from various cloud storage providers like AWS S3,
         Azure Data Lake Storage, and Google Cloud Storage, with support for
         various authentication methods.
 
+        The credentials ride in an ``EncryptedCredentialProvider``, since the plan is serialized to the worker.
+
         Args:
             settings: A `CloudStorageReadSettingsInternal` object containing connection
                 details, file format, and read options.
+            user_id: The user the credentials are re-encrypted for inside the plan.
 
         Returns:
             A new `FlowDataEngine` instance containing the data from cloud storage.
@@ -447,7 +519,7 @@ class FlowDataEngine:
 
         logger.info(f"Reading from {connection.storage_type} storage: {read_settings.resource_path}")
         storage_options = CloudStorageReader.get_storage_options(connection)
-        credential_provider = CloudStorageReader.get_credential_provider(connection)
+        credential_provider = CloudStorageReader.get_credential_provider(storage_options, user_id)
         use_pyarrow = CloudStorageReader.use_pyarrow_for_gcs(connection)
         if read_settings.file_format == "parquet":
             return cls._read_parquet_from_cloud(
@@ -583,15 +655,10 @@ class FlowDataEngine:
     ) -> FlowDataEngine:
         """Reads Parquet file(s) from cloud storage."""
         try:
-            # Use scan_parquet for lazy evaluation
             if is_directory:
                 resource_path = ensure_path_has_wildcard_pattern(resource_path=resource_path, file_format="parquet")
             scan_kwargs = {"source": resource_path}
-            if storage_options:
-                scan_kwargs["storage_options"] = storage_options
-
-            if credential_provider:
-                scan_kwargs["credential_provider"] = credential_provider
+            scan_kwargs.update(CloudStorageReader.get_scan_kwargs(storage_options, credential_provider))
             if storage_options and is_directory:
                 schema = cls._get_schema_from_first_file_in_dir(
                     resource_path, storage_options, "parquet", use_pyarrow=use_pyarrow
@@ -606,7 +673,7 @@ class FlowDataEngine:
                 lf = pl.scan_parquet(**scan_kwargs)
             return cls(
                 lf,
-                number_of_records=6_666_666,  # Set so the provider is not accessed for this stat
+                number_of_records=CLOUD_PLACEHOLDER_RECORD_COUNT,
                 optimize_memory=True,
                 streamable=True,
                 schema=schema,
@@ -635,15 +702,12 @@ class FlowDataEngine:
                 scan_kwargs = {"source": normalize_delta_path(resource_path)}
                 if read_settings.delta_version:
                     scan_kwargs["version"] = read_settings.delta_version
-                if storage_options:
-                    scan_kwargs["storage_options"] = storage_options
-                if credential_provider:
-                    scan_kwargs["credential_provider"] = credential_provider
+                scan_kwargs.update(CloudStorageReader.get_scan_kwargs(storage_options, credential_provider))
                 lf = pl.scan_delta(**scan_kwargs)
 
             return cls(
                 lf,
-                number_of_records=6_666_666,  # Set so the provider is not accessed for this stat
+                number_of_records=CLOUD_PLACEHOLDER_RECORD_COUNT,
                 optimize_memory=True,
                 streamable=True,
             )
@@ -660,7 +724,8 @@ class FlowDataEngine:
         read_settings: cloud_storage_schemas.CloudStorageReadSettings,
         use_pyarrow: bool = False,
     ) -> FlowDataEngine:
-        """Reads CSV file(s) from cloud storage."""
+        """Reads CSV file(s) from cloud storage; unset CSV options take the drawer's defaults (Polars rejects None)."""
+        read_settings = read_settings.with_csv_defaults()
         try:
             if use_pyarrow and read_settings.scan_mode == "directory":
                 return cls._read_directory_via_gcsfs(resource_path, storage_options, "csv", read_settings)
@@ -671,10 +736,7 @@ class FlowDataEngine:
                 "separator": read_settings.csv_delimiter,
                 "encoding": read_settings.csv_encoding,
             }
-            if storage_options:
-                scan_kwargs["storage_options"] = storage_options
-            if credential_provider:
-                scan_kwargs["credential_provider"] = credential_provider
+            scan_kwargs.update(CloudStorageReader.get_scan_kwargs(storage_options, credential_provider))
 
             if read_settings.scan_mode == "directory":
                 resource_path = ensure_path_has_wildcard_pattern(resource_path=resource_path, file_format="csv")
@@ -692,7 +754,7 @@ class FlowDataEngine:
 
             return cls(
                 lf,
-                number_of_records=6_666_666,
+                number_of_records=CLOUD_PLACEHOLDER_RECORD_COUNT,
                 optimize_memory=True,
                 streamable=True,
                 schema=schema,
@@ -719,11 +781,7 @@ class FlowDataEngine:
             if is_directory:
                 resource_path = ensure_path_has_wildcard_pattern(resource_path, "json")
             scan_kwargs = {"source": resource_path}
-
-            if storage_options:
-                scan_kwargs["storage_options"] = storage_options
-            if credential_provider:
-                scan_kwargs["credential_provider"] = credential_provider
+            scan_kwargs.update(CloudStorageReader.get_scan_kwargs(storage_options, credential_provider))
 
             if use_pyarrow:
                 # For GCS via gcsfs: use gcsfs.open for single-file JSON
@@ -983,24 +1041,47 @@ class FlowDataEngine:
                 calculate_schema_stats=calculate_schema_stats,
             )
 
-        df = self.data_frame.rename({c.old_name: c.new_name for c in group_columns})
-        group_by_columns = [n_c.new_name for n_c in group_columns]
+        # A renamed group key must not collide with a dropped column.
+        group_exprs = [pl.col(c.old_name).alias(c.new_name) for c in group_columns]
 
-        # Handle case where there are no aggregations - just get unique combinations of group columns
         if len(aggregations) == 0:
             return FlowDataEngine(
-                df.select(group_by_columns).unique(),
+                self.data_frame.select(group_exprs).unique(),
                 calculate_schema_stats=calculate_schema_stats,
             )
 
-        grouped_df = df.group_by(*group_by_columns)
-        agg_exprs = [ac.agg_func(ac.old_name).alias(ac.new_name) for ac in aggregations]
-        result_df = grouped_df.agg(agg_exprs)
+        result_df = self.data_frame.group_by(group_exprs).agg(
+            ac.agg_func(ac.old_name).alias(ac.new_name) for ac in aggregations
+        )
 
         return FlowDataEngine(
             result_df,
             calculate_schema_stats=calculate_schema_stats,
         )
+
+    def do_window_functions(
+        self, settings: transform_schemas.WindowFunctionsInput, calculate_schema_stats: bool = False
+    ) -> FlowDataEngine:
+        """Applies window functions (rolling, cumulative, rank, tile, partition aggregates) to the data.
+
+        When ``settings.order_by`` is provided, rows are sorted first so that
+        rolling and tile operations have a deterministic order; the sort is
+        preserved in the output. Partitioning (``partition_by``) is applied via
+        ``.over(...)`` so operations reset for each group.
+        """
+        if not settings.window_functions:
+            return self
+
+        df = self.data_frame
+        if settings.order_by:
+            descending = [s.descending for s in settings.order_by]
+            df = df.sort([s.column for s in settings.order_by], descending=descending)
+
+        exprs = [
+            _build_window_expr(w, settings.partition_by) for w in settings.window_functions
+        ]
+        df = df.with_columns(exprs)
+        return FlowDataEngine(df, calculate_schema_stats=calculate_schema_stats)
 
     def do_sort(self, sorts: list[transform_schemas.SortByInput]) -> FlowDataEngine:
         """Sorts the DataFrame by one or more columns.
@@ -1015,7 +1096,7 @@ class FlowDataEngine:
         if not sorts:
             return self
 
-        descending = [s.how == "desc" or s.how.lower() == "descending" for s in sorts]
+        descending = [s.descending for s in sorts]
         df = self.data_frame.sort([sort_by.column for sort_by in sorts], descending=descending)
         return FlowDataEngine(df, number_of_records=self.number_of_records, schema=self.schema)
 
@@ -1039,9 +1120,12 @@ class FlowDataEngine:
             if transform.data_type is not None
         )
 
-        actual_transforms = [c for c in idx_mapping if c[2] != dtypes[c[1]]]
+        # Compare base types: an Extension instance never equals its own class.
+        actual_transforms = [c for c in idx_mapping if c[2].base_type() != dtypes[c[1]]]
         transformations = [
-            utils.define_pl_col_transformation(col_name=transform[0], col_type=transform[2])
+            utils.define_pl_col_transformation(
+                col_name=transform[0], col_type=transform[2], source_type=dtypes[transform[1]]
+            )
             for transform in actual_transforms
         ]
 
@@ -1166,7 +1250,7 @@ class FlowDataEngine:
         return cls(df, schema=schema, calculate_schema_stats=False, number_of_records=0)
 
     @classmethod
-    def create_from_path(cls, received_table: input_schema.ReceivedTable) -> FlowDataEngine:
+    def create_from_path(cls, received_table: input_schema.ReceivedTable, node_logger=None) -> FlowDataEngine:
         """Creates a FlowDataEngine from a local file path.
 
         Supports various file types like CSV, Parquet, and Excel.
@@ -1174,22 +1258,44 @@ class FlowDataEngine:
         Args:
             received_table: A `ReceivedTableBase` object containing the file path
                 and format details.
+            node_logger: Optional node logger, so a reader can report into the flow log.
 
         Returns:
             A new `FlowDataEngine` instance with data from the file.
         """
+        refuse_cloud_path(received_table.path, received_table.file_type)
         received_table.set_absolute_filepath()
+        if received_table.scan_mode == "directory":
+            assert_directory_scan_supported(
+                received_table.file_type,
+                getattr(received_table.table_settings, "encoding", None),
+                received_table.path,
+            )
         file_type_handlers = {
             "csv": create_funcs.create_from_path_csv,
             "parquet": create_funcs.create_from_path_parquet,
             "excel": create_funcs.create_from_path_excel,
+            "ipc": create_funcs.create_from_path_ipc,
+            "ndjson": create_funcs.create_from_path_ndjson,
+            "avro": create_funcs.create_from_path_avro,
+            "ipc_stream": create_funcs.create_from_path_ipc_stream,
         }
 
         handler = file_type_handlers.get(received_table.file_type)
         if not handler:
             raise Exception(f"Cannot create from {received_table.file_type}")
 
-        flow_file = cls(handler(received_table))
+        # Only the excel reader reports which engine it used; the rest take the table alone.
+        extra = {"logger": node_logger} if received_table.file_type == "excel" else {}
+        data = handler(received_table, **extra)
+        if isinstance(data, pl.DataFrame):
+            flow_file = cls(data.lazy(), number_of_records=data.height)
+        else:
+            flow_file = cls(data)
+        if received_table.file_type == "parquet":
+            count = create_funcs.parquet_row_count(received_table)
+            if count is not None:
+                flow_file.number_of_records = count
         flow_file._org_path = received_table.abs_file_path
         return flow_file
 
@@ -1334,8 +1440,8 @@ class FlowDataEngine:
         Returns:
             A new, pivoted `FlowDataEngine` instance.
         """
-        # Get unique values for pivot columns
         max_unique_vals = 200
+        # TODO: a null pivot value ends up as a column name and raises; give it its own bucket instead.
         new_cols_unique = fetch_unique_values(
             self.data_frame.select(pivot_input.pivot_column)
             .unique()
@@ -1358,7 +1464,6 @@ class FlowDataEngine:
             no_index_cols = False
             ff = self
 
-        # Perform pivot operations
         index_columns = pivot_input.get_index_columns()
         grouped_ff = ff.do_group_by(pivot_input.get_group_by_input(), False)
         pivot_column = pivot_input.get_pivot_column()
@@ -1391,7 +1496,6 @@ class FlowDataEngine:
             )
         )
 
-        # Clean up temporary columns if needed
         if no_index_cols:
             df = df.drop("__temp__")
             pivot_input.index_columns = []
@@ -1511,7 +1615,7 @@ class FlowDataEngine:
         Returns:
             The file size in bytes, or 0 if the original path is unknown.
         """
-        if self._org_path is not None:
+        if self._org_path is not None and not is_url(self._org_path):
             return os.path.getsize(self._org_path)
         return 0
 
@@ -1563,7 +1667,7 @@ class FlowDataEngine:
                 self.data_frame = self.external_source.get_pl_df().lazy()
             else:
                 self.data_frame = pl.LazyFrame(list(self.external_source.get_iter()))
-            self._schema = None  # enforce reset schema
+            self._schema = None
 
     def get_output_sample(self, n_rows: int = 10) -> list[dict]:
         """Gets a sample of the data as a list of dictionaries.
@@ -1644,6 +1748,41 @@ class FlowDataEngine:
             sample_df = self.data_frame.head(n_rows)
 
         return FlowDataEngine(sample_df, schema=self.schema)
+
+    def random_sample(
+        self,
+        n: int | None = None,
+        fraction: float | None = None,
+        seed: int | None = None,
+    ) -> FlowDataEngine:
+        """Takes a uniform random sample of rows without materialising the frame.
+
+        Polars exposes ``sample`` only on eager DataFrames, so the lazy
+        equivalent is built from a shuffled row rank: each row draws a distinct
+        rank from a random permutation of ``0..len``, and keeping the ranks
+        below a threshold keeps a uniform subset. Nothing is collected and the
+        row count is never queried, so the result stays a plan that ships to
+        the worker like any other lazy transform — unlike :meth:`random_split`,
+        which has to materialise because its outputs must share one permutation.
+
+        Sampling more rows than the frame holds yields the whole frame, and the
+        original row order is preserved.
+
+        Args:
+            n: Number of rows to keep. Mutually exclusive with `fraction`.
+            fraction: Share of rows to keep, between 0 and 1. Mutually exclusive with `n`.
+            seed: Seed for a reproducible sample; None draws a fresh permutation
+                on every execution.
+
+        Returns:
+            A new `FlowDataEngine` instance containing the sampled rows.
+        """
+        if (n is None) == (fraction is None):
+            raise ValueError("Provide exactly one of n or fraction")
+        df = self.data_frame if self.lazy else self.data_frame.lazy()
+        threshold = (pl.len() * fraction).round().cast(pl.Int64) if fraction is not None else max(0, n)
+        sampled = df.filter(pl.int_range(0, pl.len()).shuffle(seed=seed) < threshold)
+        return FlowDataEngine(sampled, schema=self.schema, streamable=self._streamable)
 
     def random_split(
         self,
@@ -1731,9 +1870,7 @@ class FlowDataEngine:
         )
         cached_lf = edf.get_result()
         if not isinstance(cached_lf, pl.LazyFrame):
-            raise RuntimeError(
-                f"random_split_external: worker did not return a LazyFrame (got {type(cached_lf)!r})"
-            )
+            raise RuntimeError(f"random_split_external: worker did not return a LazyFrame (got {type(cached_lf)!r})")
 
         # Cheap — reads parquet footer metadata, not row data.
         total = cached_lf.select(pl.len()).collect()[0, 0]
@@ -1861,6 +1998,8 @@ class FlowDataEngine:
             left=self, right=other, fuzzy_match_input_manager=fuzzy_match_input_manager
         )
         fuzzy_mappings = [FuzzyMapping(**fm.__dict__) for fm in fuzzy_match_input_manager.fuzzy_maps]
+        # fuzzy_match_dfs skips naming the score columns when a side is empty
+        set_name_in_fuzzy_mappings(fuzzy_mappings)
         return FlowDataEngine(
             fuzzy_match_dfs(
                 left_df, right_df, fuzzy_maps=fuzzy_mappings, logger=node_logger.logger if node_logger else logger
@@ -1911,6 +2050,9 @@ class FlowDataEngine:
             if (v.keep or v.join_key) and v.is_available
         ]
         cross_join_input_manager.auto_rename(rename_mode="suffix")
+        duplicate_problems = get_duplicate_output_problems(cross_join_input_manager)
+        if duplicate_problems:
+            raise ValueError("Cross join is not valid: " + "; ".join(duplicate_problems))
         left = self.data_frame.select(left_select).rename(cross_join_input_manager.left_select.rename_table)
         right = other.data_frame.select(right_select).rename(cross_join_input_manager.right_select.rename_table)
 
@@ -1933,28 +2075,45 @@ class FlowDataEngine:
         other: FlowDataEngine,
     ) -> FlowDataEngine:
         """Performs a standard SQL-style join with another DataFrame."""
-        # Create manager from input
         join_manager = transform_schemas.JoinInputManager(join_input)
         _ensure_all_columns_have_select(left_cols=self.columns, right_cols=other.columns, manager=join_manager)
         join_manager.set_join_keys()
-        ensure_right_unselect_for_semi_and_anti_joins(join_manager.input)
         for jk in join_manager.join_mapping:
             if jk.left_col not in {c.old_name for c in join_manager.left_select.renames}:
                 join_manager.left_select.append(transform_schemas.SelectInput(jk.left_col, keep=False))
             if jk.right_col not in {c.old_name for c in join_manager.right_select.renames}:
                 join_manager.right_select.append(transform_schemas.SelectInput(jk.right_col, keep=False))
         verify_join_select_integrity(join_manager.input, left_columns=self.columns, right_columns=other.columns)
-        if not verify_join_map_integrity(join_manager.input, left_columns=self.schema, right_columns=other.schema):
-            raise Exception("Join is not valid by the data fields")
+        join_map_problems = get_join_map_problems(
+            join_manager.input, left_columns=self.schema, right_columns=other.schema
+        )
+        if join_map_problems:
+            raise Exception("Join is not valid: " + "; ".join(join_map_problems))
+
+        # Either side may be eager (e.g. a local Excel read); polars only joins lazy with lazy.
+        left_lf = self.data_frame.lazy()
+        right_lf = other.data_frame.lazy()
+        if join_manager.how in ("semi", "anti"):
+            # Semi/anti joins push the full left input downstream unchanged (all columns,
+            # original order, no rename or drop); the right frame only supplies the join
+            # keys for matching. Stale entries in left_select are therefore irrelevant here.
+            left_on = [jm.left_col for jm in join_manager.join_mapping]
+            right_on = [jm.right_col for jm in join_manager.join_mapping]
+            right = right_lf.select(list(dict.fromkeys(right_on)))
+            joined_df = left_lf.join(other=right, left_on=left_on, right_on=right_on, how=join_manager.how)
+            # -1 = unknown (not 0): a 0 here reads as a real "empty result" count.
+            return FlowDataEngine(joined_df, calculate_schema_stats=False, number_of_records=-1, streamable=False)
 
         if auto_generate_selection:
             join_manager.auto_rename()
+        duplicate_problems = get_duplicate_output_problems(join_manager)
+        if duplicate_problems:
+            raise ValueError("Join is not valid: " + "; ".join(duplicate_problems))
 
-        # Use manager properties throughout
-        left = self.data_frame.select(join_manager.left_manager.get_select_cols()).rename(
+        left = left_lf.select(join_manager.left_manager.get_select_cols()).rename(
             join_manager.left_manager.get_rename_table()
         )
-        right = other.data_frame.select(join_manager.right_manager.get_select_cols()).rename(
+        right = right_lf.select(join_manager.right_manager.get_select_cols()).rename(
             join_manager.right_manager.get_rename_table()
         )
 
@@ -1998,7 +2157,8 @@ class FlowDataEngine:
         undo_join_key_remapping = get_undo_rename_mapping_join(join_manager)
         joined_df = joined_df.rename(undo_join_key_remapping)
 
-        return FlowDataEngine(joined_df, calculate_schema_stats=False, number_of_records=0, streamable=False)
+        # -1 = unknown (not 0): a 0 here reads as a real "empty result" count.
+        return FlowDataEngine(joined_df, calculate_schema_stats=False, number_of_records=-1, streamable=False)
 
     def solve_graph(self, graph_solver_input: transform_schemas.GraphSolverInput) -> FlowDataEngine:
         """Solves a graph problem represented by 'from' and 'to' columns.
@@ -2018,6 +2178,21 @@ class FlowDataEngine:
             )
         )
         return FlowDataEngine(lf)
+
+    def explode_hierarchy(self, settings: transform_schemas.ExplodeHierarchyInput) -> FlowDataEngine:
+        """Explodes a parent -> child edge list into its transitive closure.
+
+        The result is a new table (see `ExplodeHierarchyInput`); input columns are not carried
+        through. The plan stays lazy, so a cycle or null quantity only raises on collect.
+
+        Args:
+            settings: The edge columns, output detail and explosion options.
+
+        Returns:
+            A new, lazy `FlowDataEngine` with an unknown row count.
+        """
+        lf = explode_hierarchy_frame(self.data_frame.lazy(), settings)
+        return FlowDataEngine(lf, number_of_records=-1)
 
     def add_new_values(self, values: Iterable, col_name: str = None) -> FlowDataEngine:
         """Adds a new column with the provided values.
@@ -2109,6 +2284,27 @@ class FlowDataEngine:
             The total number of records.
         """
         return self.get_number_of_records(force_calculate=force_calculate)
+
+    def known_record_count(self) -> int | None:
+        """Returns the exact record count only when it is already known for free.
+
+        Sources, in order: a previously stored ``number_of_records`` (e.g. the
+        count the worker sent along with a remote run result), or the height of
+        an eager frame. Returns None otherwise — deliberately never falls back
+        to ``get_number_of_records()``, which on a lazy frame collects the whole
+        plan to count it. Stored placeholders are not counts: the cloud readers
+        stamp ``CLOUD_PLACEHOLDER_RECORD_COUNT`` and external-source engines
+        carry a schema-time 0, so both report unknown here.
+        """
+        if self._external_source is not None:
+            return None
+        if self.number_of_records is not None and self.number_of_records >= 0:
+            if self.number_of_records == CLOUD_PLACEHOLDER_RECORD_COUNT:
+                return None
+            return self.number_of_records
+        if not self.lazy:
+            return self.data_frame.height
+        return None
 
     def get_number_of_records(
         self, warn: bool = False, force_calculate: bool = False, calculate_in_worker_process: bool = False
@@ -2268,7 +2464,6 @@ class FlowDataEngine:
         actual_names = set(self.columns)
         expected_names = [c.column_name for c in expected_schema]
 
-        # Add missing columns as typed null literals
         missing_exprs = []
         for col in expected_schema:
             if col.column_name not in actual_names:
@@ -2279,7 +2474,6 @@ class FlowDataEngine:
         if missing_exprs:
             df = df.with_columns(missing_exprs)
 
-        # Build final column order: expected first, then any extras
         expected_set = set(expected_names)
         extra_names = [c for c in self.columns if c not in expected_set]
         final_order = expected_names + extra_names
@@ -2323,16 +2517,48 @@ class FlowDataEngine:
         return FlowDataEngine(df2, number_of_records=self.number_of_records)
 
     @staticmethod
+    def _select_target_columns(
+        columns: list[tuple[str, str]],
+        selection_mode: transform_schemas.ColumnSelectionMode,
+        selected_columns: list[str],
+        selected_data_type: transform_schemas.ReadableDataTypeGroup | None,
+    ) -> list[str]:
+        """Return the ordered column names a column-selection rule applies to.
+
+        Shared by every node that offers the `all` / `list` / `data_type` selection
+        triple (dynamic rename, multi-field formula). Unknown names in `selected_columns`
+        are silently dropped so stale UI state does not break execution; `"list"` mode
+        keeps the user's chosen order while the other modes keep schema order. An
+        unknown or unset `selection_mode` returns `[]`.
+
+        Args:
+            columns: Incoming schema as `(column_name, data_type_group)` tuples, in order.
+            selection_mode: Which selection rule to apply.
+            selected_columns: The listed column names, used in `"list"` mode.
+            selected_data_type: The wanted data-type group, used in `"data_type"` mode.
+
+        Returns:
+            The column names the rule should be applied to.
+        """
+        if selection_mode == "all":
+            return [name for name, _ in columns]
+        if selection_mode == "list":
+            available = {name for name, _ in columns}
+            return [c for c in selected_columns if c in available]
+        if selection_mode == "data_type":
+            if selected_data_type is None:
+                return []
+            return [name for name, group in columns if group == selected_data_type]
+        return []
+
+    @staticmethod
     def _select_rename_targets(
         columns: list[tuple[str, str]],
         settings: transform_schemas.DynamicRenameInput,
     ) -> list[str]:
         """Return the ordered list of column names the rename rule applies to.
 
-        Applies the `selection_mode` filter (`"all"`, `"list"`, or `"data_type"`) to
-        the incoming schema, preserving the original column order. Unknown column
-        names in `settings.selected_columns` are silently dropped so stale UI state
-        does not break execution. An unknown or unset `selection_mode` returns `[]`.
+        Thin delegate over `_select_target_columns`; see there for the selection rules.
 
         Args:
             columns: Incoming schema as `(column_name, data_type_group)` tuples, in order.
@@ -2341,18 +2567,109 @@ class FlowDataEngine:
         Returns:
             The column names the rename rule should be applied to, in schema order.
         """
-        mode = settings.selection_mode
-        if mode == "all":
-            return [name for name, _ in columns]
-        if mode == "list":
-            available = {name for name, _ in columns}
-            return [c for c in settings.selected_columns if c in available]
-        if mode == "data_type":
-            wanted = settings.selected_data_type
-            if wanted is None:
-                return []
-            return [name for name, group in columns if group == wanted]
-        return []
+        return FlowDataEngine._select_target_columns(
+            columns, settings.selection_mode, settings.selected_columns, settings.selected_data_type
+        )
+
+    @staticmethod
+    def build_multi_field_formula_expressions(
+        columns: list[tuple[str, str, str]],
+        settings: transform_schemas.MultiFieldFormulaInput,
+    ) -> list[pl.Expr]:
+        """Build the aliased expressions a multi-field formula produces.
+
+        Pure function — takes the incoming schema as `(name, data_type, data_type_group)`
+        tuples plus the settings and returns one expression per target column, ready for a
+        SINGLE `with_columns` call. One call is what makes the operation well-defined when a
+        target's formula references another target: every expression sees the ORIGINAL input
+        values, so `[_CurrentField_] / [Total] * 100` reads the untouched `Total` even when
+        `Total` is itself being overwritten. This is the deliberate opposite of
+        `apply_sql_formulas`, where the formula node's entries are chained so entry N reads
+        the columns entries 1..N-1 produced.
+
+        Column names listed in `selected_columns` that are absent from the schema are silently
+        skipped, mirroring `_select_rename_targets` — stale UI state must not break a run. Zero
+        targets is a valid no-op and yields an empty list; validation still runs first, so a
+        misconfigured node errors even when it would touch nothing.
+
+        In `"new"` output mode the result names are `f"{prefix}{name}{suffix}"` and must not
+        collide with an incoming column: silently shadowing an input would make the single
+        `with_columns` order-dependent and lose data. Two targets producing the SAME output name
+        (a duplicated entry in `selected_columns`) is rejected for the same reason, in both
+        output modes — Polars would otherwise reject the duplicate alias with an opaque
+        `ComputeError`.
+
+        Args:
+            columns: Incoming schema as `(column_name, data_type, data_type_group)` tuples, in order.
+            settings: The multi-field formula configuration.
+
+        Returns:
+            The aliased expressions, in target order (possibly empty).
+
+        Raises:
+            ValueError: If the formula is empty, `"new"` mode has neither prefix nor suffix,
+                an output name already exists, two targets produce the same output name, or a
+                column name cannot be bound to `[_CurrentFieldName_]`.
+        """
+        if not settings.formula.strip():
+            raise ValueError("Multi-field formula: no formula configured")
+        new_mode = settings.output_mode == "new"
+        if new_mode and not settings.output_prefix and not settings.output_suffix:
+            raise ValueError("Multi-field formula: writing to new columns requires a prefix or a suffix")
+
+        targets = FlowDataEngine._select_target_columns(
+            [(name, group) for name, _, group in columns],
+            settings.selection_mode,
+            settings.selected_columns,
+            settings.selected_data_type,
+        )
+        data_types = {name: data_type for name, data_type, _ in columns}
+        existing = {name for name, _, _ in columns}
+
+        output_data_type = settings.output_data_type
+        cast_type = (
+            cast_str_to_polars_type(str(output_data_type))
+            if output_data_type not in (None, transform_schemas.AUTO_DATA_TYPE)
+            else None
+        )
+
+        expressions: list[pl.Expr] = []
+        seen: set[str] = set()
+        for name in targets:
+            bound = transform_schemas.bind_multi_field_formula(settings.formula, name, data_types.get(name, ""))
+            output_name = f"{settings.output_prefix}{name}{settings.output_suffix}" if new_mode else name
+            if new_mode and output_name in existing:
+                raise ValueError(f"Multi-field formula: output column '{output_name}' already exists")
+            if output_name in seen:
+                raise ValueError(
+                    f"Multi-field formula: output column '{output_name}' is produced by more than one selected column"
+                )
+            seen.add(output_name)
+            expr = to_expr(bound)
+            if cast_type is not None:
+                expr = expr.cast(cast_type)
+            expressions.append(expr.alias(output_name))
+        return expressions
+
+    def apply_multi_field_formula(self, settings: transform_schemas.MultiFieldFormulaInput) -> FlowDataEngine:
+        """Applies one formula to many columns at once.
+
+        Every selected column is bound into the formula via the `[_CurrentField_]`,
+        `[_CurrentFieldName_]` and `[_CurrentFieldType_]` placeholders and the results either
+        overwrite their source column or land in new prefixed/suffixed columns. Stays lazy.
+
+        Args:
+            settings: The multi-field formula configuration.
+
+        Returns:
+            A new `FlowDataEngine` with the computed columns, or this instance's DataFrame
+            unchanged when no column is selected.
+        """
+        columns = [(c.column_name, c.data_type, c.data_type_group) for c in self.schema]
+        expressions = self.build_multi_field_formula_expressions(columns, settings)
+        if not expressions:
+            return FlowDataEngine(self.data_frame, number_of_records=self.number_of_records, schema=self.schema)
+        return FlowDataEngine(self.data_frame.with_columns(expressions), number_of_records=self.number_of_records)
 
     @staticmethod
     def _compute_renamed_names(
@@ -2551,69 +2868,235 @@ class FlowDataEngine:
             )
         return FlowDataEngine(new_df, number_of_records=self.number_of_records)
 
-    def apply_sql_formula(self, func: str, col_name: str, output_data_type: pl.DataType = None) -> FlowDataEngine:
-        """Applies an SQL-style formula using `pl.sql_expr`.
+    @staticmethod
+    def _select_cleansing_targets(
+        columns: list[tuple[str, str]],
+        settings: transform_schemas.DataCleansingInput,
+    ) -> list[str]:
+        """Return the ordered column names the per-column cleansing rules apply to.
+
+        Unknown names in `settings.selected_columns` are silently dropped so stale UI
+        state does not break execution, mirroring `_select_rename_targets`.
 
         Args:
-            func: A string containing an SQL expression.
-            col_name: The name of the new or transformed column.
-            output_data_type: The desired Polars data type for the output column.
+            columns: Incoming schema as `(column_name, data_type_group)` tuples, in order.
+            settings: The data cleansing configuration.
 
         Returns:
-            A new `FlowDataEngine` instance with the applied formula.
+            The target column names, in schema order.
         """
-        expr = to_expr(func)
-        if output_data_type not in (None, transform_schemas.AUTO_DATA_TYPE):
-            df = self.data_frame.with_columns(expr.cast(output_data_type).alias(col_name))
-        else:
-            df = self.data_frame.with_columns(expr.alias(col_name))
+        if settings.selection_mode == "all":
+            return [name for name, _ in columns]
+        if settings.selection_mode == "list":
+            available = {name for name, _ in columns}
+            return [c for c in settings.selected_columns if c in available]
+        return []
 
-        return FlowDataEngine(df, number_of_records=self.number_of_records)
+    @staticmethod
+    def build_data_cleansing_expressions(
+        columns: list[tuple[str, str]],
+        settings: transform_schemas.DataCleansingInput,
+    ) -> list[pl.Expr]:
+        """Build the per-column cleansing expressions for a single `with_columns` call.
+
+        Pure function — takes the incoming schema as `(name, data_type_group)` tuples
+        (where `data_type_group` is `FlowfileColumn.data_type_group`) plus the user's
+        settings, and returns one expression per column the rules actually change.
+        Columns that are not targeted, or whose data-type group no rule applies to, are
+        simply absent from the result and therefore pass through untouched.
+
+        String columns get a single chained expression in a fixed order: fill nulls,
+        remove letters, numbers and punctuation, clean up whitespace (after character
+        removal, so the gaps it leaves are collapsed too), then apply the casing rule.
+        `remove_all_whitespace` supersedes trimming and normalising. Numeric columns only
+        ever get a zero-fill, expressed as `fill_null(strategy="zero")` rather than
+        `fill_null(0)` because the literal form promotes a `Decimal(p, s)` column to
+        `Decimal(38, s)`. No rule changes a dtype, so the output schema equals the input
+        schema.
+
+        Args:
+            columns: Incoming schema as `(column_name, data_type_group)` tuples, in order.
+            settings: The data cleansing configuration.
+
+        Returns:
+            The expressions to pass to a single `with_columns` call, in schema order.
+        """
+        targets = set(FlowDataEngine._select_cleansing_targets(columns, settings))
+        exprs: list[pl.Expr] = []
+        for name, data_type_group in columns:
+            if name not in targets:
+                continue
+            if data_type_group == "Numeric":
+                if settings.replace_nulls_with_zero:
+                    exprs.append(pl.col(name).fill_null(strategy="zero"))
+                continue
+            if data_type_group != "String":
+                continue
+
+            expr = pl.col(name)
+            touched = False
+            if settings.replace_nulls_with_blank:
+                expr = expr.fill_null("")
+                touched = True
+            if settings.remove_letters:
+                expr = expr.str.replace_all(transform_schemas.CLEANSING_LETTERS_REGEX, "")
+                touched = True
+            if settings.remove_numbers:
+                expr = expr.str.replace_all(transform_schemas.CLEANSING_NUMBERS_REGEX, "")
+                touched = True
+            if settings.remove_punctuation:
+                expr = expr.str.replace_all(transform_schemas.CLEANSING_PUNCTUATION_REGEX, "")
+                touched = True
+            if settings.remove_all_whitespace:
+                expr = expr.str.replace_all(transform_schemas.CLEANSING_WHITESPACE_REGEX, "")
+                touched = True
+            else:
+                if settings.normalize_whitespace:
+                    expr = expr.str.replace_all(transform_schemas.CLEANSING_WHITESPACE_RUN_REGEX, " ")
+                    touched = True
+                if settings.trim_whitespace:
+                    expr = expr.str.strip_chars()
+                    touched = True
+            if settings.case_mode == "uppercase":
+                expr = expr.str.to_uppercase()
+                touched = True
+            elif settings.case_mode == "lowercase":
+                expr = expr.str.to_lowercase()
+                touched = True
+            elif settings.case_mode == "titlecase":
+                expr = expr.str.to_titlecase()
+                touched = True
+            if touched:
+                exprs.append(expr)
+        return exprs
+
+    def _fetch_null_profile(self) -> tuple[int, dict[str, int]]:
+        """Return `(height, {column: null_count})` for the incoming frame.
+
+        Dropping all-null columns is data-dependent, and a lazy plan cannot change its
+        schema based on the data flowing through it, so the keep-list has to be resolved
+        before the rest of the plan is built. The aggregation is bounded to a single row,
+        and runs on the external worker via `ExternalDfFetcher` (same pattern as
+        `_peek_first_row_as_dict` / `fetch_unique_values`) so core stays collect-free on
+        the hot path; it falls back to an in-core streaming collect only when the worker
+        is unavailable.
+
+        Returns:
+            The frame height and the per-column null count, both from one aggregation.
+        """
+        df = self.data_frame
+        lf = df.lazy() if isinstance(df, pl.DataFrame) else df
+        names = lf.collect_schema().names()
+        if not names:
+            return 0, {}
+
+        height_alias = "__ff_height__"
+        while height_alias in names:
+            height_alias += "_"
+        agg_lf = lf.select([pl.len().alias(height_alias), *[pl.col(name).null_count() for name in names]])
+
+        table = None
+        try:
+            external = ExternalDfFetcher(lf=agg_lf, flow_id=1, node_id=-1, wait_on_completion=True)
+            if external.status is not None and external.status.status == "Completed":
+                table = arrow_read(external.status.file_ref)
+        except Exception as e:  # noqa: BLE001 - worker availability is best-effort
+            logger.debug(f"ExternalDfFetcher unavailable for null profile ({e}); using in-core fallback")
+
+        if table is not None:
+            row = {name: table.column(name)[0].as_py() for name in table.column_names}
+        else:
+            row = agg_lf.collect(engine="streaming").to_dicts()[0]
+        height = int(row.pop(height_alias))
+        return height, {name: int(row[name]) for name in names}
+
+    def apply_data_cleansing(self, cleansing_input: transform_schemas.DataCleansingInput) -> FlowDataEngine:
+        """Fixes common data quality issues in a single pass.
+
+        Applies three stages in order: drop rows that are null in every column, drop
+        columns that are null in every row, then apply the per-column rules (null
+        replacement, character removal, whitespace handling, casing) to the selected
+        columns. The first two stages deliberately ignore the column selection, matching
+        Alteryx's Data Cleansing tool.
+
+        Everything stays a lazy plan except the bounded null-count aggregation that
+        `remove_null_columns` needs — see `_fetch_null_profile`. That fetch is skipped
+        entirely when the rule is off or when this engine is a schema-only prediction
+        placeholder (`number_of_records == 0`), so schema prediction never touches data
+        and predicted schema equals the input schema.
+
+        Args:
+            cleansing_input: The data cleansing configuration.
+
+        Returns:
+            A new `FlowDataEngine` with the cleansing rules applied.
+        """
+        new_df = self.data_frame
+        if cleansing_input.remove_null_rows:
+            new_df = new_df.filter(~pl.all_horizontal(pl.all().is_null()))
+
+        dropped: set[str] = set()
+        if cleansing_input.remove_null_columns and self.number_of_records != 0:
+            height, null_counts = self._fetch_null_profile()
+            if height > 0:
+                dropped = {name for name, null_count in null_counts.items() if null_count == height}
+            if dropped:
+                new_df = new_df.drop([name for name in null_counts if name in dropped])
+
+        columns = [(c.column_name, c.data_type_group) for c in self.schema if c.column_name not in dropped]
+        exprs = self.build_data_cleansing_expressions(columns, cleansing_input)
+        if exprs:
+            new_df = new_df.with_columns(exprs)
+
+        if cleansing_input.remove_null_rows:
+            return FlowDataEngine(new_df, streamable=self._streamable)
+        return FlowDataEngine(new_df, number_of_records=self.number_of_records, streamable=self._streamable)
+
+    def apply_sql_formulas(self, entries: list[FormulaEntry]) -> FlowDataEngine:
+        """Applies the formula node's entries, chained (see `apply_formula_entries`).
+
+        This is the deliberate opposite of `build_multi_field_formula_expressions`, which
+        builds a SINGLE `with_columns` call so that every expression reads the ORIGINAL
+        input values.
+
+        Raises:
+            FormulaEntryError: Naming the failing entry's position and output column.
+        """
+        df = self.data_frame
+        lf = df.lazy() if isinstance(df, pl.DataFrame) else df
+        return FlowDataEngine(apply_formula_entries(lf, entries), number_of_records=self.number_of_records)
 
     def output(
-        self, output_fs: input_schema.OutputSettings, flow_id: int, node_id: int | str, execute_remote: bool = True
+        self, output_fs: input_schema.OutputSettings, flow_id: int, node_id: int | str, execute_remote: bool = False
     ) -> FlowDataEngine:
-        """Writes the DataFrame to an output file.
+        """Writes the DataFrame to a local output file.
 
-        Can execute the write operation locally or in a remote worker process.
+        For remote-worker writes the caller (``add_output._func``) uses
+        ``ExternalOutputWriter`` directly so the fetcher can be exposed on
+        the node for cancellation; this method only handles the local path.
 
         Args:
             output_fs: An `OutputSettings` object with details about the output file.
             flow_id: The flow ID for tracking.
             node_id: The node ID for tracking.
-            execute_remote: If True, executes the write in a worker process.
+            execute_remote: Retained for signature compatibility; ignored.
 
         Returns:
             The same `FlowDataEngine` instance for chaining.
         """
-        logger.info("Starting to write output")
-        if execute_remote:
-            status = utils.write_output(
-                self.data_frame,
-                data_type=output_fs.file_type,
-                path=output_fs.abs_file_path,
-                write_mode=output_fs.write_mode,
-                sheet_name=output_fs.sheet_name,
-                delimiter=output_fs.delimiter,
-                flow_id=flow_id,
-                node_id=node_id,
-            )
-            tracker = ExternalExecutorTracker(status)
-            tracker.get_result()
-            logger.info("Finished writing output")
-        else:
-            logger.info("Starting to write results locally")
-            utils.local_write_output(
-                self.data_frame,
-                data_type=output_fs.file_type,
-                path=output_fs.abs_file_path,
-                write_mode=output_fs.write_mode,
-                sheet_name=output_fs.sheet_name,
-                delimiter=output_fs.delimiter,
-                flow_id=flow_id,
-                node_id=node_id,
-            )
-            logger.info("Finished writing output")
+        logger.info("Starting to write results locally")
+        utils.local_write_output(
+            self.data_frame,
+            data_type=output_fs.file_type,
+            path=output_fs.abs_file_path,
+            write_mode=output_fs.write_mode,
+            sheet_name=output_fs.sheet_name,
+            delimiter=output_fs.delimiter,
+            compression=output_fs.compression,
+            flow_id=flow_id,
+            node_id=node_id,
+        )
+        logger.info("Finished writing output")
         return self
 
     def make_unique(self, unique_input: transform_schemas.UniqueInput = None) -> FlowDataEngine:
@@ -2626,8 +3109,10 @@ class FlowDataEngine:
         Returns:
             A new `FlowDataEngine` instance with unique rows.
         """
-        if unique_input is None or unique_input.columns is None:
+        if unique_input is None:
             return FlowDataEngine(self.data_frame.unique())
+        if not unique_input.columns:
+            return FlowDataEngine(self.data_frame.unique(keep=unique_input.strategy))
         return FlowDataEngine(self.data_frame.unique(unique_input.columns, keep=unique_input.strategy))
 
     def concat(self, other: Iterable[FlowDataEngine] | FlowDataEngine) -> FlowDataEngine:
@@ -2657,19 +3142,27 @@ class FlowDataEngine:
             A new `FlowDataEngine` with the transformed selection.
         """
         new_schema = deepcopy(self.schema)
+        frame_cols = set(self.data_frame.collect_schema().names())
         renames = [r for r in select_inputs.renames if r.is_available]
         if not keep_missing:
-            drop_cols = set(self.data_frame.collect_schema().names()) - set(r.old_name for r in renames).union(
+            drop_cols = frame_cols - set(r.old_name for r in renames).union(
                 set(r.old_name for r in renames if not r.keep)
             )
             keep_cols = []
         else:
-            keep_cols = list(set(self.data_frame.collect_schema().names()) - set(r.old_name for r in renames))
+            keep_cols = list(frame_cols - set(r.old_name for r in renames))
             drop_cols = set(r.old_name for r in renames if not r.keep)
 
         if len(drop_cols) > 0:
             new_schema = [s for s in new_schema if s.name not in drop_cols]
         new_schema_mapping = {v.name: v for v in new_schema}
+
+        # Only columns the frame holds reach the rename; a stale entry is skipped below, so it cannot collide.
+        output_sources = {r.old_name: r.new_name for r in renames if r.keep and r.old_name in frame_cols}
+        output_sources.update({c: c for c in keep_cols})
+        shared_names = get_shared_output_name_problems(output_sources)
+        if shared_names:
+            raise ValueError("Select is not valid: " + "; ".join(shared_names))
 
         available_renames = []
         for rename in renames:
@@ -2696,6 +3189,29 @@ class FlowDataEngine:
         """Sets whether DataFrame operations should be streamable."""
         self._streamable = streamable
 
+    def shallow_copy(self) -> FlowDataEngine:
+        """Cheap de-aliasing wrapper around the same (immutable) Polars frame.
+
+        Shares the frame and the cached schema, but owns its own mutable flags
+        (_lazy, _streamable, number_of_records, _schema), so a consumer handed
+        this copy can never mutate an engine shared with sibling consumers.
+        Collect-free: forwarding number_of_records and the cached schema skips
+        both pl.len() and collect_schema() in __init__ (the schema fallback only
+        fires when _schema is unset, and is metadata-only). Deliberately does
+        not carry external_source: memoized results are materialized before
+        they are shared, so the plain frame is the whole result.
+        """
+        return FlowDataEngine(
+            self.data_frame,
+            name=self.name,
+            optimize_memory=self._optimize_memory,
+            schema=self._schema,
+            number_of_records=self.number_of_records,
+            streamable=self._streamable,
+            number_of_records_callback=self._number_of_records_callback,
+            data_callback=self._data_callback,
+        )
+
     def _calculate_schema(self) -> list[dict]:
         """Calculates schema statistics."""
         if self.external_source is not None:
@@ -2715,7 +3231,10 @@ class FlowDataEngine:
     @classmethod
     def create_from_path_worker(cls, received_table: input_schema.ReceivedTable, flow_id: int, node_id: int | str):
         """Creates a FlowDataEngine from a path in a worker process."""
+        refuse_cloud_path(received_table.path, received_table.file_type)
         received_table.set_absolute_filepath()
+        if received_table.scan_mode == "directory":
+            raise DirectoryScanUnsupportedError("Directory scan mode cannot be executed by the worker file reader.")
 
         external_fetcher = ExternalCreateFetcher(
             received_table=received_table, file_type=received_table.file_type, flow_id=flow_id, node_id=node_id
@@ -2737,6 +3256,9 @@ def execute_sql_query(*flowfile_tables: FlowDataEngine, sql_code: str) -> FlowDa
     Returns:
         A new FlowDataEngine instance containing the query result.
     """
+    from flowfile_core.flowfile.sources.external_sources.sql_source.sql_source import validate_sql_query
+
+    validate_sql_query(sql_code)
     ctx = pl.SQLContext()
     for i, flowfile_table in enumerate(flowfile_tables):
         ctx.register(f"input_{i + 1}", flowfile_table.data_frame)
@@ -2748,8 +3270,9 @@ def execute_polars_code(*flowfile_tables: FlowDataEngine, code: str) -> FlowData
     """Executes arbitrary Polars code on one or more FlowDataEngine objects.
 
     This function takes a string of Python code that uses Polars and executes it.
-    Input `FlowDataEngine` objects are made available in the code's scope as
-    `input_df` (for a single input) or `input_df_1`, `input_df_2`, etc.
+    Function-form code (a single ``def``) is called with the inputs as positional
+    LazyFrames; snippet code reads them as `input_df` (for a single input) or
+    `input_df_1`, `input_df_2`, etc.
 
     Args:
         *flowfile_tables: A variable number of `FlowDataEngine` objects to be
@@ -2760,13 +3283,7 @@ def execute_polars_code(*flowfile_tables: FlowDataEngine, code: str) -> FlowData
         A new `FlowDataEngine` instance containing the result of the executed code.
     """
     polars_executable = polars_code_parser.get_executable(code, num_inputs=len(flowfile_tables))
-    if len(flowfile_tables) == 0:
-        kwargs = {}
-    elif len(flowfile_tables) == 1:
-        kwargs = {"input_df": flowfile_tables[0].data_frame}
-    else:
-        kwargs = {f"input_df_{i+1}": flowfile_table.data_frame for i, flowfile_table in enumerate(flowfile_tables)}
-    df = polars_executable(**kwargs)
+    df = polars_executable(*(flowfile_table.data_frame for flowfile_table in flowfile_tables))
     if isinstance(df, pl.DataFrame):
         logger.warning("Got a non lazy DataFrame, possibly harming performance, if possible, try to use a lazy method")
     return FlowDataEngine(df)

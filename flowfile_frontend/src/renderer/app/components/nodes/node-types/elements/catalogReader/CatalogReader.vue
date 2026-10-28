@@ -58,7 +58,23 @@
           </el-select>
         </div>
 
-        <div v-if="versionOptions.length > 0" class="catalog-field">
+        <ChangeFeedReadSection
+          :model-value="cdcSettings"
+          :node-id="nodeData.node_id"
+          :status="cdcSectionStatus"
+          :version-options="versionOptions"
+          :disabled-reason="readDisabledReason"
+          :can-enable="canEnableTracking"
+          :enabling="enablingCdc"
+          :resetting="resettingCursor"
+          allow-last-run
+          persist-key="catalogReader.cdc"
+          @update:model-value="onCdcSettingsChange"
+          @enable="enableTracking"
+          @reset-cursor="handleResetCursor"
+        />
+
+        <div v-if="versionOptions.length > 0 && !selectedScd2" class="catalog-field">
           <label class="catalog-label">Version</label>
           <el-select v-model="nodeData.delta_version" size="small" placeholder="Latest" clearable>
             <el-option
@@ -70,6 +86,51 @@
           </el-select>
         </div>
 
+        <div v-if="selectedScd2" class="catalog-field">
+          <label class="catalog-label">History</label>
+          <el-select v-model="scd2View" size="small">
+            <el-option label="Active records" value="active" />
+            <el-option label="All records (default)" value="all" />
+            <el-option label="Active at a point in time" value="active_at" />
+          </el-select>
+          <p class="section-hint">
+            SCD2 table — versioned by {{ selectedScd2.business_keys.join(", ") }}, using
+            {{ selectedScd2.valid_from_column }} / {{ selectedScd2.valid_to_column }}.
+          </p>
+        </div>
+        <div v-if="selectedScd2 && scd2View === 'active_at'" class="catalog-field">
+          <label class="catalog-label">Active at</label>
+          <DateTimePicker
+            v-model="nodeData.scd2_as_of"
+            placeholder="Pick a date and time"
+            show-seconds
+          />
+          <p v-if="scd2AsOfError" class="field-error">{{ scd2AsOfError }}</p>
+        </div>
+        <!-- On SCD2 tables, Delta time travel is an escape hatch, not the history mechanism -->
+        <CollapsibleSection
+          v-if="selectedScd2 && versionOptions.length > 0"
+          title="Table version (time travel)"
+          :default-open="false"
+          nested
+          persist-key="catalogReader.deltaVersion"
+        >
+          <div class="catalog-field">
+            <el-select v-model="nodeData.delta_version" size="small" placeholder="Latest" clearable>
+              <el-option
+                v-for="v in versionOptions"
+                :key="v.version"
+                :label="v.label"
+                :value="v.version"
+              />
+            </el-select>
+            <p class="section-hint">
+              Snapshots the whole table at a past Delta commit — unrelated to the SCD2 row history
+              above.
+            </p>
+          </div>
+        </CollapsibleSection>
+
         <div v-if="selectedTableMeta" class="table-meta">
           Latest stats:
           <div class="meta-row">
@@ -80,15 +141,14 @@
             <span class="meta-label">Columns</span>
             <span class="meta-value">{{ selectedTableMeta.column_count }}</span>
           </div>
-          <div v-if="selectedTableMeta.schema_columns.length > 0" class="schema-preview">
+          <div v-if="schemaPreviewColumns.length > 0" class="schema-preview">
             <label class="catalog-label">Schema</label>
             <div class="schema-list">
-              <div
-                v-for="col in selectedTableMeta.schema_columns"
-                :key="col.name"
-                class="schema-col"
-              >
-                <span class="col-name">{{ col.name }}</span>
+              <div v-for="col in schemaPreviewColumns" :key="col.name" class="schema-col">
+                <span class="col-name">
+                  {{ col.name }}
+                  <span v-if="col.generated" class="col-generated-tag">changes</span>
+                </span>
                 <span class="col-type">{{ col.dtype }}</span>
               </div>
             </div>
@@ -137,14 +197,33 @@
 
 <script lang="ts" setup>
 import { ref, computed, onMounted, watch } from "vue";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { sql } from "@codemirror/lang-sql";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { Codemirror } from "vue-codemirror";
 import { useNodeStore } from "../../../../../stores/node-store";
 import { useNodeSettings } from "../../../../../composables/useNodeSettings";
+import { useResourceSharing } from "../../../../../composables/useResourceSharing";
 import { CatalogApi } from "../../../../../api/catalog.api";
-import type { CatalogTable, NamespaceTree, DeltaVersionCommit } from "../../../../../types";
-import type { NodeCatalogReader } from "../../../../../types/node.types";
+import { ChangeFeedReadSection, CollapsibleSection, DateTimePicker } from "../../../../common";
+import {
+  CDF_COLUMNS,
+  cdcFieldErrors,
+  deltaVersionOptions,
+  readModeDisabledReason,
+} from "../../../../../utils/catalogCdc";
+import type {
+  CatalogTable,
+  CdcCursor,
+  NamespaceTree,
+  DeltaVersionCommit,
+  TableCdcStatus,
+} from "../../../../../types";
+import {
+  DEFAULT_CDC_SETTINGS,
+  type CdcReaderSettings,
+  type NodeCatalogReader,
+} from "../../../../../types/node.types";
 
 const nodeStore = useNodeStore();
 const nodeData = ref<NodeCatalogReader | null>(null);
@@ -159,6 +238,9 @@ const cachedTableState = ref<{
   catalog_full_table_name: string | null;
   catalog_namespace_id: number | null;
   delta_version: number | null;
+  scd2_view: "active" | "all" | "active_at" | null;
+  scd2_as_of: string | null;
+  cdc: CdcReaderSettings;
   selectedTableMeta: CatalogTable | null;
   deltaVersions: DeltaVersionCommit[];
 } | null>(null);
@@ -166,6 +248,21 @@ const cachedSqlCode = ref<string | null>(null);
 
 const { saveSettings, pushNodeData } = useNodeSettings({
   nodeRef: nodeData,
+  onBeforeSave: () => {
+    if (scd2AsOfError.value) {
+      ElMessage.error(scd2AsOfError.value);
+      return false;
+    }
+    const errors = cdcFieldErrors(currentCdcSettings());
+    const cdcError = errors.consumerName ?? errors.version ?? errors.timestamp;
+    if (cdcError) {
+      ElMessage.error(cdcError);
+      return false;
+    }
+    if (nodeData.value?.cdc_consumer_name) {
+      nodeData.value.cdc_consumer_name = nodeData.value.cdc_consumer_name.trim() || null;
+    }
+  },
 });
 
 const catalogNamespaces = ref<{ id: number; label: string }[]>([]);
@@ -209,14 +306,162 @@ function tableOptionLabel(table: CatalogTable): string {
   return table.name;
 }
 
-const versionOptions = computed(() => {
-  return deltaVersions.value.map((v) => ({
-    version: v.version,
-    label: `v${v.version}${v.operation ? ` (${v.operation})` : ""}${v.timestamp ? ` - ${v.timestamp}` : ""}`,
-  }));
+const versionOptions = computed(() => deltaVersionOptions(deltaVersions.value));
+
+const selectedScd2 = computed(() => selectedTableMeta.value?.scd2 ?? null);
+// null on the wire means "all records" (no filter) — surface it explicitly so the
+// control is never blank. Choosing "All" writes null back (not the string "all"),
+// keeping the wire value the same as an unconfigured reader.
+const scd2View = computed({
+  get: () => nodeData.value?.scd2_view ?? "all",
+  set: (v: "active" | "all" | "active_at") => {
+    if (!nodeData.value) return;
+    nodeData.value.scd2_view = v === "all" ? null : v;
+  },
 });
 
-// Sync sqlCode with nodeData.sql_query
+// The picker is clearable and selecting "active at" seeds nothing, so the empty state is easy to
+// reach and the backend only rejects it with a message that never names the field.
+const scd2AsOfError = computed(() =>
+  selectedScd2.value && scd2View.value === "active_at" && !nodeData.value?.scd2_as_of
+    ? "Pick the date and time to read the table as of"
+    : null,
+);
+
+const { canManage } = useResourceSharing();
+const cdcStatus = ref<TableCdcStatus | null>(null);
+const enablingCdc = ref(false);
+const resettingCursor = ref(false);
+
+const readDisabledReason = computed(() =>
+  readModeDisabledReason(selectedTableMeta.value, nodeData.value?.delta_version ?? null),
+);
+
+const cdcSettings = computed(() => currentCdcSettings());
+
+function onCdcSettingsChange(settings: CdcReaderSettings) {
+  if (!nodeData.value) return;
+  const modeChanged = settings.cdc_mode !== nodeData.value.cdc_mode;
+  Object.assign(nodeData.value, settings);
+  if (!modeChanged) return;
+  if (settings.cdc_mode === "off") cdcStatus.value = null;
+  else if (settings.cdc_mode === "since_last_run") void loadCdcStatus();
+}
+
+// The tree's table row already carries the flag, so the /cdc round trip is only for cursors.
+const cdcSectionStatus = computed<TableCdcStatus>(
+  () =>
+    cdcStatus.value ?? {
+      cdc_enabled: selectedTableMeta.value?.cdc_enabled ?? false,
+      cdc_enabled_version: selectedTableMeta.value?.cdc_enabled_version ?? null,
+      current_version: null,
+      cursors: [],
+    },
+);
+
+const canEnableTracking = computed(
+  () => !!selectedTableMeta.value && canManage(selectedTableMeta.value),
+);
+
+const schemaPreviewColumns = computed(() => {
+  const columns = (selectedTableMeta.value?.schema_columns ?? []).map((c) => ({
+    name: c.name,
+    dtype: c.dtype,
+    generated: false,
+  }));
+  if ((nodeData.value?.cdc_mode ?? "off") === "off") return columns;
+  return [...columns, ...CDF_COLUMNS.map((c) => ({ ...c, generated: true }))];
+});
+
+function currentCdcSettings(): CdcReaderSettings {
+  const d = nodeData.value;
+  if (!d) return { ...DEFAULT_CDC_SETTINGS };
+  return {
+    cdc_mode: d.cdc_mode,
+    cdc_from_version: d.cdc_from_version,
+    cdc_from_timestamp: d.cdc_from_timestamp,
+    cdc_consumer_name: d.cdc_consumer_name,
+    cdc_start: d.cdc_start,
+    cdc_include_preimage: d.cdc_include_preimage,
+  };
+}
+
+function applyCdcSettings(settings: CdcReaderSettings) {
+  if (!nodeData.value) return;
+  Object.assign(nodeData.value, settings);
+  cdcStatus.value = null;
+}
+
+function resetCdcSettings() {
+  applyCdcSettings({ ...DEFAULT_CDC_SETTINGS });
+}
+
+async function loadCdcStatus() {
+  const tableId = nodeData.value?.catalog_table_id;
+  if (tableId == null) {
+    cdcStatus.value = null;
+    return;
+  }
+  try {
+    cdcStatus.value = await CatalogApi.getTableCdc(tableId);
+  } catch {
+    cdcStatus.value = null;
+  }
+}
+
+async function enableTracking() {
+  const table = selectedTableMeta.value;
+  if (!table) return;
+  enablingCdc.value = true;
+  try {
+    const status = await CatalogApi.enableTableCdc(table.id);
+    cdcStatus.value = status;
+    table.cdc_enabled = status.cdc_enabled;
+    table.cdc_enabled_version = status.cdc_enabled_version;
+    ElMessage.success("Change tracking enabled");
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? e?.message ?? "Could not enable change tracking");
+  } finally {
+    enablingCdc.value = false;
+  }
+}
+
+async function handleResetCursor(cursor: CdcCursor) {
+  const tableId = nodeData.value?.catalog_table_id;
+  if (tableId == null) return;
+  const target = nodeData.value?.cdc_start ?? "now";
+  const targetLabel = target === "beginning" ? "the beginning of tracked history" : "now";
+  try {
+    await ElMessageBox.confirm(
+      `Reset this cursor to ${targetLabel}? The next run reads from there instead of after v${cursor.last_version}.`,
+      "Reset cursor",
+      { confirmButtonText: "Reset", cancelButtonText: "Cancel", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  resettingCursor.value = true;
+  try {
+    await CatalogApi.resetCdcCursor(tableId, cursor.consumer_key, target);
+    await loadCdcStatus();
+    ElMessage.success("Cursor reset");
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? e?.message ?? "Could not reset the cursor");
+  } finally {
+    resettingCursor.value = false;
+  }
+}
+
+// Pinning a version and reading changes are mutually exclusive (the backend rejects both).
+watch(
+  () => nodeData.value?.delta_version,
+  (version) => {
+    if (version != null && nodeData.value && nodeData.value.cdc_mode !== "off") {
+      resetCdcSettings();
+    }
+  },
+);
+
 watch(sqlCode, (newCode) => {
   if (nodeData.value) {
     nodeData.value.sql_query = newCode || null;
@@ -228,13 +473,15 @@ function switchMode(newMode: "table" | "sql") {
   if (!nodeData.value) return;
 
   if (newMode === "sql") {
-    // Cache table state before clearing
     cachedTableState.value = {
       catalog_table_id: nodeData.value.catalog_table_id,
       catalog_table_name: nodeData.value.catalog_table_name,
       catalog_full_table_name: nodeData.value.catalog_full_table_name,
       catalog_namespace_id: nodeData.value.catalog_namespace_id,
       delta_version: nodeData.value.delta_version,
+      scd2_view: nodeData.value.scd2_view,
+      scd2_as_of: nodeData.value.scd2_as_of,
+      cdc: currentCdcSettings(),
       selectedTableMeta: selectedTableMeta.value,
       deltaVersions: [...deltaVersions.value],
     };
@@ -242,29 +489,33 @@ function switchMode(newMode: "table" | "sql") {
     nodeData.value.catalog_table_name = null;
     nodeData.value.catalog_full_table_name = null;
     nodeData.value.delta_version = null;
+    nodeData.value.scd2_view = null;
+    nodeData.value.scd2_as_of = null;
+    resetCdcSettings();
     selectedTableMeta.value = null;
     deltaVersions.value = [];
 
-    // Restore cached SQL if available
     if (cachedSqlCode.value != null) {
       sqlCode.value = cachedSqlCode.value;
       nodeData.value.sql_query = cachedSqlCode.value || null;
     }
   } else {
-    // Cache SQL state before clearing
     cachedSqlCode.value = sqlCode.value;
     nodeData.value.sql_query = null;
     sqlCode.value = "";
 
-    // Restore cached table state if available
     if (cachedTableState.value) {
       nodeData.value.catalog_table_id = cachedTableState.value.catalog_table_id;
       nodeData.value.catalog_table_name = cachedTableState.value.catalog_table_name;
       nodeData.value.catalog_full_table_name = cachedTableState.value.catalog_full_table_name;
       nodeData.value.catalog_namespace_id = cachedTableState.value.catalog_namespace_id;
       nodeData.value.delta_version = cachedTableState.value.delta_version;
+      nodeData.value.scd2_view = cachedTableState.value.scd2_view;
+      nodeData.value.scd2_as_of = cachedTableState.value.scd2_as_of;
+      applyCdcSettings(cachedTableState.value.cdc);
       selectedTableMeta.value = cachedTableState.value.selectedTableMeta;
       deltaVersions.value = cachedTableState.value.deltaVersions;
+      if (nodeData.value.cdc_mode === "since_last_run") void loadCdcStatus();
     }
   }
 
@@ -288,6 +539,9 @@ function handleNamespaceChange() {
     nodeData.value.catalog_table_name = null;
     nodeData.value.catalog_full_table_name = null;
     nodeData.value.delta_version = null;
+    nodeData.value.scd2_view = null;
+    nodeData.value.scd2_as_of = null;
+    resetCdcSettings();
   }
   selectedTableMeta.value = null;
   deltaVersions.value = [];
@@ -297,6 +551,8 @@ async function handleTableChange(tableId: number | null) {
   if (!nodeData.value) return;
   nodeData.value.delta_version = null;
   deltaVersions.value = [];
+  // Cursors are per table, so a retarget always starts over.
+  resetCdcSettings();
 
   const table = allTables.value.find((t) => t.id === tableId);
   if (table) {
@@ -304,10 +560,17 @@ async function handleTableChange(tableId: number | null) {
     nodeData.value.catalog_namespace_id = table.namespace_id;
     nodeData.value.catalog_full_table_name = table.full_table_name ?? null;
     selectedTableMeta.value = table;
+    // The newly selected table may not be SCD2-tracked — drop a stale view/timestamp.
+    if (!table.scd2) {
+      nodeData.value.scd2_view = null;
+      nodeData.value.scd2_as_of = null;
+    }
     await loadTableHistory(table.id);
   } else {
     nodeData.value.catalog_table_name = null;
     nodeData.value.catalog_full_table_name = null;
+    nodeData.value.scd2_view = null;
+    nodeData.value.scd2_as_of = null;
     selectedTableMeta.value = null;
   }
 }
@@ -371,6 +634,15 @@ async function loadNodeData(nodeId: number) {
     if (nodeData.value!.catalog_full_table_name === undefined) {
       nodeData.value!.catalog_full_table_name = null;
     }
+    if (nodeData.value!.scd2_view === undefined) {
+      nodeData.value!.scd2_view = null;
+    }
+    if (nodeData.value!.scd2_as_of === undefined) {
+      nodeData.value!.scd2_as_of = null;
+    }
+    if (nodeData.value!.cdc_mode === undefined) {
+      Object.assign(nodeData.value!, DEFAULT_CDC_SETTINGS);
+    }
   } else {
     nodeData.value = {
       catalog_table_id: null,
@@ -378,7 +650,10 @@ async function loadNodeData(nodeId: number) {
       catalog_table_name: null,
       catalog_namespace_id: null,
       delta_version: null,
+      scd2_view: null,
+      scd2_as_of: null,
       sql_query: null,
+      ...DEFAULT_CDC_SETTINGS,
       flow_id: nodeStore.flow_id,
       node_id: nodeId,
       cache_results: false,
@@ -389,7 +664,6 @@ async function loadNodeData(nodeId: number) {
     };
   }
 
-  // Detect mode from saved settings
   if (nodeData.value?.sql_query) {
     mode.value = "sql";
     sqlCode.value = nodeData.value.sql_query;
@@ -399,7 +673,6 @@ async function loadNodeData(nodeId: number) {
 
   dataLoaded.value = true;
 
-  // Ensure catalog data is loaded before looking up the table
   if (catalogLoadPromise) await catalogLoadPromise;
 
   if (mode.value === "table" && nodeData.value?.catalog_table_id) {
@@ -407,6 +680,7 @@ async function loadNodeData(nodeId: number) {
     if (table) {
       selectedTableMeta.value = table;
       await loadTableHistory(table.id);
+      if (nodeData.value.cdc_mode === "since_last_run") await loadCdcStatus();
     }
   }
 }
@@ -547,6 +821,16 @@ defineExpose({
   font-size: 11px;
 }
 
+.col-generated-tag {
+  margin-left: 6px;
+  padding: 0 4px;
+  font-family: inherit;
+  font-size: 10px;
+  color: var(--el-color-primary, var(--color-primary));
+  background: var(--el-color-primary-light-9, rgba(64, 158, 255, 0.1));
+  border-radius: 3px;
+}
+
 .sql-editor-wrapper {
   display: flex;
   flex-direction: column;
@@ -557,6 +841,12 @@ defineExpose({
   margin: 0;
   font-size: 12px;
   color: var(--color-text-muted);
+}
+
+.field-error {
+  margin: 0;
+  font-size: 11px;
+  color: var(--el-color-danger);
 }
 
 .editor-container {

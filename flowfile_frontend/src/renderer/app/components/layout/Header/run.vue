@@ -1,22 +1,29 @@
 <template>
   <div class="button-group">
     <el-button size="small" :disabled="nodeStore.isRunning" round @click="runFlow()">
-      <span class="material-icons run-icon">play_arrow</span>
-      Run
+      <span v-if="!isCancelling" class="material-icons run-icon">play_arrow</span>
+      {{ isCancelling ? "Cancelling…" : "Run" }}
     </el-button>
-    <el-button v-if="nodeStore.isRunning" size="small" round @click="cancelFlow()">
+    <el-button
+      v-if="nodeStore.isRunning"
+      :disabled="cancelPending"
+      size="small"
+      round
+      @click="cancelFlow()"
+    >
       Cancel
     </el-button>
   </div>
 </template>
 
 <script setup lang="ts">
+import { computed } from "vue";
 import { useNodeStore } from "../../../stores/column-store";
+import { useEditorStore } from "../../../stores/editor-store";
 import { useFlowExecution } from "../../../composables/useFlowExecution";
-import { useTutorialStore } from "../../../stores/tutorial-store";
 
 const nodeStore = useNodeStore();
-const tutorialStore = useTutorialStore();
+const editorStore = useEditorStore();
 
 const props = defineProps({
   flowId: { type: Number, required: true },
@@ -25,12 +32,12 @@ const props = defineProps({
     default: () => ({
       interval: 2000,
       enabled: true,
-      maxAttempts: Infinity,
+      maxAttempts: 5,
     }),
   },
   persistPolling: {
     type: Boolean,
-    default: false, // RunButton doesn't need persistent polling by default
+    default: true,
   },
 });
 
@@ -38,35 +45,36 @@ const props = defineProps({
 // Without this, Save As re-keys nodeStore.flow_id but the run button keeps
 // firing /flow/run/ and getFlowSettings against the old (template) id.
 const {
-  runFlow: executeFlow,
+  runFlow,
   cancelFlow,
+  isCancelling: cancelPending,
   showNotification,
   startPolling,
+  startStatusPolling,
   stopPolling,
   checkRunStatus,
+  checkStatusPolling,
+  getOperationOwner,
+  freezeFlow,
+  unFreezeFlow,
 } = useFlowExecution(() => props.flowId, props.pollingConfig, {
   persistPolling: props.persistPolling,
-  pollingKey: `run_button_${props.flowId}`,
 });
-
-// Wrapper to also advance tutorial when run is clicked
-const runFlow = () => {
-  executeFlow();
-  // Advance tutorial if we're on the "run-flow" step
-  if (tutorialStore.isActive && tutorialStore.currentStep?.id === "run-flow") {
-    setTimeout(() => {
-      tutorialStore.nextStep();
-    }, 500);
-  }
-};
+const isCancelling = computed(
+  () => nodeStore.isRunning && (editorStore.isCanceled || cancelPending.value),
+);
 
 defineEmits(["logs-start", "logs-stop"]);
 
-// Expose methods if parent component needs them
 defineExpose({
   startPolling,
+  startStatusPolling,
   stopPolling,
   checkRunStatus,
+  checkStatusPolling,
+  getOperationOwner,
+  freezeFlow,
+  unFreezeFlow,
   showNotification,
   runFlow,
   cancelFlow,

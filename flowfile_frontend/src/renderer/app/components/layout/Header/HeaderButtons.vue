@@ -10,7 +10,11 @@
         :show-arrow="true"
       >
         <template #reference>
-          <button class="action-btn action-btn--split-main" @click="openSaveModal">
+          <button
+            class="action-btn action-btn--split-main"
+            data-tutorial="save-main-btn"
+            @click="openSaveModal"
+          >
             <span class="material-icons btn-icon">save</span>
             <span class="btn-text">Save</span>
           </button>
@@ -85,7 +89,11 @@
         :show-arrow="true"
       >
         <template #reference>
-          <button class="action-btn action-btn--split-main" @click="handleQuickCreate">
+          <button
+            class="action-btn action-btn--split-main"
+            data-tutorial="quick-create-main-btn"
+            @click="handleQuickCreate"
+          >
             <span class="material-icons btn-icon">add_circle_outline</span>
             <span class="btn-text">Create</span>
           </button>
@@ -117,6 +125,11 @@
               <span class="material-icons save-as-icon">folder_open</span>
               Create at specific location…
             </el-dropdown-item>
+            <el-dropdown-item divided @click="openAlteryxDialog">
+              <span class="material-icons save-as-icon">upload_file</span>
+              Import Alteryx workflow…
+              <span class="beta-badge alteryx-beta">Beta</span>
+            </el-dropdown-item>
           </el-dropdown-menu>
         </template>
       </el-dropdown>
@@ -126,7 +139,7 @@
   <!-- Hidden run-button instance kept solely to back loadFlowSettings()'s
        polling-restoration path. The user-visible run-button now lives in
        RightActionCluster; this off-screen instance preserves the existing
-       runButton.value.startPolling()/stopPolling() calls below without
+       runButton.value.startStatusPolling()/stopPolling() calls below without
        refactoring the polling restore. v-show:false stays in the layout
        tree so the ref resolves. -->
   <run-button v-show="false" ref="runButton" :flow-id="nodeStore.flow_id" aria-hidden="true" />
@@ -149,6 +162,8 @@
     v-model:visible="modalVisibleForCreate"
     @create-complete="handleCreateComplete"
   />
+
+  <alteryx-import-dialog v-model:visible="modalVisibleForAlteryx" @imported="emit('refreshFlow')" />
 
   <el-dialog
     v-model="modalVisibleForSettings"
@@ -224,6 +239,19 @@
             />
             <span class="form-hint"> Display input names on connections between nodes. </span>
           </div>
+          <div class="form-group">
+            <el-checkbox
+              v-model="flowSettings.validate_settings"
+              label="Warn about invalid node settings"
+              size="small"
+              @change="pushFlowSettings"
+            />
+            <span class="form-hint">
+              Shows a warning on nodes that use columns no longer available from their input, and on
+              formula or filter expressions that cannot run against it. Only applies when the input
+              schema is known without running the flow.
+            </span>
+          </div>
         </div>
         <div class="settings-section">
           <h4 class="settings-section-title">Parameters</h4>
@@ -231,42 +259,7 @@
             Define flow-level parameters and reference them in node settings using
             <code>${param_name}</code> syntax.
           </span>
-          <div v-if="flowSettings.parameters && flowSettings.parameters.length > 0">
-            <div v-for="(param, index) in flowSettings.parameters" :key="index" class="param-row">
-              <el-input
-                v-model="param.name"
-                placeholder="Name"
-                size="small"
-                class="param-name-input"
-                @change="pushFlowSettings"
-              />
-              <el-input
-                v-model="param.default_value"
-                placeholder="Default value"
-                size="small"
-                class="param-value-input"
-                @change="pushFlowSettings"
-              />
-              <el-input
-                v-model="param.description"
-                placeholder="Description (optional)"
-                size="small"
-                class="param-desc-input"
-                @change="pushFlowSettings"
-              />
-              <el-button
-                type="danger"
-                size="small"
-                :icon="'Delete'"
-                circle
-                @click="removeParameter(index)"
-              />
-            </div>
-          </div>
-          <div v-else class="param-empty">No parameters defined.</div>
-          <el-button size="small" style="margin-top: var(--spacing-3)" @click="addParameter">
-            + Add Parameter
-          </el-button>
+          <parameter-settings v-model="flowSettings.parameters" @change="pushFlowSettings" />
         </div>
       </div>
     </div>
@@ -284,12 +277,18 @@ import { ElMessage } from "element-plus";
 
 import { saveFlowSilent } from "./utils";
 import RunButton from "./run.vue";
+import ParameterSettings from "./ParameterSettings.vue";
 import SaveDialog from "../../../features/designer/components/SaveDialog.vue";
 import OpenDialog from "../../../features/designer/components/OpenDialog.vue";
 import CreateDialog from "../../../features/designer/components/CreateDialog.vue";
+import AlteryxImportDialog from "../../../features/designer/components/AlteryxImportDialog.vue";
 import { useNodeStore } from "../../../stores/column-store";
+import { useFlowStore } from "../../../stores/flow-store";
 import { useEditorStore } from "../../../stores/editor-store";
 import { useTutorialStore } from "../../../stores/tutorial-store";
+import { useProjectStore } from "../../../stores/project-store";
+import { useCatalogStore } from "../../../stores/catalog-store";
+import { useRecentFlows } from "../../../composables/useRecentFlows";
 import {
   createFlow,
   getFlowSettings,
@@ -297,18 +296,22 @@ import {
   updateFlowSettings,
   ExecutionMode,
   ExecutionLocation,
-  updateRunStatus,
+  getRunStatus,
 } from "../../nodes/nodeLogic";
-import type { FlowParameter } from "../../../types/flow.types";
 import { MODIFIER_LABEL } from "../../../utils/shortcuts";
 
 const nodeStore = useNodeStore();
+const flowStore = useFlowStore();
 const editorStore = useEditorStore();
 const tutorialStore = useTutorialStore();
+const projectStore = useProjectStore();
+const catalogStore = useCatalogStore();
+const { recordFlow, recordFlowFromSettings, reconcileWithCatalog, removeFlow } = useRecentFlows();
 
 const modalVisibleForOpen = ref(false);
 const modalVisibleForSave = ref(false);
 const modalVisibleForCreate = ref(false);
+const modalVisibleForAlteryx = ref(false);
 const modalVisibleForSettings = ref(false);
 
 // Save is a no-op when no flow is loaded; hide the button entirely rather
@@ -318,17 +321,19 @@ const hasOpenFlow = computed(() => !!nodeStore.flow_id && nodeStore.flow_id > 0)
 const flowSettings = ref<FlowSettings | null>(null);
 const runButton = ref<InstanceType<typeof RunButton> | null>(null);
 
-// Main "Create" click: instant quick-create — flow lands in
-// ~/.flowfile/flows/unnamed_flows/ via the backend's auto-naming, auto-
-// registered in the default catalog namespace. Users who want to pick a
-// location or namespace use the chevron → "Create at specific location…".
+// Main "Create" click: instant quick-create — an unregistered draft. The YAML
+// lands in ~/.flowfile/flows/unnamed_flows/ (crash-safe), but no catalog row is
+// minted: the flow joins the catalog on first run or an explicit save into a
+// schema. Users who want a location or namespace up front use the chevron →
+// "Create at specific location…".
 const handleQuickCreate = async () => {
   try {
-    const createdFlowId = await createFlow(null, null);
+    const createdFlowId = await createFlow(null, null, null, false);
     nodeStore.setFlowId(createdFlowId);
+    await recordCurrentFlowAsRecent();
     emit("refreshFlow");
     ElMessage.success("Flow created");
-    advanceQuickCreateTutorial();
+    tutorialStore.notify({ type: "flow-created", flowId: createdFlowId });
   } catch (error) {
     console.error("Failed to create flow:", error);
     ElMessage.error("Failed to create flow");
@@ -339,23 +344,26 @@ const openCreateDialog = () => {
   modalVisibleForCreate.value = true;
 };
 
-const advanceQuickCreateTutorial = () => {
-  if (!tutorialStore.isActive) return;
-  const stepId = tutorialStore.currentStep?.id;
-  if (stepId === "click-quick-create" || stepId === "confirm-create-flow") {
-    setTimeout(() => {
-      tutorialStore.nextStep();
-    }, 200);
-  }
+const openAlteryxDialog = () => {
+  modalVisibleForAlteryx.value = true;
 };
 
-const handleCreateComplete = (flowId: number) => {
+const handleCreateComplete = async (flowId: number, catalogRef?: string) => {
   modalVisibleForCreate.value = false;
   if (flowId) {
     nodeStore.setFlowId(flowId);
+    await recordCurrentFlowAsRecent(catalogRef);
     emit("refreshFlow");
+    tutorialStore.notify({ type: "flow-created", flowId });
   }
-  advanceQuickCreateTutorial();
+};
+
+// Created flows never pass through DesignerView's reloadCanvas (the open-path
+// recording seam), so record them here. loadFlowSettings dedupes with the
+// flow_id watcher's concurrent call, so this costs no extra request.
+const recordCurrentFlowAsRecent = async (catalogRef?: string) => {
+  await loadFlowSettings();
+  recordFlowFromSettings(flowSettings.value, catalogRef);
 };
 
 const executionModes = ref<ExecutionMode[]>(["Development", "Performance"]);
@@ -372,36 +380,92 @@ const executionLocationOptions = ref<ExecutionLocationOption[]>([
 
 const emit = defineEmits(["openFlow", "refreshFlow", "flowSaved", "logs-start", "logs-stop"]);
 
-const loadFlowSettings = async () => {
-  if (!(nodeStore.flow_id && nodeStore.flow_id > 0)) return;
+// Collapse the concurrent watcher-triggered + explicit loadFlowSettings calls fired on
+// flow load (setFlowId fires the flow_id watcher while initialSetup also calls explicitly)
+// into one getFlowSettings + one run_status. Keyed by flow_id; cleared once settled.
+let settingsLoad: { id: number; promise: Promise<void> } | null = null;
 
-  flowSettings.value = await getFlowSettings(nodeStore.flow_id);
-  if (!flowSettings.value) return;
+const loadFlowSettings = async (): Promise<void> => {
+  const flowId = nodeStore.flow_id;
+  if (!(flowId && flowId > 0)) return;
+  if (settingsLoad && settingsLoad.id === flowId) return settingsLoad.promise;
 
-  flowSettings.value.execution_mode = flowSettings.value.execution_mode || "Development";
-  flowSettings.value.show_edge_labels = flowSettings.value.show_edge_labels ?? false;
-  flowSettings.value.parameters = flowSettings.value.parameters ?? [];
-  editorStore.displayLogViewer = flowSettings.value.show_detailed_progress;
-  editorStore.showEdgeLabels = flowSettings.value.show_edge_labels;
+  const wasRunning = editorStore.isRunning;
+  const wasCanceled = editorStore.isCanceled;
+  const owner = runButton.value?.getOperationOwner();
+  const refreshCounter = flowStore.pendingRunStateCounter;
+  let stale = false;
+  let promise = Promise.resolve();
+  promise = (async () => {
+    const settings = await getFlowSettings(flowId);
+    if (settingsLoad?.promise !== promise) return;
+    if (
+      nodeStore.flow_id !== flowId ||
+      runButton.value?.getOperationOwner() !== owner ||
+      flowStore.pendingRunStateCounter !== refreshCounter ||
+      editorStore.isRunning !== wasRunning ||
+      editorStore.isCanceled !== wasCanceled
+    ) {
+      stale = true;
+      return;
+    }
+    flowSettings.value = settings;
+    if (!flowSettings.value) return;
 
-  if (!runButton.value) return;
+    flowSettings.value.execution_mode = flowSettings.value.execution_mode || "Development";
+    flowSettings.value.show_edge_labels = flowSettings.value.show_edge_labels ?? false;
+    flowSettings.value.parameters = flowSettings.value.parameters ?? [];
+    flowStore.setParameters(flowSettings.value.parameters);
+    editorStore.displayLogViewer = flowSettings.value.show_detailed_progress;
+    editorStore.showEdgeLabels = flowSettings.value.show_edge_labels;
+    editorStore.isCanceled = flowSettings.value.is_running && flowSettings.value.is_canceled;
 
-  if (flowSettings.value.is_running) {
-    editorStore.isRunning = true;
-    runButton.value.startPolling(runButton.value.checkRunStatus);
-  } else {
-    editorStore.isRunning = false;
-    runButton.value.stopPolling();
-    updateRunStatus(nodeStore.flow_id, nodeStore);
+    const button = runButton.value;
+    if (!button) return;
+
+    if (flowSettings.value.is_running) {
+      editorStore.isRunning = true;
+      button.freezeFlow();
+      button.startStatusPolling(flowId, !flowSettings.value.is_canceled);
+    } else {
+      editorStore.isRunning = false;
+      button.unFreezeFlow();
+      if (!button.checkStatusPolling()) {
+        void getRunStatus(flowId)
+          .then((response) => {
+            if (nodeStore.flow_id === flowId && response.status === 200)
+              nodeStore.insertRunResult(response.data);
+          })
+          .catch(() => {
+            /* An idle flow may have been evicted; leave its results unchanged. */
+          });
+      }
+    }
+  })();
+
+  settingsLoad = { id: flowId, promise };
+  try {
+    await promise;
+  } finally {
+    if (settingsLoad?.promise === promise) {
+      settingsLoad = null;
+      if (
+        nodeStore.flow_id === flowId &&
+        (stale || flowStore.pendingRunStateCounter !== refreshCounter)
+      )
+        await loadFlowSettings();
+    }
   }
 };
 
 const pushFlowSettings = async () => {
   if (flowSettings.value) {
     await updateFlowSettings(flowSettings.value);
+    flowStore.setParameters(flowSettings.value.parameters ?? []);
     editorStore.displayLogViewer = flowSettings.value.show_detailed_progress;
     editorStore.showEdgeLabels = flowSettings.value.show_edge_labels;
     editorStore.bumpGraphVersion();
+    flowStore.fetchSettingsValidation();
   }
 };
 
@@ -415,8 +479,9 @@ const openDialogRef = ref<{
   close: () => void;
 } | null>(null);
 
-const handleSaveDialogComplete = (flowId: number) => {
+const handleSaveDialogComplete = async (flowId: number) => {
   modalVisibleForSave.value = false;
+  const previousPath = flowSettings.value?.path ?? null;
   if (flowId && flowId !== nodeStore.flow_id) {
     // "Save As" produced a new flow identity — switch to it
     nodeStore.setFlowId(flowId);
@@ -424,14 +489,36 @@ const handleSaveDialogComplete = (flowId: number) => {
   } else {
     emit("flowSaved", flowId);
   }
-  if (tutorialStore.isActive && tutorialStore.currentStep?.id === "save-flow") {
-    setTimeout(() => {
-      tutorialStore.nextStep();
-    }, 300);
-  }
+  projectStore.onSourceChanged();
+  tutorialStore.notify({ type: "flow-saved", flowId: nodeStore.flow_id });
+  // A catalog save adds/updates a registration; refresh the cached listing so
+  // the Catalog view and recents reflect it without a manual reload.
+  await catalogStore.loadAllFlows();
+  await recordRelocatedFlowAsRecent(previousPath);
+  await reconcileWithCatalog();
 };
 
-function handleOpenFromDialog(payload: { message: string; flowPath: string }) {
+// Save As / save-to-catalog move the flow, and recents are keyed by path.
+const recordRelocatedFlowAsRecent = async (previousPath: string | null) => {
+  await loadFlowSettings();
+  const newPath = flowSettings.value?.path;
+  if (!newPath) return;
+  // Label from the registration: flow_settings.name is the on-disk stem after a save.
+  const registration = catalogStore.allFlows.find((f) => f.flow_path === newPath);
+  recordFlow({ path: newPath, name: registration?.name, catalogId: registration?.id });
+  if (!previousPath || previousPath === newPath) return;
+  // Prune only when the backend removed the old file (it unlinks scratch flows on
+  // Save As). A regular Save As is a copy, so the original still opens.
+  const previous = catalogStore.allFlows.find((f) => f.flow_path === previousPath);
+  if (previous && previous.file_exists === false) removeFlow(previousPath);
+};
+
+function handleOpenFromDialog(payload: {
+  message: string;
+  flowPath: string;
+  flowName?: string;
+  catalogRef?: string;
+}) {
   emit("openFlow", payload);
   nodeStore.resetRunResults();
   modalVisibleForOpen.value = false;
@@ -448,12 +535,9 @@ const openSaveModal = async () => {
     try {
       await saveFlowSilent(nodeStore.flow_id);
       emit("flowSaved", nodeStore.flow_id);
-      ElMessage.success("Flow saved successfully");
-      if (tutorialStore.isActive && tutorialStore.currentStep?.id === "save-flow") {
-        setTimeout(() => {
-          tutorialStore.nextStep();
-        }, 300);
-      }
+      projectStore.onSourceChanged();
+      ElMessage.success("Flow saved");
+      tutorialStore.notify({ type: "flow-saved", flowId: nodeStore.flow_id });
     } catch (error: any) {
       ElMessage.error({
         message: error.message || "Failed to save flow",
@@ -487,34 +571,36 @@ const runFlow = () => {
   }
 };
 
-const addParameter = () => {
-  if (!flowSettings.value) return;
-  if (!flowSettings.value.parameters) {
-    flowSettings.value.parameters = [];
-  }
-  flowSettings.value.parameters.push({
-    name: "",
-    default_value: "",
-    description: "",
-  } as FlowParameter);
-  pushFlowSettings();
-};
-
-const removeParameter = (index: number) => {
-  if (!flowSettings.value?.parameters) return;
-  flowSettings.value.parameters.splice(index, 1);
-  pushFlowSettings();
-};
-
 const openSettingsModal = () => {
   modalVisibleForSettings.value = true;
+  tutorialStore.notify({ type: "flow-settings-opened" });
 };
+
+// Allow other components (e.g. the Performance-mode notice in the run results)
+// to open the Flow Settings modal via an editor-store signal.
+watch(
+  () => editorStore.flowSettingsOpenRequest,
+  () => openSettingsModal(),
+);
+
+// Another client started or finished a run (the change feed): re-read the run state the
+// way a flow load does, which starts or stops the polling and picks up the result.
+watch(
+  () => flowStore.pendingRunStateCounter,
+  () => {
+    void loadFlowSettings();
+  },
+);
 
 watch(
   () => nodeStore.flow_id,
   async (newId, oldId) => {
     if (newId !== oldId && newId > 0) {
       await loadFlowSettings();
+    } else if (newId <= 0) {
+      // No flow open — drop the cache so the settings modal can't show
+      // (or POST back) a closed flow's settings.
+      flowSettings.value = null;
     }
   },
 );
@@ -522,6 +608,7 @@ watch(
 defineExpose({
   loadFlowSettings,
   openCreateDialog,
+  openAlteryxDialog,
   handleQuickCreate,
   openOpenDialog: () => (modalVisibleForOpen.value = true),
   openSaveModal,
@@ -669,6 +756,10 @@ onMounted(async () => {
   vertical-align: middle;
 }
 
+.alteryx-beta {
+  margin-left: var(--spacing-2);
+}
+
 .settings-modal-content {
   padding: var(--spacing-4);
   font-family: var(--font-family-base);
@@ -720,33 +811,5 @@ onMounted(async () => {
 .dialog-footer {
   display: flex;
   gap: var(--spacing-2);
-}
-
-.param-row {
-  display: flex;
-  align-items: center;
-  gap: var(--spacing-2);
-  margin-bottom: var(--spacing-2);
-}
-
-.param-name-input {
-  flex: 1;
-  min-width: 80px;
-}
-
-.param-value-input {
-  flex: 2;
-  min-width: 100px;
-}
-
-.param-desc-input {
-  flex: 3;
-  min-width: 120px;
-}
-
-.param-empty {
-  font-size: var(--font-size-sm);
-  color: var(--color-text-muted, #999);
-  font-style: italic;
 }
 </style>

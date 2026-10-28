@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from jose import jwt as jose_jwt
+import jwt as jose_jwt
 from sqlalchemy.orm import Session
 
 from flowfile_core import main
@@ -30,7 +30,6 @@ def test_user_credentials():
 def create_test_user(test_user_credentials):
     """Fixture to create a test user in the database."""
     with get_db_context() as db:
-        # Clean up any existing test user
         existing_user = db.query(db_models.User).filter(
             db_models.User.username == test_user_credentials["username"]
         ).first()
@@ -38,7 +37,6 @@ def create_test_user(test_user_credentials):
             db.delete(existing_user)
             db.commit()
 
-        # Create new test user
         hashed_password = get_password_hash(test_user_credentials["password"])
         test_user = db_models.User(
             username=test_user_credentials["username"],
@@ -54,7 +52,6 @@ def create_test_user(test_user_credentials):
 
     yield user_id
 
-    # Cleanup after test
     with get_db_context() as db:
         user = db.query(db_models.User).filter(db_models.User.id == user_id).first()
         if user:
@@ -97,9 +94,7 @@ class TestPasswordUtilities:
         hash1 = get_password_hash(password)
         hash2 = get_password_hash(password)
 
-        # Hashes should be different due to salt
         assert hash1 != hash2
-        # But both should verify correctly
         assert verify_password(password, hash1) is True
         assert verify_password(password, hash2) is True
 
@@ -115,7 +110,6 @@ class TestElectronModeAuth:
     def test_electron_mode_auto_authenticate(self):
         """Test that Electron mode auto-authenticates without credentials."""
         with TestClient(main.app) as client:
-            # Post to /auth/token without any credentials
             response = client.post("/auth/token")
 
             assert response.status_code == 200
@@ -127,7 +121,6 @@ class TestElectronModeAuth:
     def test_electron_mode_ignores_credentials(self):
         """Test that Electron mode ignores provided credentials."""
         with TestClient(main.app) as client:
-            # Even with wrong credentials, should auto-authenticate
             response = client.post(
                 "/auth/token",
                 data={"username": "wronguser", "password": "wrongpass"}
@@ -247,7 +240,6 @@ class TestDockerAdminUserCreation:
         admin_username = "dockeradmin"
         admin_password = "dockerpass123"
 
-        # Clean up first
         self.cleanup_admin_user(admin_username)
 
         try:
@@ -260,7 +252,6 @@ class TestDockerAdminUserCreation:
 
                 assert result is True
 
-                # Verify user was created
                 user = db.query(db_models.User).filter(
                     db_models.User.username == admin_username
                 ).first()
@@ -277,7 +268,6 @@ class TestDockerAdminUserCreation:
         """Test admin user is not created in Electron mode."""
         admin_username = "electronuser"
 
-        # Clean up first
         self.cleanup_admin_user(admin_username)
 
         try:
@@ -290,7 +280,6 @@ class TestDockerAdminUserCreation:
 
                 assert result is False
 
-                # Verify user was not created
                 user = db.query(db_models.User).filter(
                     db_models.User.username == admin_username
                 ).first()
@@ -326,11 +315,9 @@ class TestDockerAdminUserCreation:
         admin_username = "existingadmin"
         original_password = "originalpass"
 
-        # Clean up first
         self.cleanup_admin_user(admin_username)
 
         try:
-            # Create user manually
             with get_db_context() as db:
                 original_hash = get_password_hash(original_password)
                 user = db_models.User(
@@ -342,7 +329,6 @@ class TestDockerAdminUserCreation:
                 db.add(user)
                 db.commit()
 
-            # Try to create admin user with same username
             monkeypatch.setenv("FLOWFILE_MODE", "docker")
             monkeypatch.setenv("FLOWFILE_ADMIN_USER", admin_username)
             monkeypatch.setenv("FLOWFILE_ADMIN_PASSWORD", "newpassword")
@@ -352,7 +338,6 @@ class TestDockerAdminUserCreation:
 
                 assert result is False
 
-                # Verify original user is unchanged
                 user = db.query(db_models.User).filter(
                     db_models.User.username == admin_username
                 ).first()
@@ -360,7 +345,6 @@ class TestDockerAdminUserCreation:
                 assert user is not None
                 assert user.email == f"{admin_username}@original.com"
                 assert user.full_name == "Original User"
-                # Password should still be the original
                 assert verify_password(original_password, user.hashed_password)
                 assert not verify_password("newpassword", user.hashed_password)
         finally:
@@ -371,11 +355,9 @@ class TestDockerAdminUserCreation:
         admin_username = "loginadmin"
         admin_password = "loginpass123"
 
-        # Clean up first
         self.cleanup_admin_user(admin_username)
 
         try:
-            # Create admin user
             monkeypatch.setenv("FLOWFILE_MODE", "docker")
             monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-for-unit-tests")
             monkeypatch.setenv("FLOWFILE_ADMIN_USER", admin_username)
@@ -384,7 +366,6 @@ class TestDockerAdminUserCreation:
             with get_db_context() as db:
                 create_docker_admin_user(db)
 
-            # Try to login
             with TestClient(main.app) as client:
                 response = client.post(
                     "/auth/token",
@@ -463,14 +444,12 @@ class TestRefreshToken:
         with TestClient(main.app) as client:
             login_data = self._login(client, test_user_credentials)
 
-            # Get new tokens via refresh
             refresh_response = client.post(
                 "/auth/refresh",
                 data={"refresh_token": login_data["refresh_token"]},
             )
             new_access_token = refresh_response.json()["access_token"]
 
-            # Use the new access token
             me_response = client.get(
                 "/auth/users/me",
                 headers={"Authorization": f"Bearer {new_access_token}"},
@@ -540,7 +519,6 @@ class TestRefreshToken:
         try:
             refresh_token = create_refresh_token(data={"sub": test_user_credentials["username"]})
 
-            # Disable the user
             with get_db_context() as db:
                 user = db.query(db_models.User).filter(db_models.User.id == user_id).first()
                 user.disabled = True
@@ -575,7 +553,6 @@ class TestRefreshToken:
 
         refresh_token = create_refresh_token(data={"sub": test_user_credentials["username"]})
 
-        # Delete the user
         with get_db_context() as db:
             user = db.query(db_models.User).filter(db_models.User.username == test_user_credentials["username"]).first()
             if user:
@@ -589,3 +566,125 @@ class TestRefreshToken:
             )
             assert response.status_code == 401
             assert response.json()["detail"] == "User no longer exists"
+
+
+class TestUserLookupCache:
+    """Auth lookups are TTL-cached; mutation routes invalidate."""
+
+    @pytest.fixture(autouse=True)
+    def setup_docker_mode(self, monkeypatch):
+        monkeypatch.setenv("FLOWFILE_MODE", "docker")
+        monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-for-unit-tests")
+
+    @pytest.fixture
+    def admin_user(self):
+        with get_db_context() as db:
+            existing = db.query(db_models.User).filter(db_models.User.username == "cache_admin").first()
+            if existing:
+                db.delete(existing)
+                db.commit()
+            admin = db_models.User(
+                username="cache_admin",
+                email="cache_admin@flowfile.app",
+                hashed_password=get_password_hash("adminpassword123"),
+                disabled=False,
+                is_admin=True,
+            )
+            db.add(admin)
+            db.commit()
+            admin_id = admin.id
+        yield {"id": admin_id, "username": "cache_admin", "password": "adminpassword123"}
+        with get_db_context() as db:
+            db.query(db_models.User).filter(db_models.User.id == admin_id).delete()
+            db.commit()
+
+    @staticmethod
+    def _login(client, username, password):
+        response = client.post("/auth/token", data={"username": username, "password": password})
+        assert response.status_code == 200
+        return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+    def test_lookup_is_cached_until_invalidated(self, create_test_user, test_user_credentials):
+        from flowfile_core.auth.jwt import invalidate_user_cache
+
+        with TestClient(main.app) as client:
+            headers = self._login(client, test_user_credentials["username"], test_user_credentials["password"])
+            assert client.get("/auth/users/me", headers=headers).status_code == 200
+
+            with get_db_context() as db:
+                user = db.query(db_models.User).filter(db_models.User.id == create_test_user).first()
+                user.disabled = True
+                db.commit()
+
+            # Direct DB writes bypass invalidation.
+            assert client.get("/auth/users/me", headers=headers).status_code == 200
+            invalidate_user_cache(test_user_credentials["username"])
+            assert client.get("/auth/users/me", headers=headers).status_code == 400
+
+    def test_expired_entry_is_reread(self, monkeypatch, create_test_user, test_user_credentials):
+        from flowfile_core.auth import jwt as jwt_module
+
+        monkeypatch.setattr(jwt_module, "USER_CACHE_TTL_SECONDS", 0)
+        with TestClient(main.app) as client:
+            headers = self._login(client, test_user_credentials["username"], test_user_credentials["password"])
+            assert client.get("/auth/users/me", headers=headers).status_code == 200
+            with get_db_context() as db:
+                user = db.query(db_models.User).filter(db_models.User.id == create_test_user).first()
+                user.disabled = True
+                db.commit()
+            assert client.get("/auth/users/me", headers=headers).status_code == 400
+
+    def test_admin_disable_takes_effect_immediately(self, admin_user, create_test_user, test_user_credentials):
+        with TestClient(main.app) as client:
+            user_headers = self._login(client, test_user_credentials["username"], test_user_credentials["password"])
+            assert client.get("/auth/users/me", headers=user_headers).status_code == 200
+
+            admin_headers = self._login(client, admin_user["username"], admin_user["password"])
+            response = client.put(f"/auth/users/{create_test_user}", json={"disabled": True}, headers=admin_headers)
+            assert response.status_code == 200
+
+            assert client.get("/auth/users/me", headers=user_headers).status_code == 400
+
+    def test_delete_evicts_cached_user(self, admin_user, create_test_user, test_user_credentials):
+        with TestClient(main.app) as client:
+            user_headers = self._login(client, test_user_credentials["username"], test_user_credentials["password"])
+            assert client.get("/auth/users/me", headers=user_headers).status_code == 200
+
+            admin_headers = self._login(client, admin_user["username"], admin_user["password"])
+            assert client.delete(f"/auth/users/{create_test_user}", headers=admin_headers).status_code == 200
+
+            assert client.get("/auth/users/me", headers=user_headers).status_code == 401
+
+    def test_password_change_refreshes_flags(self, create_test_user, test_user_credentials):
+        with get_db_context() as db:
+            user = db.query(db_models.User).filter(db_models.User.id == create_test_user).first()
+            user.must_change_password = True
+            db.commit()
+
+        with TestClient(main.app) as client:
+            headers = self._login(client, test_user_credentials["username"], test_user_credentials["password"])
+            assert client.get("/auth/users/me", headers=headers).json()["must_change_password"] is True
+
+            response = client.post(
+                "/auth/users/me/change-password",
+                json={
+                    "current_password": test_user_credentials["password"],
+                    "new_password": "brandnew-password456!",
+                },
+                headers=headers,
+            )
+            assert response.status_code == 200
+            assert client.get("/auth/users/me", headers=headers).json()["must_change_password"] is False
+
+    def test_concurrent_authenticated_requests_do_not_stall(self, create_test_user, test_user_credentials):
+        """A page-load fan-out must not stall (was a multi-minute deadlock)."""
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        with TestClient(main.app) as client:
+            headers = self._login(client, test_user_credentials["username"], test_user_credentials["password"])
+            started = time.monotonic()
+            with ThreadPoolExecutor(max_workers=40) as pool:
+                statuses = list(pool.map(lambda _: client.get("/auth/users/me", headers=headers).status_code, range(40)))
+            assert statuses == [200] * 40
+            assert time.monotonic() - started < 10

@@ -5,6 +5,7 @@ and decision-making logic introduced in the refactored FlowNode.
 """
 
 import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -12,6 +13,10 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from polars.exceptions import ColumnNotFoundError
+
+from flowfile_core.flowfile.flow_data_engine.column_stats import ColumnStatsUnavailable
+from flowfile_core.flowfile.flow_data_engine.flow_data_engine import FlowDataEngine
 from flowfile_core.flowfile.flow_graph import FlowGraph, add_connection
 from flowfile_core.flowfile.handler import FlowfileHandler
 from flowfile_core.flowfile.flow_node.models import (
@@ -25,6 +30,7 @@ from flowfile_core.flowfile.flow_node.state import (
 )
 from flowfile_core.flowfile.flow_node.executor import NodeExecutor
 from flowfile_core.schemas import input_schema, schemas, transform_schema
+from shared.storage_config import storage
 from typing import Literal
 
 
@@ -308,7 +314,6 @@ class TestSourceFileInfo:
             assert info is not None
             assert info.has_changed() is False
 
-            # Modify the file
             time.sleep(0.1)  # Ensure mtime changes
             with open(temp_path, 'w') as f:
                 f.write("modified content that is longer")
@@ -450,7 +455,6 @@ class TestNodeExecutor:
         add_manual_input(graph, [{"a": 1}], node_id=1)
         node = graph.get_node(1)
 
-        # Ensure node hasn't run
         node._execution_state.has_run_with_current_setup = False
 
         executor = NodeExecutor(node)
@@ -470,7 +474,6 @@ class TestNodeExecutor:
         add_manual_input(graph, [{"a": 1}], node_id=1)
         node = graph.get_node(1)
 
-        # Mark as already run
         node._execution_state.has_run_with_current_setup = True
 
         executor = NodeExecutor(node)
@@ -478,7 +481,7 @@ class TestNodeExecutor:
             state=node._execution_state,
             run_location="remote",
             performance_mode=False,
-            force_refresh=True,  # Force refresh
+            force_refresh=True,
         )
 
         assert decision.should_run is True
@@ -489,7 +492,6 @@ class TestNodeExecutor:
         graph = create_graph()
         add_manual_input(graph, [{"a": 1}], node_id=1)
         node = graph.get_node(1)
-        # Mark as already run
         node._execution_state.has_run_with_current_setup = True
 
         executor = NodeExecutor(node)
@@ -518,7 +520,6 @@ class TestNodeExecutor:
         add_manual_input(graph, [{"a": 1}], node_id=1)
         node = graph.get_node(1)
 
-        # Access executor via property
         executor = node.executor
         assert isinstance(executor, NodeExecutor)
         assert executor.node is node
@@ -529,10 +530,8 @@ class TestNodeExecutor:
         add_manual_input(graph, [{"a": 1}], node_id=1)
         node = graph.get_node(1)
 
-        # Executor should not exist yet
         assert node._executor is None
 
-        # Access executor - should be created
         executor = node.executor
         assert node._executor is not None
         assert node._executor is executor
@@ -570,14 +569,12 @@ class TestExecutorIntegration:
             assert state.source_file_info is not None
             assert state.source_file_info.has_changed() is False
 
-            # Modify file
             time.sleep(0.1)
             with open(temp_path, 'w') as f:
                 f.write("modified content")
 
             assert state.source_file_info.has_changed() is True
 
-            # Update file info
             state.source_file_info = SourceFileInfo.from_path(temp_path)
             assert state.source_file_info.has_changed() is False
         finally:
@@ -590,14 +587,11 @@ class TestExecutorIntegration:
 
         node = graph.get_node(1)
 
-        # Before execution
         assert node._execution_state.has_run_with_current_setup is False
 
-        # Run the graph
         result = graph.run_graph()
         assert result.success is True
 
-        # After execution, state should be updated
         assert node._execution_state.has_run_with_current_setup is True
 
 
@@ -1051,6 +1045,195 @@ class TestPreviewAfterExecution:
         assert len(table_example.data) <= 100
 
 
+class TestPreviewRowCount:
+    """The preview row count must be real or None (unknown) — never the old
+    999 sentinel — and producing it must never trigger a count collect."""
+
+    def test_preview_row_count_is_real_not_999(self, execution_location):
+        graph = create_graph_with_read_and_select(execution_location=execution_location)
+        run_info = graph.run_graph()
+        assert run_info.success, f"Graph should run: {run_info}"
+
+        table_example = graph.get_node(2).get_table_example(include_data=True)
+
+        # The count arrives for free in both modes: remote via the worker's
+        # status, local via parquet metadata propagated through the select.
+        assert table_example.number_of_records != 999
+        assert table_example.number_of_records == 1000
+
+    def test_preview_row_count_exact_for_small_result(self, execution_location):
+        """A sample shorter than the sample size is the whole table — exact count."""
+        graph = create_graph_with_select(execution_location=execution_location)
+        run_info = graph.run_graph()
+        assert run_info.success, f"Graph should run: {run_info}"
+
+        table_example = graph.get_node(2).get_table_example(include_data=True)
+
+        assert table_example.number_of_records == 1
+
+    def test_preview_row_count_none_before_run(self):
+        """Before a run the count is unknown, not the misleading 0 it used to be."""
+        graph = create_graph_with_read_and_select()
+
+        table_example = graph.get_node(2).get_table_example(include_data=True)
+
+        assert table_example.number_of_records is None
+
+    def test_preview_never_triggers_record_count_collect(self, execution_location):
+        """The preview must never pay for a count: get_number_of_records on a
+        lazy engine collects the whole upstream plan to render a header."""
+        graph = create_graph_with_read_and_select(execution_location=execution_location)
+        graph.run_graph()
+
+        with patch.object(FlowDataEngine, "get_number_of_records") as mock_count:
+            graph.get_node(2).get_table_example(include_data=True)
+
+        mock_count.assert_not_called()
+
+
+class TestNodeColumnStats:
+    """get_column_stats aggregates over the cached result without re-executing."""
+
+    def test_column_stats_after_run(self, execution_location):
+        graph = create_graph_with_read_and_select(execution_location=execution_location)
+        run_info = graph.run_graph()
+        assert run_info.success, f"Graph should run: {run_info}"
+
+        stats = graph.get_node(2).get_column_stats("Name")
+
+        assert stats.number_of_empty_values + stats.number_of_filled_values == 1000
+        assert stats.number_of_unique_values is not None
+        assert stats.min_value is not None
+
+    def test_column_stats_enrich_preview_schema(self, execution_location):
+        """Stats land on the result schema's FlowfileColumn — the single truth —
+        so this run's later previews carry them in table_schema too."""
+        graph = create_graph_with_read_and_select(execution_location=execution_location)
+        graph.run_graph()
+        node = graph.get_node(2)
+
+        node.get_column_stats("Name")
+        preview = node.get_table_example(include_data=True)
+
+        name_column = next(c for c in preview.table_schema if c.name == "Name")
+        assert name_column.number_of_empty_values is not None
+        assert name_column.number_of_unique_values is not None
+
+    def test_column_stats_before_run_raises(self):
+        graph = create_graph_with_read_and_select()
+
+        with pytest.raises(ColumnStatsUnavailable):
+            graph.get_node(2).get_column_stats("Name")
+
+    def test_column_stats_unknown_column_raises(self, execution_location):
+        graph = create_graph_with_read_and_select(execution_location=execution_location)
+        graph.run_graph()
+
+        with pytest.raises(ColumnNotFoundError):
+            graph.get_node(2).get_column_stats("does_not_exist")
+
+    def test_column_stats_never_reexecutes_node(self, execution_location):
+        """Stats must resolve the engine passively — get_output/get_resulting_data
+        can re-run the node from an HTTP request."""
+        graph = create_graph_with_read_and_select(execution_location=execution_location)
+        graph.run_graph()
+        node = graph.get_node(2)
+
+        with (
+            patch.object(node, "get_resulting_data") as mock_resulting,
+            patch.object(node, "get_output") as mock_output,
+        ):
+            node.get_column_stats("Name")
+
+        mock_resulting.assert_not_called()
+        mock_output.assert_not_called()
+
+    def test_column_stats_memoizes_row_count_for_preview(self, execution_location):
+        """After one stats call the preview knows the exact total for free."""
+        graph = create_graph_with_read_and_select(execution_location=execution_location)
+        graph.run_graph()
+        node = graph.get_node(2)
+
+        node.get_column_stats("Name")
+        table_example = node.get_table_example(include_data=True)
+
+        assert table_example.number_of_records == 1000
+
+
+class TestColumnStatsWorkerOffload:
+    """Local-mode results are full upstream plans: their stats collect must run
+    in the worker, never in the core process."""
+
+    def test_local_stats_offloaded_never_collect_in_process(self):
+        import requests
+
+        from flowfile_core.flowfile.flow_data_engine import column_stats as column_stats_module
+
+        try:
+            worker_up = requests.get("http://127.0.0.1:63579/docs", timeout=5).ok
+        except requests.exceptions.RequestException:
+            worker_up = False
+        if not worker_up:
+            pytest.skip("Worker not running")
+
+        graph = create_graph_with_read_and_select(execution_location="local")
+        run_info = graph.run_graph()
+        assert run_info.success, f"Graph should run: {run_info}"
+        node = graph.get_node(2)
+
+        with patch.object(column_stats_module, "run_stats_query") as mock_in_process:
+            stats = node.get_column_stats("Name", offload_to_worker=True)
+
+        mock_in_process.assert_not_called()
+        assert stats.number_of_empty_values + stats.number_of_filled_values == 1000
+        assert stats.number_of_unique_values is not None
+
+    def test_offload_failure_raises_instead_of_collecting_in_core(self):
+        """A dead worker must surface as unavailable (409), never as a silent
+        in-process collect of the full upstream plan."""
+        from flowfile_core.flowfile.flow_data_engine import column_stats as column_stats_module
+
+        graph = create_graph_with_read_and_select(execution_location="local")
+        graph.run_graph()
+        node = graph.get_node(2)
+
+        with (
+            patch.object(
+                column_stats_module, "run_stats_query_in_worker", side_effect=Exception("worker down")
+            ) as mock_worker,
+            patch.object(column_stats_module, "run_stats_query") as mock_in_process,
+            pytest.raises(ColumnStatsUnavailable),
+        ):
+            node.get_column_stats("Name", offload_to_worker=True)
+
+        assert mock_worker.call_count == 2, "full query, then the count-only retry"
+        mock_in_process.assert_not_called()
+
+    def test_offload_query_failure_retries_counts_only_in_worker(self):
+        """A worker-side query error degrades to the count-only exprs — still
+        executed in the worker, never in core."""
+        from flowfile_core.flowfile.flow_data_engine import column_stats as column_stats_module
+
+        graph = create_graph_with_read_and_select(execution_location="local")
+        graph.run_graph()
+        node = graph.get_node(2)
+
+        with (
+            patch.object(
+                column_stats_module,
+                "run_stats_query_in_worker",
+                side_effect=[Exception("dtype error in worker"), {"total_rows": 1000, "null_count": 0}],
+            ) as mock_worker,
+            patch.object(column_stats_module, "run_stats_query") as mock_in_process,
+        ):
+            stats = node.get_column_stats("Name", offload_to_worker=True)
+
+        assert mock_worker.call_count == 2
+        mock_in_process.assert_not_called()
+        assert stats.number_of_filled_values == 1000
+        assert stats.number_of_unique_values is None, "degraded result carries counts only"
+
+
 class TestPreviewAfterUpstreamChange:
     """Tests what happens to preview data when an upstream node changes
     after execution.
@@ -1087,7 +1270,6 @@ class TestPreviewAfterUpstreamChange:
         )
         graph.add_select(node_select)
 
-        # _execution_state should be reset
         assert select_node._execution_state.has_run_with_current_setup is False
 
     def test_settings_change_node_stats_has_completed_last_run(self, execution_location):
@@ -1102,7 +1284,6 @@ class TestPreviewAfterUpstreamChange:
         select_node = graph.get_node(2)
         assert select_node.node_stats.has_completed_last_run is True
 
-        # Change the select configuration
         new_select_input = transform_schema.SelectInput(old_name='City', new_name='City', keep=True)
         node_select = input_schema.NodeSelect(
             flow_id=graph.flow_id,
@@ -1133,7 +1314,6 @@ class TestPreviewAfterUpstreamChange:
         assert first_preview.columns == ["Name"]
         assert len(first_preview.data) > 0
 
-        # Change select to keep City instead of Name
         new_select_input = transform_schema.SelectInput(old_name='City', new_name='City', keep=True)
         node_select = input_schema.NodeSelect(
             flow_id=graph.flow_id,
@@ -1171,7 +1351,6 @@ class TestPreviewAfterUpstreamChange:
         first_preview = select_node.get_table_example(include_data=True)
         assert first_preview.columns == ["Name"]
 
-        # Change select to keep City
         new_select_input = transform_schema.SelectInput(old_name='City', new_name='City', keep=True)
         node_select = input_schema.NodeSelect(
             flow_id=graph.flow_id,
@@ -1182,16 +1361,13 @@ class TestPreviewAfterUpstreamChange:
         )
         graph.add_select(node_select)
 
-        # Re-run the graph
         run_info = graph.run_graph()
         assert run_info.success
 
-        # Now preview should reflect the new settings
         select_node = graph.get_node(2)
         second_preview = select_node.get_table_example(include_data=True)
         assert second_preview.columns == ["City"]
         assert len(second_preview.data) > 0
-        # Every row should have the City key
         for row in second_preview.data:
             assert "City" in row, f"Expected City column in row, got: {row.keys()}"
 
@@ -1206,7 +1382,6 @@ class TestPreviewAfterUpstreamChange:
         assert first_preview.columns == ["Name"]
         assert len(first_preview.data) > 0
 
-        # Change sort direction (upstream settings change)
         node_sort = input_schema.NodeSort(
             flow_id=graph.flow_id,
             node_id=2,
@@ -1272,7 +1447,6 @@ class TestPreviewAfterUpstreamChange:
             auto_keep_all=True,
             depending_on_ids=[1, 2]
         ))
-        # Start test
 
         fuzzy_node = graph.get_node(3)
         result = fuzzy_node.get_table_example(True)
@@ -1301,6 +1475,596 @@ class TestPreviewAfterUpstreamChange:
         assert fuzzy_node.node_stats.has_completed_last_run
         assert not fuzzy_node.node_stats.has_run_with_current_setup
         assert result.columns
+
+
+def _rewrite_atomic(path: Path, content: str) -> None:
+    """write_text truncates under polars' live mmap (SIGBUS); write-then-replace is atomic.
+
+    The same window exists in production (the read node's schema callback mmaps on a background
+    thread while an external writer truncates the file); it predates this feature and is filed
+    separately.
+
+    Windows additionally *rejects* the replace (WinError 5) while that background scan holds the
+    destination open, and the prefetch is orphaned by the schema_callback setter so it cannot be
+    joined — hence the retry. On POSIX the replace succeeds first time and the loop never spins.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
+def _csv_pattern(directory: Path) -> str:
+    return os.path.join(str(directory), "**", "*.csv")
+
+
+def _write_csv_files(directory: Path, names: list[str]) -> None:
+    for i, name in enumerate(names, start=1):
+        (directory / f"{name}.csv").write_text(f"id,val\n{i},{name}\n")
+
+
+def create_graph_with_read(path, flow_id: int = 20, scan_mode: str = "single_file") -> FlowGraph:
+    """Graph with a single csv read node — a file path in single-file mode, a directory otherwise."""
+    graph = create_graph(execution_location="local", flow_id=flow_id)
+    add_node_promise(graph, "read", node_id=1)
+    graph.add_read(
+        input_schema.NodeRead(
+            flow_id=flow_id,
+            node_id=1,
+            received_file=input_schema.ReceivedTable(
+                name=os.path.basename(str(path)) if scan_mode == "single_file" else "folder",
+                path=str(path),
+                file_type="csv",
+                scan_mode=scan_mode,
+            ),
+        )
+    )
+    return graph
+
+
+class TestSourceFileInfoFromPattern:
+    """SourceFileInfo.from_pattern — the aggregate fingerprint a directory-mode read is tracked by."""
+
+    def test_from_pattern_aggregates_count_mtime_and_size(self, tmp_path):
+        """One snapshot summarises the whole match set: how many files, the newest mtime, total bytes."""
+        _write_csv_files(tmp_path, ["a", "bb"])
+        files = [tmp_path / "a.csv", tmp_path / "bb.csv"]
+
+        info = SourceFileInfo.from_pattern(_csv_pattern(tmp_path))
+
+        assert info.path == _csv_pattern(tmp_path)
+        assert info.file_count == 2
+        assert info.size == sum(os.path.getsize(f) for f in files)
+        assert info.mtime == max(os.stat(f).st_mtime for f in files)
+        assert info.has_changed() is False
+
+    def test_has_changed_when_a_file_is_added(self, tmp_path):
+        """A new file changes the data without changing any node setting."""
+        _write_csv_files(tmp_path, ["a"])
+        info = SourceFileInfo.from_pattern(_csv_pattern(tmp_path))
+
+        _write_csv_files(tmp_path, ["b"])
+
+        assert info.has_changed() is True
+
+    def test_has_changed_when_a_file_is_removed(self, tmp_path):
+        """A removed file lowers the count, which a single stat could never see."""
+        _write_csv_files(tmp_path, ["a", "b"])
+        info = SourceFileInfo.from_pattern(_csv_pattern(tmp_path))
+
+        (tmp_path / "b.csv").unlink()
+
+        assert info.has_changed() is True
+
+    def test_has_changed_when_a_file_is_edited(self, tmp_path):
+        """An in-place edit shows up through the total size and the newest mtime."""
+        _write_csv_files(tmp_path, ["a", "b"])
+        info = SourceFileInfo.from_pattern(_csv_pattern(tmp_path))
+
+        edited = tmp_path / "a.csv"
+        _rewrite_atomic(edited, "id,val\n1,a_much_longer_value\n")
+        stat = os.stat(edited)
+        os.utime(edited, (stat.st_atime + 10, stat.st_mtime + 10))
+
+        assert info.has_changed() is True
+
+    def test_zero_matches_is_a_valid_snapshot(self, tmp_path):
+        """from_pattern never returns None: an empty directory is a state worth remembering, so a
+        file appearing later reads as a change."""
+        info = SourceFileInfo.from_pattern(_csv_pattern(tmp_path))
+
+        assert info.file_count == 0
+        assert info.has_changed() is False
+
+        _write_csv_files(tmp_path, ["a"])
+        assert info.has_changed() is True
+
+
+class TestSourceFileInfoSerialization:
+    """to_dict / from_dict must survive the file_count addition in both directions."""
+
+    def test_round_trip_preserves_file_count(self, tmp_path):
+        _write_csv_files(tmp_path, ["a", "b"])
+        info = SourceFileInfo.from_pattern(_csv_pattern(tmp_path))
+
+        restored = SourceFileInfo.from_dict(info.to_dict())
+
+        assert restored == info
+        assert restored.file_count == 2
+        assert restored.has_changed() is False
+
+    def test_legacy_dict_without_file_count_loads_as_single_file(self, tmp_path):
+        """Flows saved before directory mode have no file_count key; they must keep comparing by a
+        single stat rather than blowing up or being read as a zero-match pattern."""
+        source = tmp_path / "data.csv"
+        source.write_text("id,val\n1,a\n")
+        stat = os.stat(source)
+
+        restored = SourceFileInfo.from_dict({"path": str(source), "mtime": stat.st_mtime, "size": stat.st_size})
+
+        assert restored.file_count is None
+        assert restored.has_changed() is False
+
+
+def _commit_source_snapshot(node) -> None:
+    """Mirror the executor's own snapshot rule from ``execute``.
+
+    The fingerprint is taken before the scan and committed to the state only when it is not
+    None, so a source that cannot be stat'ed keeps the last known-good snapshot.
+    """
+    pending = node.executor._pending_source_snapshot()
+    if pending is not None:
+        node._execution_state.source_file_info = pending
+
+
+class TestSourceFileSnapshotUpdate:
+    """What the executor records after a run."""
+
+    def test_failed_stat_does_not_erase_a_good_snapshot(self, tmp_path):
+        """A path that cannot be stat'ed (moved away, permissions) must leave the last known-good
+        fingerprint intact — overwriting it with None silently disables change detection."""
+        source = tmp_path / "data.csv"
+        source.write_text("id,val\n1,a\n")
+        node = create_graph_with_read(source).get_node(1)
+        state = node._execution_state
+
+        _commit_source_snapshot(node)
+        good_snapshot = state.source_file_info
+        assert good_snapshot is not None
+
+        # The snapshot re-resolves abs_file_path from path, so point path itself at the gap.
+        node.setting_input.received_file.path = str(tmp_path / "not_there.csv")
+        node.setting_input.received_file.name = "not_there.csv"
+        _commit_source_snapshot(node)
+
+        assert state.source_file_info is good_snapshot
+
+    def test_directory_read_snapshots_the_aggregate(self, tmp_path):
+        """A directory read must be fingerprinted by its whole match set, not by stat'ing a glob."""
+        _write_csv_files(tmp_path, ["a", "b", "c"])
+        node = create_graph_with_read(tmp_path, flow_id=21, scan_mode="directory").get_node(1)
+        state = node._execution_state
+
+        _commit_source_snapshot(node)
+
+        assert state.source_file_info is not None
+        assert state.source_file_info.file_count == 3
+
+
+class TestSourceChangeOutranksCache:
+    """Decision order: a changed source outranks the worker cache.
+
+    ``results_exists`` is an HTTP call to the worker, so it is patched here to stand in for
+    'the worker holds a cached result' — the behaviour under test is the ordering, not the lookup.
+    """
+
+    def _ran_once_with_cache(self, path, flow_id: int):
+        """A cache-enabled read node that already ran once and recorded its source fingerprint."""
+        node = create_graph_with_read(path, flow_id=flow_id).get_node(1)
+        node.node_settings.cache_results = True
+        state = node._execution_state
+        _commit_source_snapshot(node)
+        state.mark_successful()
+        return node, state
+
+    def test_changed_source_beats_a_cache_hit(self, tmp_path):
+        """The node hash does not rotate when a file on disk changes, so a cache hit here would
+        serve data the user just replaced."""
+        source = tmp_path / "data.csv"
+        source.write_text("id,val\n1,a\n")
+        node, state = self._ran_once_with_cache(source, flow_id=22)
+
+        _rewrite_atomic(source, "id,val\n1,a_changed_and_longer\n")
+        stat = os.stat(source)
+        os.utime(source, (stat.st_atime + 10, stat.st_mtime + 10))
+
+        with patch("flowfile_core.flowfile.flow_node.executor.results_exists", return_value=True):
+            decision = node.executor._decide_execution(
+                state=state, run_location="local", performance_mode=False, force_refresh=False
+            )
+
+        assert decision.should_run is True
+        assert decision.reason == InvalidationReason.SOURCE_FILE_CHANGED
+
+    def test_deleted_source_beats_a_cache_hit(self, tmp_path):
+        """Deliberate behaviour change: a vanished source re-runs (and fails loudly) instead of
+        quietly serving a cached result for a file that no longer exists."""
+        source = tmp_path / "data.csv"
+        source.write_text("id,val\n1,a\n")
+        node, state = self._ran_once_with_cache(source, flow_id=23)
+
+        source.unlink()
+
+        with patch("flowfile_core.flowfile.flow_node.executor.results_exists", return_value=True):
+            decision = node.executor._decide_execution(
+                state=state, run_location="local", performance_mode=False, force_refresh=False
+            )
+
+        assert decision.should_run is True
+        assert decision.reason == InvalidationReason.SOURCE_FILE_CHANGED
+
+    def test_missing_snapshot_still_honours_the_cache(self, tmp_path):
+        """Known limitation, documented rather than fixed: after a restart there is no snapshot to
+        compare against, so the cache is trusted and an out-of-band edit is not noticed."""
+        source = tmp_path / "data.csv"
+        source.write_text("id,val\n1,a\n")
+        node = create_graph_with_read(source, flow_id=24).get_node(1)
+        node.node_settings.cache_results = True
+        state = node._execution_state
+        state.mark_successful()
+        assert state.source_file_info is None
+
+        with patch("flowfile_core.flowfile.flow_node.executor.results_exists", return_value=True):
+            decision = node.executor._decide_execution(
+                state=state, run_location="local", performance_mode=False, force_refresh=False
+            )
+
+        assert decision.should_run is False
+        assert decision.strategy == ExecutionStrategy.SKIP
+
+
+class TestDirectoryFingerprintIdentity:
+    """The aggregate fingerprint also hashes which files matched, not just the totals."""
+
+    def test_mtime_preserving_equal_size_swap_is_detected(self, tmp_path):
+        """rsync -a / cp -p style refresh: count, total size and newest mtime are all preserved,
+        so only the digest over the (path, mtime, size) triples can see the change."""
+        _write_csv_files(tmp_path, ["a", "b"])
+        replaced = tmp_path / "b.csv"
+        content = replaced.read_text()
+        replaced_stat = os.stat(replaced)
+        info = SourceFileInfo.from_pattern(_csv_pattern(tmp_path))
+        assert info.has_changed() is False
+
+        replaced.unlink()
+        substitute = tmp_path / "c.csv"
+        substitute.write_text(content)
+        os.utime(substitute, (replaced_stat.st_atime, replaced_stat.st_mtime))
+
+        assert info.has_changed() is True
+
+    def test_legacy_digestless_snapshot_still_compares_aggregates(self, tmp_path):
+        """A directory snapshot serialized before the digest existed keeps working on the
+        aggregate comparison instead of always reading as changed."""
+        _write_csv_files(tmp_path, ["a"])
+        fresh = SourceFileInfo.from_pattern(_csv_pattern(tmp_path))
+        legacy = SourceFileInfo.from_dict(
+            {"path": fresh.path, "mtime": fresh.mtime, "size": fresh.size, "file_count": fresh.file_count}
+        )
+
+        assert legacy.files_digest is None
+        assert legacy.has_changed() is False
+
+        _write_csv_files(tmp_path, ["b"])
+        assert legacy.has_changed() is True
+
+
+class TestSourceChangeInvalidatesDownstream:
+    """SOURCE_FILE_CHANGED must refresh the whole chain: the settings hash does not rotate on a
+    disk change, so the executor bumps the cache epoch and lets the reset cascade downstream."""
+
+    def _directory_graph_with_select(
+        self, directory: Path, flow_id: int, execution_location: ExecutionLocationLit = "local"
+    ) -> FlowGraph:
+        graph = create_graph(execution_location=execution_location, flow_id=flow_id)
+        add_node_promise(graph, "read", node_id=1)
+        graph.add_read(
+            input_schema.NodeRead(
+                flow_id=flow_id,
+                node_id=1,
+                received_file=input_schema.ReceivedTable(
+                    name="folder", path=str(directory), file_type="csv", scan_mode="directory"
+                ),
+            )
+        )
+        add_node_promise(graph, "select", node_id=2)
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
+        graph.add_select(
+            input_schema.NodeSelect(
+                flow_id=flow_id,
+                node_id=2,
+                depending_on_id=1,
+                select_input=[transform_schema.SelectInput(old_name="id", new_name="id", keep=True)],
+                keep_missing=False,
+            )
+        )
+        return graph
+
+    def test_added_file_reaches_the_downstream_node(self, tmp_path):
+        """Regression: the downstream node used to SKIP and serve the pre-change frame."""
+        _write_csv_files(tmp_path, ["a"])
+        graph = self._directory_graph_with_select(tmp_path, flow_id=26)
+        graph.run_graph()
+        select_node = graph.get_node(2)
+        assert select_node.get_resulting_data().collect().height == 1
+
+        _write_csv_files(tmp_path, ["b"])
+        graph.run_graph()
+
+        assert graph.get_node(1).get_resulting_data().collect().height == 2
+        assert select_node.get_resulting_data().collect().height == 2
+
+    def test_repeated_changes_refresh_a_cached_remote_downstream(self, tmp_path):
+        """Remote mode + cache_results downstream, changed repeatedly. The hash rotation must
+        happen in run_graph's freshness pass, before the stages run — rotating inside the
+        executor is reverted by _execute_single_node's hash save/restore, which froze the
+        cached downstream node from the second source change onward."""
+        _write_csv_files(tmp_path, ["a"])
+        graph = self._directory_graph_with_select(tmp_path, flow_id=27, execution_location="remote")
+        select_node = graph.get_node(2)
+        select_node.node_settings.cache_results = True
+
+        graph.run_graph()
+        assert select_node.get_resulting_data().collect().height == 1
+
+        for i, name in enumerate(["b", "c", "d"], start=2):
+            _write_csv_files(tmp_path, [name])
+            graph.run_graph()
+            assert graph.get_node(1).get_resulting_data().collect().height == i
+            assert select_node.get_resulting_data().collect().height == i, (
+                f"cached downstream node froze after change {i - 1}"
+            )
+
+
+def _graph_with_two_sorts_and_output(out_dir: Path, flow_id: int) -> FlowGraph:
+    """manual_input(1) -> sort(2) -> sort(3) -> output csv(4).
+
+    Both sorts are wide transforms, so each runs REMOTE and leaves its own
+    ``<hash>.arrow`` in the flow cache dir. The output node is in the "output"
+    node group, so it re-runs on every graph run and always dereferences the
+    plan node 3 is holding.
+    """
+    graph = create_graph(flow_id=flow_id, execution_location="remote")
+    add_manual_input(
+        graph,
+        [{"name": "Charlie", "age": 25}, {"name": "Alice", "age": 30}, {"name": "Bob", "age": 41}],
+        node_id=1,
+    )
+
+    add_node_promise(graph, "sort", node_id=2)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    graph.add_sort(
+        input_schema.NodeSort(
+            flow_id=flow_id,
+            node_id=2,
+            depending_on_id=1,
+            sort_input=[transform_schema.SortByInput(column="name", how="asc")],
+        )
+    )
+
+    add_node_promise(graph, "sort", node_id=3)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(2, 3))
+    graph.add_sort(
+        input_schema.NodeSort(
+            flow_id=flow_id,
+            node_id=3,
+            depending_on_id=2,
+            sort_input=[transform_schema.SortByInput(column="age", how="desc")],
+        )
+    )
+
+    add_node_promise(graph, "output", node_id=4)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(3, 4))
+    graph.add_output(
+        input_schema.NodeOutput(
+            flow_id=flow_id,
+            node_id=4,
+            output_settings={
+                "name": "out.csv",
+                "directory": str(out_dir),
+                "file_type": "csv",
+                "fields": [],
+                "write_mode": "overwrite",
+                "table_settings": {"delimiter": ",", "encoding": "utf-8"},
+            },
+        )
+    )
+    return graph
+
+
+class TestMissingWorkerArtifact:
+    """A removed worker result must make the node re-resolve, never fail the run.
+
+    A node's remote result is a lazy scan of ``<cache>/<flow_id>/<hash>.arrow``.
+    Core does not own that file: the 1-hour sweep in ``storage.cleanup_directories``,
+    a worker shutdown or a manual delete can take it away while core still believes
+    the node ran. Skipping such a node hands downstream a dangling scan.
+    """
+
+    def test_wiped_flow_cache_reruns_instead_of_failing(self, tmp_path):
+        """Regression: wiping the whole flow cache dir used to fail the next run."""
+        graph = _graph_with_two_sorts_and_output(tmp_path, flow_id=30)
+        assert graph.run_graph().success
+
+        cache_dir = storage.get_flow_cache_directory(graph.flow_id)
+        assert list(cache_dir.glob("*.arrow")), "the run produced no worker artifacts to remove"
+
+        shutil.rmtree(cache_dir)
+        (tmp_path / "out.csv").unlink()
+
+        run_info = graph.run_graph()
+        failures = [(n.node_id, n.error) for n in run_info.node_step_result if not n.success]
+        assert run_info.success, f"run failed after the cache was removed: {failures}"
+        assert list(cache_dir.glob("*.arrow")), "nodes did not re-materialise their results"
+        assert (tmp_path / "out.csv").exists(), "the output node never resolved its input"
+
+    def test_only_the_node_with_a_missing_artifact_reruns(self, tmp_path):
+        """The gate must not degrade into an unconditional re-run of the graph."""
+        graph = _graph_with_two_sorts_and_output(tmp_path, flow_id=31)
+        assert graph.run_graph().success
+
+        removed = Path(graph.get_node(2).results.example_data_path)
+        untouched = Path(graph.get_node(3).results.example_data_path)
+        untouched_mtime = untouched.stat().st_mtime_ns
+
+        removed.unlink()
+        assert graph.run_graph().success
+
+        assert removed.exists(), "node 2 should have re-run and rewritten its artifact"
+        assert untouched.stat().st_mtime_ns == untouched_mtime, "node 3 should still have skipped"
+
+    def test_decide_execution_flags_a_missing_artifact(self, tmp_path):
+        """The decision itself: present artifact -> SKIP, removed artifact -> CACHE_MISSING."""
+        graph = _graph_with_two_sorts_and_output(tmp_path, flow_id=32)
+        assert graph.run_graph().success
+
+        node = graph.get_node(2)
+        executor = NodeExecutor(node)
+        decision = executor._decide_execution(
+            state=node._execution_state,
+            run_location="remote",
+            performance_mode=False,
+            force_refresh=False,
+        )
+        assert decision.should_run is False
+
+        Path(node.results.example_data_path).unlink()
+        decision = executor._decide_execution(
+            state=node._execution_state,
+            run_location="remote",
+            performance_mode=False,
+            force_refresh=False,
+        )
+        assert decision.should_run is True
+        assert decision.reason == InvalidationReason.CACHE_MISSING
+
+
+class TestDeferredUntilRun:
+    """A node seeded with a placeholder output only executes inside a real flow run."""
+
+    @staticmethod
+    def _seeded_select(flow_id: int):
+        from flowfile_core.flowfile.flow_data_engine.flow_file_column.main import FlowfileColumn
+
+        graph = create_graph_with_select(flow_id=flow_id, execution_location="local")
+        node = graph.get_node(2)
+        seed = FlowDataEngine.create_from_schema([FlowfileColumn.from_input("name", "String")])
+        node.results.resulting_data = seed
+        node._named_schemas = {"output-1": [FlowfileColumn.from_input("stale", "Int64")]}
+        node.deferred_until_run = True
+        return graph, node, seed
+
+    def test_unseeded_deferred_node_raises_instead_of_executing(self):
+        from flowfile_core.flowfile.flow_node.flow_node import DeferredNodeError
+
+        graph = create_graph_with_select(flow_id=40, execution_location="local")
+        node = graph.get_node(2)
+        node.results.resulting_data = None
+        node.results.errors = None
+        node.deferred_until_run = True
+
+        with pytest.raises(DeferredNodeError, match="node 2 is deferred until the flow runs"):
+            node.get_resulting_data()
+        assert node.results.resulting_data is None, "no empty engine may be memoized for a deferred node"
+        assert node.results.errors is None
+        with pytest.raises(DeferredNodeError):
+            node._predicted_data_getter()
+
+    def test_seeded_node_serves_the_seed(self):
+        graph, node, seed = self._seeded_select(flow_id=41)
+        assert node.get_resulting_data() is seed
+        assert node.deferred_until_run is True
+        assert node.get_resulting_data().data_frame.collect().height == 0
+
+    def test_run_graph_clears_the_flag_and_the_seeded_handle_schemas(self):
+        graph, node, _ = self._seeded_select(flow_id=42)
+        assert graph.run_graph().success
+
+        assert node.deferred_until_run is False
+        assert "output-1" not in node._named_schemas
+        assert node.get_resulting_data().data_frame.collect()["name"].to_list() == ["Alice"]
+
+    def test_reset_re_arms_a_node_placed_deferred(self):
+        graph, node, _ = self._seeded_select(flow_id=45)
+        node.placed_deferred = True
+        assert graph.run_graph().success
+        assert node.deferred_until_run is False
+
+        node.reset(deep=True)
+
+        assert node.deferred_until_run is True
+        assert node.results.resulting_data is None
+        assert graph.run_graph().success
+        assert node.deferred_until_run is False
+        assert node.get_resulting_data().data_frame.collect()["name"].to_list() == ["Alice"]
+
+    def test_reset_inside_its_own_run_does_not_re_arm_the_node(self):
+        graph, node, _ = self._seeded_select(flow_id=46)
+        node.placed_deferred = True
+        node._cache_epoch += 1  # a stale hash: the executor's own reset() drops the seed and re-arms the flag
+        assert node.needs_reset()
+
+        assert graph.run_graph().success
+
+        assert node.deferred_until_run is False
+        assert node.get_resulting_data().data_frame.collect()["name"].to_list() == ["Alice"]
+
+    def test_reset_leaves_a_node_not_placed_deferred_alone(self):
+        graph = create_graph_with_select(flow_id=47, execution_location="local")
+        node = graph.get_node(2)
+        assert graph.run_graph().success
+
+        node.reset(deep=True)
+
+        assert node.placed_deferred is False and node.deferred_until_run is False
+
+    def test_prepare_keeps_handle_schemas_of_non_deferred_nodes(self):
+        from flowfile_core.flowfile.flow_data_engine.flow_file_column.main import FlowfileColumn
+
+        graph = create_graph_with_select(flow_id=43, execution_location="local")
+        node = graph.get_node(2)
+        handle_schemas = {"output-1": [FlowfileColumn.from_input("kept", "Int64")]}
+        node._named_schemas = handle_schemas
+
+        NodeExecutor(node)._prepare_for_execution(node._execution_state)
+
+        assert node._named_schemas is handle_schemas
+        assert [c.column_name for c in node.schema_for_handle("output-1")] == ["kept"]
+
+    def test_function_derived_schema_callback_refuses_a_deferred_node(self):
+        from flowfile_core.flowfile.flow_node.flow_node import DeferredNodeError
+
+        graph = create_graph_with_select(flow_id=44, execution_location="local")
+        node = graph.get_node(2)
+        calls = []
+
+        def fn():
+            calls.append(1)
+            return FlowDataEngine()
+
+        callback = node.create_schema_callback_from_function(fn)
+        node.deferred_until_run = True
+
+        with pytest.raises(DeferredNodeError):
+            callback()
+        assert calls == []
 
 
 if __name__ == "__main__":

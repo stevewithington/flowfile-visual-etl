@@ -1,12 +1,14 @@
 import uuid
 from typing import Literal
 
+import sqlalchemy as sa
 from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     String,
@@ -75,6 +77,7 @@ class CloudStorageConnection(Base):
     aws_session_token_id = Column(Integer, ForeignKey("secrets.id"), nullable=True)
     aws_role_arn = Column(String, nullable=True)
     aws_allow_unsafe_html = Column(Boolean, nullable=True)
+    aws_profile = Column(String, nullable=True)  # aws-cli only; NULL uses boto3's default credential chain
 
     # Azure ADLS fields
     azure_account_name = Column(String, nullable=True)
@@ -118,9 +121,26 @@ class Kernel(Base):
     name = Column(String, nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     packages = Column(Text, default="[]")  # JSON-serialized list of package names
+    # JSON-serialized list of {name, version} for packages actually installed in
+    # the derived image. Populated after bake; empty for legacy kernels until they
+    # are next edited.
+    resolved_packages = Column(Text, default="[]")
     cpu_cores = Column(Float, default=2.0)
     memory_gb = Column(Float, default=4.0)
     gpu = Column(Boolean, default=False)
+    image_flavour = Column(String, nullable=False, default="base")
+    custom_image = Column(String, nullable=True)
+    # Auto-created FlowRegistration that artifacts published from this kernel's
+    # interactive cells are attributed to. Lives and dies with the kernel; see
+    # ``KernelManager._provision_scratch_flow`` in
+    # ``flowfile_core/kernel/manager.py``. ``ON DELETE SET NULL`` so a
+    # manually-removed registration leaves the kernel record intact (the
+    # manager will lazily re-create on the next publish).
+    scratch_flow_registration_id = Column(
+        Integer,
+        ForeignKey("flow_registrations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at = Column(DateTime, default=func.now(), nullable=False)
 
 
@@ -142,6 +162,12 @@ class CatalogNamespace(Base):
     level = Column(Integer, nullable=False, default=0)  # 0=catalog, 1=schema
     description = Column(Text, nullable=True)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    # Visible to every user as a tree container in multi-user mode (set on the seeded
+    # system namespaces); contents stay per-user filtered. See auth/sharing.py.
+    is_public = Column(Boolean, nullable=False, default=False, server_default="0")
+    # Per-catalog object storage (level-0 only; schemas/tables inherit). NULL ⇒ local filesystem.
+    storage_uri = Column(String, nullable=True)
+    storage_connection_name = Column(String, nullable=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -162,8 +188,46 @@ class FlowRegistration(Base):
     flow_path = Column(String, nullable=False)
     namespace_id = Column(Integer, ForeignKey("catalog_namespaces.id"), nullable=True)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    # True when the flow contains exactly one ``api_response`` node, i.e. it can be
+    # published as an HTTP data API. Recomputed from the flow graph on save.
+    is_api_compatible = Column(Boolean, default=False, nullable=False, server_default="0")
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class WorkspaceProject(Base):
+    """A git-friendly project folder mirroring this install's flows/connections/schedules.
+
+    The folder is a deterministic, secret-free projection of the catalog DB. The DB stays
+    the runtime source of truth; this row just maps it to its on-disk project tree.
+    """
+
+    __tablename__ = "workspace_projects"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    folder_path = Column(String, nullable=False)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    is_active = Column(Boolean, default=False, nullable=False)
+    # Git HEAD we last projected/imported at; differs from the live HEAD only when git
+    # changed the working tree from outside the app (pull / restore / fresh clone).
+    last_synced_head_sha = Column(String(40), nullable=True)
+    # Mirrors project.yaml's track_data_artifacts (the manifest is the source of truth): when
+    # False, catalog tables + global artifacts are excluded from the git-tracked project.
+    track_data_artifacts = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("owner_id", "folder_path", name="uq_project_owner_path"),
+        Index(
+            "ix_workspace_projects_active_owner",
+            "owner_id",
+            sqlite_where=sa.text("is_active = 1"),
+            postgresql_where=sa.text("is_active = true"),
+            unique=True,
+        ),
+    )
 
 
 class FlowRun(Base):
@@ -193,6 +257,9 @@ class FlowRun(Base):
     flow_snapshot = Column(Text, nullable=True)
     # JSON-serialised node step results
     node_results_json = Column(Text, nullable=True)
+    # Stamped when the run has been evaluated for notifications (NULL = pending evaluation).
+    # Not "a notification was sent" — a run with no matching rule is stamped too.
+    notification_processed_at = Column(DateTime, nullable=True)
 
 
 class FlowFavorite(Base):
@@ -221,6 +288,98 @@ class FlowFollow(Base):
     __table_args__ = (UniqueConstraint("user_id", "registration_id", name="uq_user_follow"),)
 
 
+class FlowApiEndpoint(Base):
+    """Publishes a registered flow as an HTTP data API endpoint.
+
+    At most one endpoint per registered flow. A GET to ``/api/data/{slug}``
+    authenticated by a ``FlowApiKey`` runs the flow synchronously and returns the
+    data flowing into the flow's single ``api_response`` node.
+    """
+
+    __tablename__ = "flow_api_endpoints"
+
+    id = Column(Integer, primary_key=True, index=True)
+    registration_id = Column(Integer, ForeignKey("flow_registrations.id"), nullable=False)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    slug = Column(String, nullable=False, unique=True, index=True)
+    enabled = Column(Boolean, default=True, nullable=False, server_default="1")
+    # node_id of the flow's api_response node, resolved at publish time.
+    response_node_id = Column(Integer, nullable=True)
+    # JSON list of typed parameter specs (see schemas/flow_api_schema.py:ApiParamSpec).
+    param_schema_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("registration_id", name="uq_api_endpoint_registration"),)
+
+
+class ApiConsumer(Base):
+    """A reusable API client / service account.
+
+    Holds one or more rotatable ``FlowApiKey`` tokens and is granted access to one
+    or more published flow endpoints via ``api_consumer_endpoints``. Owned by the
+    user who created it (in local/Electron mode everything belongs to ``local_user``).
+
+    ``is_implicit`` marks a consumer auto-created to back a single per-flow "Create
+    key" button, so that path shares the one consumer-based auth path. Implicit
+    consumers are hidden from the consumers list and deleted with their endpoint.
+    """
+
+    __tablename__ = "api_consumers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    enabled = Column(Boolean, default=True, nullable=False, server_default="1")
+    is_implicit = Column(Boolean, default=False, nullable=False, server_default="0")
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("owner_id", "name", name="uq_api_consumer_owner_name"),)
+
+
+class ApiConsumerEndpoint(Base):
+    """Grant linking an ``ApiConsumer`` to a ``FlowApiEndpoint`` it may call."""
+
+    __tablename__ = "api_consumer_endpoints"
+
+    id = Column(Integer, primary_key=True, index=True)
+    consumer_id = Column(Integer, ForeignKey("api_consumers.id", ondelete="CASCADE"), nullable=False, index=True)
+    endpoint_id = Column(Integer, ForeignKey("flow_api_endpoints.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("consumer_id", "endpoint_id", name="uq_consumer_endpoint"),)
+
+
+class FlowApiKey(Base):
+    """An API key belonging to an ``ApiConsumer``.
+
+    The raw token is shown once at creation; only its SHA-256 hash is stored
+    (one-way) so it can never be recovered from the database. Access is decided by
+    the consumer's grants (``api_consumer_endpoints``), not by the key itself, so a
+    single key can call every endpoint its consumer is granted.
+    """
+
+    __tablename__ = "flow_api_keys"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # The consumer this key authenticates as. Nullable only so migration 018 can
+    # add-then-backfill; every row carries a consumer_id once 018 has run.
+    consumer_id = Column(Integer, ForeignKey("api_consumers.id", ondelete="CASCADE"), nullable=True, index=True)
+    # Retained for display / back-compat. A per-flow key sets it to its single endpoint;
+    # not used for authorization (the grant check is the sole gate). Nullable now.
+    endpoint_id = Column(Integer, ForeignKey("flow_api_endpoints.id"), nullable=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    name = Column(String, nullable=False)
+    key_hash = Column(String, nullable=False, unique=True, index=True)
+    key_prefix = Column(String, nullable=False)  # display only, e.g. "ffk_ab12…"
+    enabled = Column(Boolean, default=True, nullable=False, server_default="1")
+    last_used_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+
 class FlowSchedule(Base):
     """Defines a schedule for automatic flow execution."""
 
@@ -232,10 +391,13 @@ class FlowSchedule(Base):
     enabled = Column(Boolean, default=True, nullable=False)
     name = Column(String, nullable=True)
     description = Column(String, nullable=True)
-    schedule_type = Column(String, nullable=False)  # "interval" | "table_trigger" | "table_set_trigger"
+    schedule_type = Column(String, nullable=False)  # "interval" | "cron" | "table_trigger" | "table_set_trigger"
     interval_seconds = Column(Integer, nullable=True)
+    cron_expression = Column(String, nullable=True)  # 5-field cron string, used when schedule_type == "cron"
+    cron_timezone = Column(String, nullable=True)  # IANA tz name (e.g. "Europe/Amsterdam") the cron runs in
     trigger_table_id = Column(Integer, ForeignKey("catalog_tables.id"), nullable=True)
     last_triggered_at = Column(DateTime, nullable=True)
+    last_cron_slot = Column(DateTime, nullable=True)  # naive LOCAL wall-clock cron cursor (NOT UTC); DST-safe
     last_trigger_table_updated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
@@ -252,6 +414,71 @@ class ScheduleTriggerTable(Base):
     created_at = Column(DateTime, default=func.now(), nullable=False)
 
     __table_args__ = (UniqueConstraint("schedule_id", "table_id", name="uq_schedule_trigger_table"),)
+
+
+class NotificationChannel(Base):
+    """A webhook destination for run alerts. All channel types are webhooks; only the payload differs."""
+
+    __tablename__ = "notification_channels"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    name = Column(String, nullable=False)
+    channel_type = Column(String, nullable=False)  # "slack" | "discord" | "teams" | "generic"
+    # $ffsec$1$<owner_id>$<token> — the URL is a credential (anyone holding it can post).
+    webhook_url_encrypted = Column(Text, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class NotificationRule(Base):
+    """Which run outcomes reach which channel.
+
+    Scope narrows in order: ``schedule_id`` set ⇒ that schedule's runs; else
+    ``registration_id`` set ⇒ that flow's runs; else every run owned by ``owner_id``.
+    """
+
+    __tablename__ = "notification_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    channel_id = Column(Integer, ForeignKey("notification_channels.id"), nullable=False)
+    registration_id = Column(Integer, ForeignKey("flow_registrations.id"), nullable=True)
+    schedule_id = Column(Integer, ForeignKey("flow_schedules.id"), nullable=True)
+    on_failure = Column(Boolean, default=True, nullable=False)
+    on_success = Column(Boolean, default=False, nullable=False)
+    on_recovery = Column(Boolean, default=True, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class NotificationOutbox(Base):
+    """Transactional outbox row: one pending webhook delivery.
+
+    Enqueued in the same transaction that claims a run for evaluation, so a crash
+    between "run evaluated" and "alert queued" is impossible. ``channel_id`` is a
+    snapshot at enqueue time; the channel row is re-read at send. ``next_attempt_at``
+    doubles as the sending lease expiry, so a drainer that dies mid-send releases it.
+    """
+
+    __tablename__ = "notification_outbox"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(Integer, ForeignKey("notification_rules.id"), nullable=False)
+    channel_id = Column(Integer, ForeignKey("notification_channels.id"), nullable=False)
+    run_id = Column(Integer, ForeignKey("flow_runs.id"), nullable=True)
+    event_type = Column(String, nullable=False)  # run_failed | run_success | run_recovered | run_orphaned
+    payload_json = Column(Text, nullable=False)
+    status = Column(String, nullable=False, default="pending")  # pending | sending | sent | dead
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    sent_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (UniqueConstraint("rule_id", "run_id", "event_type", name="uq_outbox_rule_run_event"),)
 
 
 class TableFavorite(Base):
@@ -358,6 +585,21 @@ class CatalogTable(Base):  # Pydantic schemas: schemas/catalog_schema.py; interf
     column_count = Column(Integer, nullable=True)
     size_bytes = Column(Integer, nullable=True)
 
+    # Delta partitioning: JSON array of partition column names (NULL = unpartitioned)
+    partition_columns = Column(Text, nullable=True)
+
+    # SCD2 shape (JSON ``Scd2TableConfig``) when the table is maintained by an SCD2 write;
+    # NULL for every other table. Single source of truth for readers — a non-SCD2 write clears it.
+    scd2_config = Column(Text, nullable=True)
+
+    prediction_table_id = Column(Integer, nullable=True)
+
+    # Delta change data feed. ``cdc_enabled`` mirrors the table property; ``cdc_enabled_version``
+    # is the commit version it was enabled at — the floor every cursor is clamped to, because
+    # reads below it are inconsistent.
+    cdc_enabled = Column(Boolean, nullable=False, default=False, server_default="0")
+    cdc_enabled_version = Column(Integer, nullable=True)
+
     # Lineage: which flow produced this table
     source_registration_id = Column(Integer, ForeignKey("flow_registrations.id"), nullable=True)
     source_run_id = Column(Integer, ForeignKey("flow_runs.id"), nullable=True)
@@ -365,7 +607,9 @@ class CatalogTable(Base):  # Pydantic schemas: schemas/catalog_schema.py; interf
     # Virtual Table fields (NULL for physical tables)
     table_type = Column(String, nullable=False, default="physical", server_default="physical")
     producer_registration_id = Column(Integer, ForeignKey("flow_registrations.id"), nullable=True)
-    serialized_lazy_frame = Column(LargeBinary, nullable=True)  #  TODO Should be hashed
+    # Cached plan for optimized virtual tables; only local, secret-free plans (a serialized cloud
+    # scan would embed its build-time credentials, so cloud sources are excluded).
+    serialized_lazy_frame = Column(LargeBinary, nullable=True)
     is_optimized = Column(Boolean, nullable=True, default=False)
     sql_query = Column(Text, nullable=True)  # SQL definition for query-based virtual tables
     polars_plan = Column(Text, nullable=True)  # Polars explain() plan for optimized virtual tables
@@ -376,6 +620,33 @@ class CatalogTable(Base):  # Pydantic schemas: schemas/catalog_schema.py; interf
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
 
     __table_args__ = (UniqueConstraint("name", "namespace_id", name="uq_catalog_table_name_ns"),)
+
+
+class CatalogCdcCursor(Base):
+    """One consumer's position in a catalog table's Delta change feed.
+
+    ``last_version`` is the last commit version that consumer fully processed; the next read starts
+    at ``last_version + 1`` (clamped to the table's ``cdc_enabled_version``). ``consumer_key`` is
+    either ``name:<typed name>`` — global to the table, deliberately shared across flows — or
+    ``flow:<flow_uuid>:node:<node_id>``. ``table_path`` is the table's path at mint time: SQLite
+    reuses rowids, so a mismatch means the cursor outlived its table and must be re-initialised.
+    """
+
+    __tablename__ = "catalog_cdc_cursors"
+
+    id = Column(Integer, primary_key=True, index=True)
+    table_id = Column(Integer, ForeignKey("catalog_tables.id"), nullable=False, index=True)
+    consumer_key = Column(String, nullable=False)
+    consumer_label = Column(String, nullable=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    last_version = Column(Integer, nullable=False)
+    last_commit_timestamp = Column(DateTime, nullable=True)
+    table_path = Column(Text, nullable=True)
+    last_run_id = Column(Integer, ForeignKey("flow_runs.id"), nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("table_id", "consumer_key", name="uq_cdc_cursor_table_consumer"),)
 
 
 class CatalogTableReadLink(Base):
@@ -404,6 +675,9 @@ class CatalogVisualization(Base):
     __tablename__ = "catalog_visualizations"
 
     id = Column(Integer, primary_key=True, index=True)
+    # Stable identity for the git-backed project projection (the machine-local ``id`` doesn't
+    # round-trip). Mirrors ``FlowRegistration.flow_uuid``.
+    viz_uuid = Column(String(36), unique=True, nullable=False, default=lambda: str(uuid.uuid4()))
     name = Column(String, nullable=False)
     description = Column(Text, nullable=True)
     chart_type = Column(String, nullable=True)
@@ -439,6 +713,9 @@ class CatalogDashboard(Base):
     __tablename__ = "catalog_dashboards"
 
     id = Column(Integer, primary_key=True, index=True)
+    # Stable identity for the git-backed project projection; also what a tile's portable
+    # ``viz_uuid`` reference resolves against. Mirrors ``FlowRegistration.flow_uuid``.
+    dashboard_uuid = Column(String(36), unique=True, nullable=False, default=lambda: str(uuid.uuid4()))
     name = Column(String, nullable=False)
     description = Column(Text, nullable=True)
     layout_json = Column(Text, nullable=False)
@@ -449,6 +726,39 @@ class CatalogDashboard(Base):
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class CatalogNotebook(Base):
+    """A saved notebook: the catalog's exploration console.
+
+    This row is registration/metadata only. The cell content lives on disk as a
+    deterministic YAML file keyed by ``notebook_uuid`` (see
+    ``catalog/services/notebook_store.py``) so notebooks diff cleanly and fold
+    into the project git-tracking the same way flows do (a ``FlowRegistration``
+    row + its on-disk file). ``namespace_id`` places it in the catalog
+    hierarchy. Python cells run on a kernel; ``default_kernel_id`` remembers the
+    last selected kernel (plain id, no FK — a deleted kernel just means "nothing
+    pre-selected", never a cascade). The integer ``id`` stays the public handle
+    (the frontend derives the kernel session key from it) and the grant key.
+    """
+
+    __tablename__ = "catalog_notebooks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Stable handle for the on-disk content file (``<owner>/<uuid>.notebook.yaml``).
+    notebook_uuid = Column(String(36), unique=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    namespace_id = Column(Integer, ForeignKey("catalog_namespaces.id"), nullable=True, index=True)
+
+    # Last kernel selected for Python cells (string id; no FK by design).
+    default_kernel_id = Column(String, nullable=True)
+
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("name", "namespace_id", name="uq_catalog_notebook_name_ns"),)
 
 
 class SchedulerLock(Base):
@@ -469,8 +779,11 @@ class SchedulerLock(Base):
 
 
 class GoogleAnalyticsConnection(Base):
-    """A Google Analytics 4 connection. The OAuth refresh token is stored as
-    a single encrypted Secret, referenced by ``credential_secret_id``.
+    """A Google Analytics 4 connection. The credential — an OAuth refresh token
+    or a service-account JSON key, per ``auth_method`` — is stored as a single
+    encrypted Secret, referenced by ``credential_secret_id``. ``oauth_user_email``
+    holds the principal identity (the signed-in Google account for OAuth, or the
+    service account's ``client_email``).
     """
 
     __tablename__ = "google_analytics_connections"
@@ -479,6 +792,7 @@ class GoogleAnalyticsConnection(Base):
     connection_name = Column(String, index=True, nullable=False)
     description = Column(Text, nullable=True)
     default_property_id = Column(String, nullable=True)
+    auth_method = Column(String, nullable=False, server_default="oauth")
     oauth_user_email = Column(String, nullable=True)
     credential_secret_id = Column(Integer, ForeignKey("secrets.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -525,7 +839,7 @@ class DbInfo(Base):
 
 
 class AiAuditEvent(Base):
-    """One row per AI-driven action (plan §9.4).
+    """One row per AI-driven action.
 
     Records what the agent did on the user's behalf so the user can inspect
     after the fact. Source for the §13 success metrics (tool-call validation
@@ -558,7 +872,7 @@ class AiAuditEvent(Base):
 
 
 class AiProviderCredential(Base):
-    """One row per (user, provider) BYOK credential (plan §6.5, §8).
+    """One row per (user, provider) BYOK credential.
 
     Mirrors ``cloud_storage_connections``: plaintext metadata in the row,
     encrypted ``api_key`` blob via FK to the ``secrets`` table. Deletion of a
@@ -581,7 +895,7 @@ class AiProviderCredential(Base):
     api_base = Column(String, nullable=True)
     default_model = Column(String, nullable=True)
     # JSON-encoded list[str] of models the user has curated for this credential
-    #. Decoded at the schema layer in flowfile_core.ai.credentials. Null
+    # . Decoded at the schema layer in flowfile_core.ai.credentials. Null
     # or an empty list both mean "no curated list — fall through to the
     # resolution order".
     models = Column(Text, nullable=True)
@@ -594,3 +908,71 @@ class AiProviderCredential(Base):
     api_key_secret = relationship("Secret", foreign_keys=[api_key_secret_id], lazy="joined")
 
     __table_args__ = (UniqueConstraint("user_id", "provider", name="uq_ai_provider_per_user"),)
+
+
+# ==================== User Groups & Resource Sharing ====================
+
+
+class UserGroup(Base):
+    """A named set of users that resources can be shared with (multi-user mode only).
+
+    Distinct from node-canvas groups (``/editor/create_group/``) — always
+    ``user_groups``/``UserGroup`` in code and ``/user-groups`` in routes.
+    """
+
+    __tablename__ = "user_groups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False, unique=True, index=True)
+    description = Column(Text, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class UserGroupMembership(Base):
+    """Membership of a user in a group.
+
+    ``role`` controls group administration only (``owner``/``manager`` may manage
+    members); resource permissions come from ``ResourceGrant``. Only global admins
+    create groups, after which group owners run them.
+    """
+
+    __tablename__ = "user_group_memberships"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey("user_groups.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    role = Column(String, nullable=False, default="member")  # "owner" | "manager" | "member"
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("group_id", "user_id", name="uq_group_member"),)
+
+
+class ResourceGrant(Base):
+    """Grant of ``use`` or ``manage`` on one resource to one group.
+
+    Polymorphic by design: SQLite FK enforcement is off and deletes are explicit
+    app-level cascades anyway, so per-resource grant tables would buy nothing.
+    Every resource-delete path must call ``auth.sharing.delete_grants_for_resource``
+    — SQLite reuses rowids, so a stale grant would silently attach to a future
+    resource (the same hazard documented on ``FlowRegistration.flow_uuid``).
+    """
+
+    __tablename__ = "resource_grants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # One of the auth/sharing.py RESOURCE_REGISTRY keys: "secret",
+    # "database_connection", "cloud_connection", "ga_connection",
+    # "kafka_connection", "catalog_namespace", "catalog_table", "flow".
+    resource_type = Column(String, nullable=False, index=True)
+    resource_id = Column(Integer, nullable=False)
+    group_id = Column(Integer, ForeignKey("user_groups.id"), nullable=False, index=True)
+    permission = Column(String, nullable=False, default="use")  # "use" | "manage" (secrets: "use" only)
+    granted_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("resource_type", "resource_id", "group_id", name="uq_resource_group_grant"),
+        Index("ix_resource_grants_resource", "resource_type", "resource_id"),
+    )

@@ -1,29 +1,46 @@
 /**
- * Composable for node browser functionality
+ * Node browser state: list custom nodes and preview a node's raw code.
+ * Edit/duplicate/delete actions are orchestrated by NodeDesigner.vue via loadSave.
  */
 import { ref } from "vue";
-import axios from "axios";
+import { getCustomNode, listCustomNodes } from "../../../api/nodeDesigner";
+import {
+  fetchInstalled,
+  type InstallReceipt,
+  type InstalledCommunityNode,
+} from "../../../api/communityNodes";
 import type { CustomNodeInfo } from "../types";
 
 export function useNodeBrowser() {
   const showNodeBrowser = ref(false);
   const customNodes = ref<CustomNodeInfo[]>([]);
   const loadingNodes = ref(false);
+  // Keyed by receipt.file_name: the receipt is the only marker that a local
+  // node came from the registry, and file_name is what both surfaces carry
+  // on disk (node_key can diverge from node_id).
+  const communityByFile = ref<Record<string, InstallReceipt>>({});
 
-  // View node code state
   const viewingNodeCode = ref("");
   const viewingNodeName = ref("");
   const viewingNodeFileName = ref("");
-  const showDeleteConfirm = ref(false);
 
   async function fetchCustomNodes() {
     loadingNodes.value = true;
     try {
-      const response = await axios.get("/user_defined_components/list-custom-nodes");
-      customNodes.value = response.data;
+      // /community_nodes/installed is JWT-only and reads a local sidecar, so it
+      // works offline; a failure just means no Community chips.
+      const [nodes, installed] = await Promise.all([
+        listCustomNodes(),
+        fetchInstalled().catch(() => [] as InstalledCommunityNode[]),
+      ]);
+      customNodes.value = nodes as unknown as CustomNodeInfo[];
+      communityByFile.value = Object.fromEntries(
+        installed.map((entry) => [entry.receipt.file_name, entry.receipt]),
+      );
     } catch (error) {
       console.error("Failed to fetch custom nodes:", error);
       customNodes.value = [];
+      communityByFile.value = {};
     } finally {
       loadingNodes.value = false;
     }
@@ -31,31 +48,25 @@ export function useNodeBrowser() {
 
   async function viewCustomNode(fileName: string) {
     try {
-      const response = await axios.get(`/user_defined_components/get-custom-node/${fileName}`);
-      const nodeData = response.data;
-
+      const data = await getCustomNode(fileName);
       viewingNodeFileName.value = fileName;
-      viewingNodeName.value = nodeData.metadata?.node_name || fileName;
-      viewingNodeCode.value = nodeData.content || "// No content available";
-    } catch (error: any) {
-      console.error("Failed to load custom node:", error);
-      viewingNodeCode.value = `// Error loading node: ${error.message || "Unknown error"}`;
+      viewingNodeName.value = data.file_name || fileName;
+      viewingNodeCode.value = data.code || data.content || "// No content available";
+    } catch (error: unknown) {
+      const e = error as { message?: string };
+      viewingNodeCode.value = `// Error loading node: ${e.message || "Unknown error"}`;
     }
   }
 
   function openNodeBrowser() {
     fetchCustomNodes();
-    viewingNodeCode.value = "";
-    viewingNodeName.value = "";
-    viewingNodeFileName.value = "";
+    backToNodeList();
     showNodeBrowser.value = true;
   }
 
   function closeNodeBrowser() {
     showNodeBrowser.value = false;
-    viewingNodeCode.value = "";
-    viewingNodeName.value = "";
-    viewingNodeFileName.value = "";
+    backToNodeList();
   }
 
   function backToNodeList() {
@@ -64,46 +75,18 @@ export function useNodeBrowser() {
     viewingNodeFileName.value = "";
   }
 
-  function confirmDeleteNode() {
-    showDeleteConfirm.value = true;
-  }
-
-  async function deleteNode() {
-    if (!viewingNodeFileName.value) return;
-
-    try {
-      await axios.delete(
-        `/user_defined_components/delete-custom-node/${viewingNodeFileName.value}`,
-      );
-      showDeleteConfirm.value = false;
-      backToNodeList();
-      fetchCustomNodes();
-    } catch (error: any) {
-      console.error("Failed to delete custom node:", error);
-      alert(
-        `Error deleting node: ${error.response?.data?.detail || error.message || "Unknown error"}`,
-      );
-      showDeleteConfirm.value = false;
-    }
-  }
-
   return {
-    // State
     showNodeBrowser,
     customNodes,
+    communityByFile,
     loadingNodes,
     viewingNodeCode,
     viewingNodeName,
     viewingNodeFileName,
-    showDeleteConfirm,
-
-    // Methods
     fetchCustomNodes,
     viewCustomNode,
     openNodeBrowser,
     closeNodeBrowser,
     backToNodeList,
-    confirmDeleteNode,
-    deleteNode,
   };
 }

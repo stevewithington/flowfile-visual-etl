@@ -11,10 +11,11 @@ from collections.abc import Callable
 from typing import Any, Literal
 
 import polars as pl
-from polars.exceptions import PanicException
+from polars.exceptions import InvalidOperationError, PanicException
 
 from shared.cloud_storage.gcs import sink_to_gcs, write_delta_to_gcs
 from shared.cloud_storage.utils import normalize_delta_path
+from shared.delta_utils import _validate_partition_columns
 
 _default_logger = logging.getLogger(__name__)
 
@@ -71,21 +72,38 @@ def write_parquet_to_cloud(
         raise Exception(f"Failed to write Parquet to cloud storage: {e}") from e
 
 
+# Only "cannot sink this" falls back; storage, auth and data errors would fail the eager retry too.
+_SINK_DELTA_UNSUPPORTED = (AttributeError, NotImplementedError, InvalidOperationError)
+
+
 def write_delta_to_cloud(
     df: pl.LazyFrame,
     resource_path: str,
     storage_options: dict[str, Any],
     *,
     mode: str = "overwrite",
+    partition_by: list[str] | None = None,
     credential_provider: Callable | None = None,
     use_pyarrow: bool = False,
     logger: logging.Logger | None = None,
 ) -> None:
-    """Write LazyFrame to Delta Lake format in cloud storage."""
+    """Write LazyFrame to Delta Lake format in cloud storage.
+
+    *partition_by* is passed through to Delta for every mode (matching
+    ``shared.delta_utils.write_delta``): it defines partitioning when the table
+    is created; on writes to an existing table Delta enforces that it matches
+    the table's existing partitioning (raising on a mismatch).
+    """
     log = logger or _default_logger
+    if partition_by:
+        _validate_partition_columns(df, partition_by)
     if use_pyarrow:
-        write_delta_to_gcs(df, resource_path, storage_options, mode=mode)
+        write_delta_to_gcs(df, resource_path, storage_options, mode=mode, partition_by=partition_by)
         return
+
+    delta_write_options: dict[str, Any] = {}
+    if partition_by:
+        delta_write_options["partition_by"] = partition_by
 
     sink_kwargs: dict[str, Any] = {
         "target": normalize_delta_path(resource_path),
@@ -95,10 +113,12 @@ def write_delta_to_cloud(
         sink_kwargs["storage_options"] = storage_options
     if credential_provider:
         sink_kwargs["credential_provider"] = credential_provider
+    if delta_write_options:
+        sink_kwargs["delta_write_options"] = delta_write_options
 
     try:
         df.sink_delta(**sink_kwargs)
-    except Exception as e:
+    except _SINK_DELTA_UNSUPPORTED as e:
         log.warning(f"Failed to use sink_delta, falling back to collect and write_delta: {e}")
         write_kwargs: dict[str, Any] = {
             "target": normalize_delta_path(resource_path),
@@ -106,6 +126,10 @@ def write_delta_to_cloud(
         }
         if storage_options:
             write_kwargs["storage_options"] = storage_options
+        if credential_provider:
+            write_kwargs["credential_provider"] = credential_provider
+        if delta_write_options:
+            write_kwargs["delta_write_options"] = delta_write_options
         _collect_lazy_frame(df).write_delta(**write_kwargs)
 
 
@@ -188,6 +212,7 @@ def write_to_cloud(
     write_mode: str = "overwrite",
     compression: str = "snappy",
     separator: str = ",",
+    partition_by: list[str] | None = None,
     credential_provider: Callable | None = None,
     use_pyarrow: bool = False,
     logger: logging.Logger | None = None,
@@ -201,6 +226,8 @@ def write_to_cloud(
 
     if write_mode == "append" and file_format != "delta":
         raise NotImplementedError("The 'append' write mode is not yet supported for this destination.")
+    if partition_by and file_format != "delta":
+        raise ValueError("partition_by is only supported for the 'delta' file format")
 
     if file_format == "parquet":
         write_parquet_to_cloud(
@@ -211,7 +238,7 @@ def write_to_cloud(
     elif file_format == "delta":
         write_delta_to_cloud(
             df, resource_path, storage_options,
-            mode=write_mode, credential_provider=credential_provider,
+            mode=write_mode, partition_by=partition_by, credential_provider=credential_provider,
             use_pyarrow=use_pyarrow, logger=log,
         )
     elif file_format == "csv":

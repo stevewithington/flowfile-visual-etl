@@ -16,9 +16,7 @@ from flowfile_core.schemas import input_schema, schemas, transform_schema
 from flowfile_core.schemas.schemas import FlowParameter
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def make_graph(flow_id: int = 99, execution_location: str = "local") -> FlowGraph:
@@ -47,9 +45,7 @@ def run_and_assert_ok(graph: FlowGraph) -> None:
         raise AssertionError(f"Flow failed:\n{errors}")
 
 
-# ---------------------------------------------------------------------------
 # polars_code node
-# ---------------------------------------------------------------------------
 
 
 def test_polars_code_parameter_substituted(execution_location):
@@ -57,7 +53,6 @@ def test_polars_code_parameter_substituted(execution_location):
     graph = make_graph(101, execution_location=execution_location)
     graph.flow_settings.parameters = [FlowParameter(name="col_name", default_value="city")]
 
-    # Manual input: [{name: "Alice", city: "Amsterdam"}]
     promise = input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="manual_input")
     graph.add_node_promise(promise)
     graph.add_manual_input(
@@ -70,7 +65,6 @@ def test_polars_code_parameter_substituted(execution_location):
         )
     )
 
-    # polars_code node that selects a column by the parameter name
     promise2 = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="polars_code")
     graph.add_node_promise(promise2)
     graph.add_polars_code(
@@ -246,7 +240,7 @@ def test_no_parameters_flow_unchanged(execution_location):
 def test_unresolved_parameter_fails_node(execution_location):
     """A ${missing} reference that has no matching parameter causes the node to fail."""
     graph = make_graph(106, execution_location=execution_location)
-    graph.flow_settings.parameters = []  # no parameters defined
+    graph.flow_settings.parameters = []
 
     promise = input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="manual_input")
     graph.add_node_promise(promise)
@@ -278,9 +272,7 @@ def test_unresolved_parameter_fails_node(execution_location):
     assert "undefined_param" in (node_result.error or "")
 
 
-# ---------------------------------------------------------------------------
 # Issue 1: node retains example_data_generator / has_completed_last_run after run
-# ---------------------------------------------------------------------------
 
 
 def test_node_retains_example_data_after_run_with_parameter(execution_location):
@@ -324,9 +316,7 @@ def test_node_retains_example_data_after_run_with_parameter(execution_location):
     )
 
 
-# ---------------------------------------------------------------------------
 # Issue 2: lazy schema prediction with parameters
-# ---------------------------------------------------------------------------
 
 
 def test_predicted_schema_uses_parameters():
@@ -360,7 +350,6 @@ def test_predicted_schema_uses_parameters():
     )
     add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
 
-    # Do NOT run the graph — test lazy prediction only
     node = graph.get_node(2)
     schema = node.get_predicted_schema(force=True)
 
@@ -409,16 +398,13 @@ def test_predicted_schema_preserves_original_code_after_lazy_eval():
     )
 
 
-# ---------------------------------------------------------------------------
 # Issue 3: read node predicted schema with parameterized file path
-# ---------------------------------------------------------------------------
 
 
 def test_read_node_predicted_schema_with_parameterized_path():
     """A read node whose file path uses ${file_name} should predict the correct
     schema (column names and types) WITHOUT running the graph, by resolving the
     parameter during lazy schema prediction."""
-    # Create a real CSV file so that the schema can be read from disk
     with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
         f.write("city,population\n")
         f.write("Amsterdam,900000\n")
@@ -443,7 +429,6 @@ def test_read_node_predicted_schema_with_parameterized_path():
             )
         )
 
-        # Do NOT run the graph — test lazy prediction only
         node = graph.get_node(1)
         schema = node.get_predicted_schema()
 
@@ -529,16 +514,13 @@ def test_read_node_run_with_parameterized_path(execution_location):
         os.unlink(csv_path)
 
 
-# ---------------------------------------------------------------------------
 # Issue 4: parameter change invalidates predicted schema
-# ---------------------------------------------------------------------------
 
 
 def test_parameter_change_invalidates_predicted_schema():
     """When a flow parameter value changes via the flow_settings setter,
     nodes that reference ${...} must have their predicted schema invalidated
     so the next get_predicted_schema() returns the schema for the new file."""
-    # Create two CSV files with different columns
     with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
         f.write("city,population\n")
         f.write("Amsterdam,900000\n")
@@ -575,7 +557,6 @@ def test_parameter_change_invalidates_predicted_schema():
             )
         )
 
-        # Predict schema — should match file A
         node = graph.get_node(1)
         schema_a = node.get_predicted_schema(force=True)
         assert schema_a is not None
@@ -583,7 +564,6 @@ def test_parameter_change_invalidates_predicted_schema():
         assert "city" in cols_a, f"Expected 'city' in schema from file A, got: {cols_a}"
         assert "population" in cols_a, f"Expected 'population' in schema from file A, got: {cols_a}"
 
-        # Change the parameter to point to file B via the setter
         graph.flow_settings = schemas.FlowSettings(
             flow_id=graph.flow_id,
             name="param_test",
@@ -593,17 +573,287 @@ def test_parameter_change_invalidates_predicted_schema():
             parameters=[FlowParameter(name="file_name", default_value=csv_b)],
         )
 
-        # Predict schema again — should now match file B
         schema_b = node.get_predicted_schema(force=True)
         assert schema_b is not None
         cols_b = [c.name for c in schema_b]
         assert "product" in cols_b, f"Expected 'product' in schema from file B, got: {cols_b}"
         assert "price" in cols_b, f"Expected 'price' in schema from file B, got: {cols_b}"
 
-        # Original ${file_name} reference must still be in setting_input
         assert node.setting_input.received_file.path == "${file_name}", (
             "Parameter reference must be preserved after invalidation"
         )
     finally:
         os.unlink(csv_a)
         os.unlink(csv_b)
+
+
+# formula / filter nodes: type-correct expression-literal parameter rendering
+
+
+def _manual_input(graph, node_id, rows):
+    graph.add_node_promise(
+        input_schema.NodePromise(flow_id=graph.flow_id, node_id=node_id, node_type="manual_input")
+    )
+    graph.add_manual_input(
+        input_schema.NodeManualInput(
+            flow_id=graph.flow_id,
+            node_id=node_id,
+            raw_data_format=input_schema.RawData.from_pylist(rows),
+        )
+    )
+
+
+def _formula(graph, node_id, depending_on_id, out_name, function, data_type="Auto"):
+    graph.add_node_promise(
+        input_schema.NodePromise(flow_id=graph.flow_id, node_id=node_id, node_type="formula")
+    )
+    graph.add_formula(
+        input_schema.NodeFormula(
+            flow_id=graph.flow_id,
+            node_id=node_id,
+            depending_on_id=depending_on_id,
+            function=transform_schema.FunctionInput(
+                field=transform_schema.FieldInput(name=out_name, data_type=data_type),
+                function=function,
+            ),
+        )
+    )
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(depending_on_id, node_id))
+
+
+def _advanced_filter(graph, node_id, depending_on_id, expr):
+    graph.add_node_promise(
+        input_schema.NodePromise(flow_id=graph.flow_id, node_id=node_id, node_type="filter")
+    )
+    graph.add_filter(
+        input_schema.NodeFilter(
+            flow_id=graph.flow_id,
+            node_id=node_id,
+            depending_on_id=depending_on_id,
+            filter_input=transform_schema.FilterInput(mode="advanced", advanced_filter=expr),
+        )
+    )
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(depending_on_id, node_id))
+
+
+def _column(graph, node_id, col):
+    return graph.get_node(node_id).get_resulting_data().to_dict()[col]
+
+
+def test_formula_string_param_embedded(execution_location):
+    """A string param embedded in a formula renders as a quoted literal (no manual quoting)."""
+    graph = make_graph(201, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="prefix", default_value="v2_", type="string")]
+    _manual_input(graph, 1, [{"name": "Alice"}, {"name": "Bob"}])
+    _formula(graph, 2, 1, "renamed", "${prefix} + [name]")
+    run_and_assert_ok(graph)
+    assert _column(graph, 2, "renamed") == ["v2_Alice", "v2_Bob"]
+
+
+def test_formula_string_param_whole_field(execution_location):
+    """A whole-field ${p} string param yields a constant string column (must not crash)."""
+    graph = make_graph(202, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="greeting", default_value="hello", type="string")]
+    _manual_input(graph, 1, [{"name": "a"}, {"name": "b"}])
+    _formula(graph, 2, 1, "g", "${greeting}")
+    run_and_assert_ok(graph)
+    assert _column(graph, 2, "g") == ["hello", "hello"]
+
+
+def test_formula_int_param_embedded(execution_location):
+    graph = make_graph(203, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="bump", default_value="5", type="integer")]
+    _manual_input(graph, 1, [{"val": 10}, {"val": 20}])
+    _formula(graph, 2, 1, "bumped", "[val] + ${bump}")
+    run_and_assert_ok(graph)
+    assert _column(graph, 2, "bumped") == [15, 25]
+
+
+def test_formula_int_param_whole_field_no_crash(execution_location):
+    """Regression: a formula whose entire value is ${int_param} previously crashed
+    (raw int stuffed into the expression parser). It must resolve to a literal."""
+    graph = make_graph(204, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="bump", default_value="5", type="integer")]
+    _manual_input(graph, 1, [{"val": 10}, {"val": 20}])
+    _formula(graph, 2, 1, "five", "${bump}")
+    run_and_assert_ok(graph)
+    assert _column(graph, 2, "five") == [5, 5]
+
+
+def test_formula_bool_param_whole_field(execution_location):
+    graph = make_graph(205, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="flag", default_value="true", type="boolean")]
+    _manual_input(graph, 1, [{"name": "a"}, {"name": "b"}])
+    _formula(graph, 2, 1, "f", "${flag}")
+    run_and_assert_ok(graph)
+    assert _column(graph, 2, "f") == [True, True]
+
+
+def test_formula_string_escaping_roundtrip(execution_location):
+    """String param values with a backslash / newline round-trip through the literal renderer."""
+    graph = make_graph(206, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="p", default_value="a\\b\nc", type="string")]
+    _manual_input(graph, 1, [{"name": "x"}])
+    _formula(graph, 2, 1, "s", "${p}")
+    run_and_assert_ok(graph)
+    assert _column(graph, 2, "s") == ["a\\b\nc"]
+
+
+def test_filter_advanced_string_param(execution_location):
+    graph = make_graph(207, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="target", default_value="NYC", type="string")]
+    _manual_input(graph, 1, [{"city": "NYC"}, {"city": "LA"}, {"city": "NYC"}])
+    _advanced_filter(graph, 2, 1, "[city] == ${target}")
+    run_and_assert_ok(graph)
+    assert _column(graph, 2, "city") == ["NYC", "NYC"]
+
+
+def test_filter_advanced_numeric_param(execution_location):
+    graph = make_graph(208, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="threshold", default_value="25", type="integer")]
+    _manual_input(graph, 1, [{"age": 10}, {"age": 30}, {"age": 40}])
+    _advanced_filter(graph, 2, 1, "[age] > ${threshold}")
+    run_and_assert_ok(graph)
+    assert _column(graph, 2, "age") == [30, 40]
+
+
+def test_filter_advanced_preserves_original_after_run(execution_location):
+    graph = make_graph(209, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="threshold", default_value="25", type="integer")]
+    _manual_input(graph, 1, [{"age": 10}, {"age": 30}])
+    _advanced_filter(graph, 2, 1, "[age] > ${threshold}")
+    run_and_assert_ok(graph)
+    stored = graph.get_node(2).setting_input.filter_input.advanced_filter
+    assert stored == "[age] > ${threshold}", f"reference must be preserved after run, got {stored!r}"
+
+
+def test_formula_param_type_change_rerun(execution_location):
+    """The literal is inferred from the runtime value, so changing a param's TYPE
+    between runs yields a correctly-typed result for the same ${ref}."""
+    graph = make_graph(210, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="x", default_value="5", type="string")]
+    _manual_input(graph, 1, [{"name": "a"}])
+    _formula(graph, 2, 1, "c", "${x}")
+    run_and_assert_ok(graph)
+    assert _column(graph, 2, "c") == ["5"]  # string param -> quoted literal -> string column
+
+    graph.flow_settings.parameters = [FlowParameter(name="x", default_value="5", type="integer")]
+    graph.reset()
+    run_and_assert_ok(graph)
+    assert _column(graph, 2, "c") == [5]  # integer param -> bare literal -> int column
+
+
+# Single-node fetch ("get data" on one node)
+
+
+def test_trigger_fetch_node_resolves_parameters(execution_location):
+    """A single-node fetch substitutes ${name} the same way a full run does."""
+    graph = make_graph(211, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="param_value", default_value="hello", type="string")]
+    _manual_input(graph, 1, [{"name": "Alice"}])
+    _formula(graph, 2, 1, "output_field", "${param_value}")
+    run_and_assert_ok(graph)
+
+    graph.get_node(2).node_stats.has_run_with_current_setup = False
+    graph.trigger_fetch_node(2)
+
+    result = graph.latest_run_info.node_step_result[-1]
+    assert result.success, f"single-node fetch failed: {result.error}"
+    assert _column(graph, 2, "output_field") == ["hello"]
+
+
+def test_trigger_fetch_node_preserves_parameter_reference(execution_location):
+    """A single-node fetch restores the original ${name} text, so saving is lossless."""
+    graph = make_graph(212, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="param_value", default_value="hello", type="string")]
+    _manual_input(graph, 1, [{"name": "Alice"}])
+    _formula(graph, 2, 1, "output_field", "${param_value}")
+    run_and_assert_ok(graph)
+
+    graph.get_node(2).node_stats.has_run_with_current_setup = False
+    graph.trigger_fetch_node(2)
+
+    entries = graph.get_node(2).setting_input.entries
+    assert [e.function for e in entries] == ["${param_value}"]
+
+
+def test_trigger_fetch_node_multi_entry_formula_chain(execution_location):
+    """Multi-entry formulas resolve params and still chain entry-to-entry on a fetch."""
+    graph = make_graph(213, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="param_value", default_value="hello", type="string")]
+    _manual_input(graph, 1, [{"name": "Alice"}])
+    graph.add_node_promise(
+        input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="formula")
+    )
+    graph.add_formula(
+        input_schema.NodeFormula(
+            flow_id=graph.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            functions=[
+                transform_schema.FunctionInput(
+                    field=transform_schema.FieldInput(name="a", data_type="Auto"),
+                    function="${param_value}",
+                ),
+                transform_schema.FunctionInput(
+                    field=transform_schema.FieldInput(name="b", data_type="Auto"),
+                    function="concat([a], '!')",
+                ),
+            ],
+        )
+    )
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    run_and_assert_ok(graph)
+
+    graph.get_node(2).node_stats.has_run_with_current_setup = False
+    graph.trigger_fetch_node(2)
+
+    result = graph.latest_run_info.node_step_result[-1]
+    assert result.success, f"single-node fetch failed: {result.error}"
+    assert _column(graph, 2, "a") == ["hello"]
+    assert _column(graph, 2, "b") == ["hello!"]
+
+
+def test_trigger_fetch_node_unresolved_parameter_reports_error(execution_location):
+    """An undefined ${name} reports the parameter error, not a parse error."""
+    graph = make_graph(214, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="param_value", default_value="hello", type="string")]
+    _manual_input(graph, 1, [{"name": "Alice"}])
+    _formula(graph, 2, 1, "output_field", "${param_value}")
+    run_and_assert_ok(graph)
+
+    graph.flow_settings.parameters = [FlowParameter(name="other", default_value="x", type="string")]
+    graph.get_node(2).node_stats.has_run_with_current_setup = False
+    graph.trigger_fetch_node(2)
+
+    result = graph.latest_run_info.node_step_result[-1]
+    assert result.success is False
+    assert "Unresolved parameter references" in result.error
+    assert "param_value" in result.error
+
+
+# Retry-on-missing-file re-runs upstream nodes, which need their own parameters resolved
+
+
+def test_retry_upstream_resolves_parameters(execution_location):
+    """The missing-file retry substitutes ${name} into each upstream node it re-runs."""
+    graph = make_graph(215, execution_location=execution_location)
+    graph.flow_settings.parameters = [FlowParameter(name="param_value", default_value="hello", type="string")]
+    _manual_input(graph, 1, [{"name": "Alice"}])
+    _formula(graph, 2, 1, "output_field", "${param_value}")
+    _formula(graph, 3, 2, "downstream", "[output_field]")
+    run_and_assert_ok(graph)
+
+    upstream, node = graph.get_node(2), graph.get_node(3)
+    node.executor._handle_error(
+        node._execution_state,
+        Exception("No such file or directory (os error 2)"),
+        execution_location,
+        False,
+        True,
+        graph.flow_logger.get_node_logger(3),
+    )
+
+    assert upstream.results.errors is None
+    assert _column(graph, 2, "output_field") == ["hello"]
+    assert upstream.setting_input.entries[0].function == "${param_value}"

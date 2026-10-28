@@ -15,9 +15,7 @@ from flowfile_core.flowfile.handler import FlowfileHandler
 from flowfile_core.schemas import input_schema, schemas, transform_schema
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _create_handler() -> FlowfileHandler:
@@ -93,9 +91,7 @@ def _run_graph(graph: FlowGraph) -> RunInformation:
     return run_info
 
 
-# ---------------------------------------------------------------------------
 # Test data
-# ---------------------------------------------------------------------------
 
 CUSTOMERS = [
     {"id": 1, "name": "Alice", "city": "Amsterdam"},
@@ -111,9 +107,47 @@ ORDERS = [
 ]
 
 
-# ---------------------------------------------------------------------------
+# Schema prediction
+
+
+class TestSqlQuerySchemaPrediction:
+    """The sql_query schema_callback predicts output columns without a run."""
+
+    def test_predicted_schema_single_input_aggregate(self):
+        graph = _create_graph(execution_location="local")
+        _add_manual_input(graph, CUSTOMERS, node_id=1)
+        _add_sql_query(
+            graph, node_id=2,
+            sql_code="SELECT city, COUNT(*) AS n FROM input_1 GROUP BY city",
+            depending_on_ids=[1],
+        )
+        _connect(graph, 1, 2)
+
+        predicted = graph.get_node(2).get_predicted_schema(force=True)
+        assert predicted is not None
+        assert [c.name for c in predicted] == ["city", "n"]
+
+    def test_predicted_schema_matches_executed_join(self):
+        graph = _create_graph(execution_location="local")
+        _add_manual_input(graph, CUSTOMERS, node_id=1)
+        _add_manual_input(graph, ORDERS, node_id=2)
+        _add_sql_query(
+            graph, node_id=3,
+            sql_code="SELECT a.name, b.amount FROM input_1 a JOIN input_2 b ON a.id = b.customer_id",
+            depending_on_ids=[1, 2],
+        )
+        _connect(graph, 1, 3)
+        _connect(graph, 2, 3)
+
+        predicted = graph.get_node(3).get_predicted_schema(force=True)
+        _run_graph(graph)
+        executed = graph.get_node(3).get_resulting_data().schema
+
+        assert predicted is not None
+        assert [c.name for c in predicted] == [c.name for c in executed]
+
+
 # Single-input tests
-# ---------------------------------------------------------------------------
 
 
 class TestSqlQuerySingleInput:
@@ -191,9 +225,7 @@ class TestSqlQuerySingleInput:
         assert all(d == a * 2 for a, d in zip(amounts, doubled))
 
 
-# ---------------------------------------------------------------------------
 # Multi-input tests
-# ---------------------------------------------------------------------------
 
 
 class TestSqlQueryMultiInput:
@@ -259,9 +291,7 @@ class TestSqlQueryMultiInput:
         assert diana_rows["amount"][0] is None
 
 
-# ---------------------------------------------------------------------------
 # Chaining tests
-# ---------------------------------------------------------------------------
 
 
 class TestSqlQueryChaining:
@@ -272,7 +302,6 @@ class TestSqlQueryChaining:
         graph = _create_graph(execution_location=execution_location)
         _add_manual_input(graph, CUSTOMERS, node_id=1)
 
-        # First SQL: filter to Amsterdam
         _add_sql_query(
             graph,
             node_id=2,
@@ -281,7 +310,6 @@ class TestSqlQueryChaining:
         )
         _connect(graph, 1, 2)
 
-        # Second SQL: count the filtered results
         _add_sql_query(
             graph,
             node_id=3,
@@ -296,9 +324,7 @@ class TestSqlQueryChaining:
         assert result["total"][0] == 2
 
 
-# ---------------------------------------------------------------------------
 # Error handling tests
-# ---------------------------------------------------------------------------
 
 
 class TestSqlQueryErrors:
@@ -368,9 +394,7 @@ class TestSqlQueryErrors:
         assert not run_info.success
 
 
-# ---------------------------------------------------------------------------
 # Description tests
-# ---------------------------------------------------------------------------
 
 
 class TestSqlQueryDescription:

@@ -47,9 +47,7 @@ DEFAULT_LRU_SIZE: int = 32
 _LOCK_TIMEOUT_SECONDS: float = 2.0
 
 
-# --------------------------------------------------------------------------- #
-# Protocol                                                                     #
-# --------------------------------------------------------------------------- #
+# Protocol
 
 
 class DiffRepository(Protocol):
@@ -69,9 +67,7 @@ class DiffRepository(Protocol):
     def clear(self) -> None: ...
 
 
-# --------------------------------------------------------------------------- #
-# In-memory                                                                    #
-# --------------------------------------------------------------------------- #
+# In-memory
 
 
 class InMemoryDiffRepository:
@@ -98,15 +94,13 @@ class InMemoryDiffRepository:
             self._items.clear()
 
 
-# --------------------------------------------------------------------------- #
-# Disk                                                                         #
-# --------------------------------------------------------------------------- #
+# Disk
 
 
 class DiskDiffRepository:
     """JSON sidecar repository at ``{root}/{flow_id}/{session_id}.diff.json``.
 
-    Layout chosen to colocate the diff with the session file per plan §5.6.
+    Layout chosen to colocate the diff with the session file.
     Diff lookup by ``diff_id`` walks the in-memory shadow index; on miss,
     we sweep the root once to rebuild the index. The sweep is bounded by
     the number of staged diffs across all flows in the user's data — small.

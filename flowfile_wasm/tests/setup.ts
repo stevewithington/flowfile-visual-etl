@@ -6,7 +6,6 @@
 import { vi } from 'vitest'
 import 'fake-indexeddb/auto'
 
-// Mock sessionStorage
 const sessionStorageMock = (() => {
   let store: Record<string, string> = {}
   return {
@@ -23,7 +22,26 @@ Object.defineProperty(window, 'sessionStorage', {
   value: sessionStorageMock
 })
 
-// Mock Blob for file size calculations
+const localStorageMock = (() => {
+  let store: Record<string, string> = {}
+  return {
+    getItem: (key: string) => store[key] ?? null,
+    setItem: (key: string, value: string) => { store[key] = value.toString() },
+    removeItem: (key: string) => { delete store[key] },
+    clear: () => { store = {} },
+    get length() { return Object.keys(store).length },
+    key: (index: number) => Object.keys(store)[index] || null
+  }
+})()
+
+Object.defineProperty(window, 'localStorage', {
+  value: localStorageMock
+})
+Object.defineProperty(globalThis, 'localStorage', {
+  value: localStorageMock,
+  configurable: true
+})
+
 if (typeof Blob === 'undefined') {
   global.Blob = class Blob {
     private content: BlobPart[]
@@ -42,7 +60,6 @@ if (typeof Blob === 'undefined') {
   } as any
 }
 
-// Reset mocks between tests
 beforeEach(() => {
   sessionStorageMock.clear()
   vi.clearAllMocks()

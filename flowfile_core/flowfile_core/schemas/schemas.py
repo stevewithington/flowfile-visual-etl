@@ -1,8 +1,21 @@
-from typing import Any, ClassVar, Literal
+from enum import Enum
+from typing import Annotated, Any, ClassVar, Literal, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    ValidationInfo,
+    field_serializer,
+    field_validator,
+    model_serializer,
+)
 
 from flowfile_core.configs.settings import OFFLOAD_TO_WORKER
+from flowfile_core.flowfile.node_designer.state import ArtifactDecl
+from flowfile_core.flowfile.param_types import FlowParameter  # noqa: F401 - re-exported; historical home
 from flowfile_core.flowfile.utils import create_unique_id
 from flowfile_core.schemas import input_schema
 
@@ -19,6 +32,9 @@ NODE_TYPE_TO_SETTINGS_CLASS = {
     "manual_input": input_schema.NodeManualInput,
     "filter": input_schema.NodeFilter,
     "formula": input_schema.NodeFormula,
+    "multi_field_formula": input_schema.NodeMultiFieldFormula,
+    "dynamic_rename": input_schema.NodeDynamicRename,
+    "data_cleansing": input_schema.NodeDataCleansing,
     "select": input_schema.NodeSelect,
     "sort": input_schema.NodeSort,
     "record_id": input_schema.NodeRecordId,
@@ -26,10 +42,12 @@ NODE_TYPE_TO_SETTINGS_CLASS = {
     "random_split": input_schema.NodeRandomSplit,
     "unique": input_schema.NodeUnique,
     "group_by": input_schema.NodeGroupBy,
+    "window_functions": input_schema.NodeWindowFunctions,
     "pivot": input_schema.NodePivot,
     "unpivot": input_schema.NodeUnpivot,
     "text_to_rows": input_schema.NodeTextToRows,
     "graph_solver": input_schema.NodeGraphSolver,
+    "explode_hierarchy": input_schema.NodeExplodeHierarchy,
     "python_script": input_schema.NodePythonScript,
     "polars_code": input_schema.NodePolarsCode,
     "sql_query": input_schema.NodeSqlQuery,
@@ -39,8 +57,11 @@ NODE_TYPE_TO_SETTINGS_CLASS = {
     "record_count": input_schema.NodeRecordCount,
     "explore_data": input_schema.NodeExploreData,
     "union": input_schema.NodeUnion,
+    "gate": input_schema.NodeGate,
     "output": input_schema.NodeOutput,
+    "api_response": input_schema.NodeApiResponse,
     "read": input_schema.NodeRead,
+    "list_files": input_schema.NodeListFiles,
     "database_reader": input_schema.NodeDatabaseReader,
     "database_writer": input_schema.NodeDatabaseWriter,
     "cloud_storage_reader": input_schema.NodeCloudStorageReader,
@@ -49,6 +70,7 @@ NODE_TYPE_TO_SETTINGS_CLASS = {
     "catalog_writer": input_schema.NodeCatalogWriter,
     "kafka_source": input_schema.NodeKafkaSource,
     "google_analytics_reader": input_schema.NodeGoogleAnalyticsReader,
+    "rest_api_reader": input_schema.NodeRestApiReader,
     "external_source": input_schema.NodeExternalSource,
     "promise": input_schema.NodePromise,
     "user_defined": input_schema.UserDefinedNode,
@@ -56,6 +78,9 @@ NODE_TYPE_TO_SETTINGS_CLASS = {
     "apply_model": input_schema.NodeApplyModel,
     "evaluate_model": input_schema.NodeEvaluateModel,
     "wait_for": input_schema.NodeWaitFor,
+    "flow_input": input_schema.NodeFlowInput,
+    "flow_output": input_schema.NodeFlowOutput,
+    "run_flow": input_schema.NodeRunFlow,
 }
 
 
@@ -81,14 +106,27 @@ def _get_custom_node_store():
     return _custom_node_store_cache
 
 
-def get_settings_class_for_node_type(node_type: str):
-    """Get the settings class for a node type, supporting both standard and user-defined nodes."""
+def get_settings_class_for_node_type(node_type: str, setting_data: dict | None = None):
+    """Get the settings class for a node type, supporting both standard and user-defined nodes.
+
+    ``setting_data`` (the raw stored settings dict, when available) lets flows
+    referencing a custom node that is missing from the store still resolve to
+    ``UserDefinedNode`` instead of failing as an unknown type.
+    """
+    # A user-defined node whose key collides with a built-in type must still
+    # resolve to UserDefinedNode. Built-in schemas drop ``is_user_defined`` on
+    # serialization, so a truthy marker means a genuine custom node — it wins
+    # over the built-in type->schema mapping.
+    if isinstance(setting_data, dict) and setting_data.get("is_user_defined"):
+        return input_schema.UserDefinedNode
     model_class = NODE_TYPE_TO_SETTINGS_CLASS.get(node_type)
-    if model_class is None:
-        if node_type in _get_custom_node_store():
-            return input_schema.UserDefinedNode
-        return None
-    return model_class
+    if model_class is not None:
+        return model_class
+    if node_type in _get_custom_node_store():
+        return input_schema.UserDefinedNode
+    if isinstance(setting_data, dict) and "settings" in setting_data:
+        return input_schema.UserDefinedNode
+    return None
 
 
 def is_valid_execution_location_in_current_global_settings(execution_location: ExecutionLocationsLiteral) -> bool:
@@ -104,14 +142,6 @@ def get_prio_execution_location(
         return "local"
     else:
         return local_execution_location
-
-
-class FlowParameter(BaseModel):
-    """A single flow-level parameter that can be referenced via ${name} syntax."""
-
-    name: str
-    default_value: str = ""
-    description: str = ""
 
 
 class FlowGraphConfig(BaseModel):
@@ -181,6 +211,7 @@ class FlowSettings(FlowGraphConfig):
         is_running (bool): Indicates if the flow is currently running.
         is_canceled (bool): Indicates if the flow execution has been canceled.
         track_history (bool): Flag to enable or disable undo/redo history tracking.
+        validate_settings (bool): Flag to warn on nodes whose settings reference missing input columns.
     """
 
     auto_save: bool = False
@@ -190,6 +221,7 @@ class FlowSettings(FlowGraphConfig):
     is_running: bool = False
     is_canceled: bool = False
     track_history: bool = True
+    validate_settings: bool = True
 
     @classmethod
     def from_flow_settings_input(cls, flow_graph_config: FlowGraphConfig):
@@ -239,6 +271,7 @@ class FlowfileSettings(BaseModel):
     execution_location: ExecutionLocationsLiteral = "local"
     auto_save: bool = False
     show_detailed_progress: bool = True
+    validate_settings: bool = True
     max_parallel_workers: int = Field(default=4, ge=1)
     source_registration_id: int | None = None
     parameters: list[FlowParameter] = Field(default_factory=list, description="Flow-level parameters.")
@@ -251,16 +284,39 @@ class FlowfileSettings(BaseModel):
         return v
 
 
+class FlowfileInputConnection(BaseModel):
+    """One keyed input edge of a dynamic-input node (per-edge target handle).
+
+    Only nodes whose template sets ``dynamic_inputs`` serialize these; the same
+    upstream node may legitimately appear twice with different handles.
+    """
+
+    from_id: int
+    input_handle: str
+    source_handle: str = "output-0"
+
+
 class FlowfileNode(BaseModel):
-    """Node representation for flowfile serialization (YAML/JSON)."""
+    """Node representation for flowfile serialization (YAML/JSON).
+
+    ``description`` is the rendered canvas text: the user's, else the auto-generated one.
+    ``description_is_auto_generated`` records which of the two it is, so an undo snapshot
+    restores a typed description even when it equals the auto text. It is emitted only by
+    python-mode dumps of a live graph (the in-memory history snapshots, which are python-mode
+    anyway so secrets survive); JSON dumps (saved files, share links, run snapshots) omit it,
+    which keeps the on-disk format unchanged and leaves file loads to compare the text with
+    the auto text.
+    """
 
     id: int
     type: str
     is_start_node: bool = False
     description: str | None = ""
+    description_is_auto_generated: bool | None = None
     node_reference: str | None = None  # Unique reference identifier for code generation
     x_position: int | None = 0
     y_position: int | None = 0
+    group_id: int | None = None  # Visual group this node belongs to (organizational only)
     left_input_id: int | None = None
     right_input_id: int | None = None
     input_ids: list[int] | None = Field(default_factory=list)
@@ -269,6 +325,8 @@ class FlowfileNode(BaseModel):
     # (e.g. ["output-0", "output-1"]). Older flowfiles omit this — loaders treat
     # missing entries as "output-0".
     output_handles: list[str] | None = None
+    # Keyed edges for dynamic-input nodes; None for every other node type.
+    input_connections: list[FlowfileInputConnection] | None = None
     setting_input: Any | None = None
 
     _setting_input_exclude: ClassVar[set] = {
@@ -276,6 +334,7 @@ class FlowfileNode(BaseModel):
         "node_id",
         "pos_x",
         "pos_y",
+        "group_id",
         "is_setup",
         "description",
         "node_reference",
@@ -296,7 +355,85 @@ class FlowfileNode(BaseModel):
             return value
         if hasattr(value, "to_yaml_dict"):
             return value.to_yaml_dict()
+        if isinstance(value, input_schema.UserDefinedNode):
+            # Persist the marker so flows reopen gracefully even when the node
+            # type is no longer installed (settings-class resolution).
+            data = value.model_dump(exclude=self._setting_input_exclude)
+            data["is_user_defined"] = True
+            return data
         return value.model_dump(exclude=self._setting_input_exclude)
+
+    @model_serializer(mode="wrap")
+    def _keep_description_provenance_in_memory(self, handler: SerializerFunctionWrapHandler, info: SerializationInfo):
+        """Drop ``description_is_auto_generated`` from JSON dumps and whenever it is unset.
+
+        Deliberately unannotated: a return annotation would replace the model's serialization JSON schema.
+        """
+        data = handler(self)
+        if info.mode_is_json() or self.description_is_auto_generated is None:
+            data.pop("description_is_auto_generated", None)
+        return data
+
+
+# Allowed group tints. Single source of truth — mirrored by the frontend `GroupColor` union.
+GroupColor = Literal["slate", "blue", "green", "amber", "rose", "violet", "cyan"]
+
+
+class GroupBounds(NamedTuple):
+    """Axis-aligned bounds of a group box, in absolute canvas coordinates."""
+
+    x: float
+    y: float
+    width: float
+    height: float
+
+
+class _GroupFields(BaseModel):
+    """Shared fields for the runtime and serialization group models (one definition, zero drift).
+
+    Groups are purely visual containers; they have no effect on execution or the DAG.
+    """
+
+    id: int
+    name: str = "Group"
+    color: GroupColor | None = None  # None -> frontend default tint
+    x_position: float = 0.0
+    y_position: float = 0.0
+    width: float = 400.0
+    height: float = 250.0
+    collapsed: bool = False  # whether the box is collapsed to a compact bar
+    parent_group_id: int | None = None  # reserved for future nesting; unused in v1
+
+
+class GroupInformation(_GroupFields):
+    """Runtime representation of a visual node group (stored in FlowGraph._groups)."""
+
+
+class FlowfileGroup(_GroupFields):
+    """Serialized representation of a visual node group (YAML/JSON)."""
+
+
+class _CommentFields(BaseModel):
+    """Shared fields for the runtime and serialization comment models (one definition, zero drift).
+
+    Comments are free-floating text notes on the canvas (the Alteryx "Comment" tool). They
+    are not nodes: they have no inputs, outputs, settings or effect on execution.
+    """
+
+    id: int
+    text: str = ""
+    x_position: float = 0.0
+    y_position: float = 0.0
+    width: float = 240.0
+    height: float = 120.0
+
+
+class CommentInformation(_CommentFields):
+    """Runtime representation of a canvas comment (stored in FlowGraph._comments)."""
+
+
+class FlowfileComment(_CommentFields):
+    """Serialized representation of a canvas comment (YAML/JSON)."""
 
 
 class FlowfileData(BaseModel):
@@ -307,6 +444,237 @@ class FlowfileData(BaseModel):
     flowfile_name: str
     flowfile_settings: FlowfileSettings
     nodes: list[FlowfileNode]
+    groups: list[FlowfileGroup] = Field(default_factory=list)
+    comments: list[FlowfileComment] = Field(default_factory=list)
+
+
+class NodeTag(str, Enum):
+    """Controlled vocabulary of palette search keywords.
+
+    Matched (case-insensitive substring) against the user's query in the node palette so a
+    node surfaces by concept, format, or tool rather than only its display name
+    (e.g. "s3" -> cloud reader/writer, "sum" -> formula and group by). As a ``str`` enum each
+    member serializes to its plain string value for the frontend.
+    """
+
+    # File formats & local IO
+    CSV = "csv"
+    EXCEL = "excel"
+    PARQUET = "parquet"
+    JSON = "json"
+    FILE = "file"
+    READ = "read"
+    WRITE = "write"
+    IMPORT = "import"
+    EXPORT = "export"
+    SAVE = "save"
+    DELTA = "delta"
+    FOLDER = "folder"
+    DIRECTORY = "directory"
+    LIST_FILES = "list files"
+    METADATA = "metadata"
+
+    # Connectivity & APIs
+    API = "api"
+    REST = "rest"
+    HTTP = "http"
+    EXTERNAL = "external"
+    RESPONSE = "response"
+    PAGINATION = "pagination"
+
+    # Databases
+    DATABASE = "database"
+    SQL = "sql"
+    QUERY = "query"
+    TABLE = "table"
+    POSTGRES = "postgres"
+    MYSQL = "mysql"
+    SQL_SERVER = "sql server"
+    SNOWFLAKE = "snowflake"
+    ORACLE = "oracle"
+    SQLITE = "sqlite"
+    REDSHIFT = "redshift"
+    BIGQUERY = "bigquery"
+
+    # Cloud storage
+    S3 = "s3"
+    AWS = "aws"
+    AZURE = "azure"
+    ADLS = "adls"
+    GCS = "gcs"
+    BLOB = "blob"
+    BUCKET = "bucket"
+    CLOUD = "cloud"
+
+    # Catalog / lakehouse
+    CATALOG = "catalog"
+    LAKEHOUSE = "lakehouse"
+    TIME_TRAVEL = "time travel"
+
+    # Streaming
+    KAFKA = "kafka"
+    REDPANDA = "redpanda"
+    STREAMING = "streaming"
+    TOPIC = "topic"
+
+    # Analytics sources
+    GOOGLE_ANALYTICS = "google analytics"
+    GA4 = "ga4"
+    ANALYTICS = "analytics"
+
+    # Data entry
+    MANUAL = "manual"
+    PASTE = "paste"
+    INPUT = "input"
+
+    # Column shaping
+    SELECT = "select"
+    COLUMNS = "columns"
+    RENAME = "rename"
+    REORDER = "reorder"
+    PROJECTION = "projection"
+
+    # Row selection
+    FILTER = "filter"
+    WHERE = "where"
+    SUBSET = "subset"
+    SAMPLE = "sample"
+    LIMIT = "limit"
+    HEAD = "head"
+
+    # Formula / compute
+    FORMULA = "formula"
+    EXPRESSION = "expression"
+    CALCULATE = "calculate"
+    MATH = "math"
+    CONCAT = "concat"
+    TRANSFORM = "transform"
+
+    # Data quality & cleansing
+    CLEAN = "clean"
+    CLEANSE = "cleanse"
+    TRIM = "trim"
+    WHITESPACE = "whitespace"
+    NULLS = "nulls"
+
+    # Aggregation
+    GROUP_BY = "group by"
+    AGGREGATE = "aggregate"
+    SUM = "sum"
+    MEAN = "mean"
+    AVERAGE = "average"
+    COUNT = "count"
+    MIN = "min"
+    MAX = "max"
+    MEDIAN = "median"
+    SUMMARIZE = "summarize"
+    RECORD_COUNT = "record count"
+    ROWS = "rows"
+
+    # Window functions
+    WINDOW = "window"
+    ROLLING = "rolling"
+    CUMULATIVE = "cumulative"
+    RANK = "rank"
+    PARTITION = "partition"
+    LAG = "lag"
+    LEAD = "lead"
+
+    # Joins & combine
+    JOIN = "join"
+    MERGE = "merge"
+    LOOKUP = "lookup"
+    VLOOKUP = "vlookup"
+    INNER = "inner"
+    OUTER = "outer"
+    CROSS_JOIN = "cross join"
+    CARTESIAN = "cartesian"
+    FUZZY = "fuzzy"
+    SIMILARITY = "similarity"
+    LEVENSHTEIN = "levenshtein"
+    UNION = "union"
+    APPEND = "append"
+    WAIT = "wait"
+    DEPENDENCY = "dependency"
+    GATE = "gate"
+    CONDITION = "condition"
+    CONDITIONAL = "conditional"
+    IF = "if"
+    ELSE = "else"
+    SWITCH = "switch"
+    BRANCH = "branch"
+    SKIP = "skip"
+
+    # Reshape
+    PIVOT = "pivot"
+    CROSSTAB = "crosstab"
+    UNPIVOT = "unpivot"
+    MELT = "melt"
+    RESHAPE = "reshape"
+    TEXT_TO_ROWS = "text to rows"
+    SPLIT = "split"
+    EXPLODE = "explode"
+
+    # Deduplication
+    UNIQUE = "unique"
+    DEDUPE = "dedupe"
+    DISTINCT = "distinct"
+    DROP_DUPLICATES = "drop duplicates"
+
+    # Graph
+    GRAPH = "graph"
+    NETWORK = "network"
+    CLUSTER = "cluster"
+    CONNECTED_COMPONENTS = "connected components"
+
+    # Hierarchy
+    HIERARCHY = "hierarchy"
+    BOM = "bom"
+    BILL_OF_MATERIALS = "bill of materials"
+    ROLLUP = "rollup"
+    TREE = "tree"
+
+    # Identifiers & ordering
+    RECORD_ID = "record id"
+    ROW_NUMBER = "row number"
+    INDEX = "index"
+    SORT = "sort"
+    ORDER = "order"
+    ASCENDING = "ascending"
+    DESCENDING = "descending"
+
+    # Code
+    POLARS = "polars"
+    CODE = "code"
+    PYTHON = "python"
+    SCRIPT = "script"
+    KERNEL = "kernel"
+    CUSTOM = "custom"
+    DATAFRAME = "dataframe"
+
+    # Explore
+    EXPLORE = "explore"
+    PROFILE = "profile"
+    PREVIEW = "preview"
+    EDA = "eda"
+    STATISTICS = "statistics"
+    VISUALIZE = "visualize"
+    BAR_CHART = "bar chart"
+    INSIGHT = "insight"
+    GRAPHS = "graphs"
+
+    # Machine learning
+    ML = "ml"
+    MACHINE_LEARNING = "machine learning"
+    TRAIN = "train"
+    TEST = "test"
+    MODEL = "model"
+    REGRESSION = "regression"
+    CLASSIFICATION = "classification"
+    PREDICT = "predict"
+    SCORE = "score"
+    EVALUATE = "evaluate"
+    METRICS = "metrics"
 
 
 class NodeTemplate(BaseModel):
@@ -334,13 +702,40 @@ class NodeTemplate(BaseModel):
     node_type: NodeTypeLiteral
     transform_type: TransformTypeLiteral
     node_group: str
+    # Display name for dynamic (custom-category) palette groups; None for built-ins.
+    node_group_label: str | None = None
     prod_ready: bool = True
     can_be_start: bool = False
     drawer_title: str = "Node title"
     drawer_intro: str = "Drawer into"
     custom_node: bool | None = False
+    execution_environment: str | None = None
+    dependencies: list[str] | None = None
+    publishes: list[ArtifactDecl] | None = None
     laziness: LazinessLiteral = "eager"
     output_names: list[str] | None = None
+    # Display-only names for the canvas input handles, index i <-> "input-{i}".
+    # Purely cosmetic: unlike output_names these are never dict keys and nothing
+    # reads them at execution time. Distinct from NodeInput.input_names, which is
+    # the per-instance dynamic-handle list (run_flow) with a reserved index 0.
+    input_labels: list[str] | None = None
+    # When set, the arity check accepts min_inputs..input connections instead of
+    # exactly `input` — for nodes with optional inputs (gate's control input).
+    min_inputs: int | None = None
+    # Purely cosmetic (like input_labels): input handle indices the canvas
+    # renders as bottom-center "parameter" pips instead of left data handles
+    # (gate's control input). Never read at execution time.
+    control_input_indices: list[int] | None = None
+    # Per-instance input handles (run_flow): connections are keyed by target
+    # handle instead of collapsing onto input-0. See flow_node/input_handles.py.
+    dynamic_inputs: bool = False
+    tags: list[NodeTag] = Field(default_factory=list)
+
+    @property
+    def writes(self) -> bool:
+        """Whether a node of this template writes when the flow runs: the ``output`` group, or a custom node whose
+        class declares ``node_type="output"`` whatever palette group its category gives it."""
+        return self.node_group == "output" or bool(self.custom_node and self.node_type == "output")
 
 
 class NodeInformation(BaseModel):
@@ -356,11 +751,13 @@ class NodeInformation(BaseModel):
     node_reference: str | None = None  # Unique reference identifier for code generation
     x_position: int | None = 0
     y_position: int | None = 0
+    group_id: int | None = None
     left_input_id: int | None = None
     right_input_id: int | None = None
     input_ids: list[int] | None = Field(default_factory=list)
     outputs: list[int] | None = Field(default_factory=list)
     output_handles: list[str] | None = None
+    input_connections: list[FlowfileInputConnection] | None = None
     setting_input: Any | None = None
 
     @property
@@ -380,7 +777,7 @@ class NodeInformation(BaseModel):
             return v
 
         node_type = info.data.get("type")
-        model_class = get_settings_class_for_node_type(node_type)
+        model_class = get_settings_class_for_node_type(node_type, v if isinstance(v, dict) else None)
 
         if model_class is None:
             raise ValueError(f"Unknown node type: {node_type}")
@@ -410,6 +807,8 @@ class FlowInformation(BaseModel):
     data: dict[int, NodeInformation] = {}
     node_starts: list[int]
     node_connections: list[tuple[int, int]] = []
+    groups: list[GroupInformation] = Field(default_factory=list)
+    comments: list[CommentInformation] = Field(default_factory=list)
 
     @field_validator("flow_name", mode="before")
     def ensure_string(cls, v):
@@ -445,13 +844,22 @@ class NodeInput(NodeTemplate):
         pos_y (float): The y-coordinate on the canvas.
         output_names (list[str] | None): Named outputs for multi-output nodes.
         node_reference (str | None): Reference name used for code generation and input naming.
+        description (str): Canvas text — the user's, else auto-generated.
+        is_auto_generated (bool): Whether ``description`` is the auto text.
     """
 
     id: int
     pos_x: float
     pos_y: float
+    group_id: int | None = None
     output_names: list[str] | None = None
+    # Dynamic-input nodes: label per input handle, index i <-> "input-{i}"
+    # (index 0 is the reserved parameter handle). None for static nodes.
+    input_names: list[str] | None = None
     node_reference: str | None = None
+    # Set by core on the way out (canvas cache seed); ignored on the way in.
+    description: str = ""
+    is_auto_generated: bool = True
 
 
 class NodeEdge(BaseModel):
@@ -486,6 +894,277 @@ class VueFlowInput(BaseModel):
 
     node_edges: list[NodeEdge]
     node_inputs: list[NodeInput]
+    groups: list[FlowfileGroup] = Field(default_factory=list)
+    comments: list[FlowfileComment] = Field(default_factory=list)
+
+
+# ============================================================================
+# Node-group editor request bodies (organizational only; no execution impact)
+# ============================================================================
+
+
+class CreateGroupRequest(BaseModel):
+    """Body for POST /editor/create_group/. Bounds are optional; computed from members if omitted."""
+
+    node_ids: list[int]
+    name: str = "Group"
+    color: GroupColor | None = None
+    x_position: float | None = None
+    y_position: float | None = None
+    width: float | None = None
+    height: float | None = None
+    parent_group_id: int | None = None  # nest the new group under this group
+    child_group_ids: list[int] = Field(default_factory=list)  # existing groups to nest inside the new one
+    group_id: int | None = None  # a batch names the group it creates; must be above every id the flow has held
+
+
+class UpdateGroupRequest(BaseModel):
+    """Body for POST /editor/update_group/. All fields optional -> partial update."""
+
+    name: str | None = None
+    color: GroupColor | None = None
+    x_position: float | None = None
+    y_position: float | None = None
+    width: float | None = None
+    height: float | None = None
+    collapsed: bool | None = None
+    clear_color: bool | None = None  # back to the default tint; a None color leaves it alone
+
+
+class GroupMembershipRequest(BaseModel):
+    """Body for adding/removing nodes from a group."""
+
+    node_ids: list[int]
+
+
+class NodePositionUpdate(BaseModel):
+    """A single node's new absolute canvas position."""
+
+    node_id: int
+    pos_x: float
+    pos_y: float
+
+
+class GroupBoundsUpdate(BaseModel):
+    """A single group's new absolute bounds."""
+
+    group_id: int
+    x_position: float
+    y_position: float
+    width: float
+    height: float
+
+
+class CommentBounds(NamedTuple):
+    """Axis-aligned bounds of a canvas comment, in absolute canvas coordinates."""
+
+    x: float
+    y: float
+    width: float
+    height: float
+
+
+class CreateCommentRequest(BaseModel):
+    """Body for POST /editor/create_comment/. Size falls back to the model defaults."""
+
+    text: str = ""
+    x_position: float = 0.0
+    y_position: float = 0.0
+    width: float | None = None
+    height: float | None = None
+
+
+class UpdateCommentRequest(BaseModel):
+    """Body for POST /editor/update_comment/. All fields optional -> partial update."""
+
+    text: str | None = None
+    x_position: float | None = None
+    y_position: float | None = None
+    width: float | None = None
+    height: float | None = None
+
+
+class CommentBoundsUpdate(BaseModel):
+    """A single comment's new absolute bounds."""
+
+    comment_id: int
+    x_position: float
+    y_position: float
+    width: float
+    height: float
+
+
+class UpdateLayoutRequest(BaseModel):
+    """Batch persistence of dragged node positions, group bounds and/or comment bounds (one drag-end -> one call)."""
+
+    node_positions: list[NodePositionUpdate] = Field(default_factory=list)
+    group_bounds: list[GroupBoundsUpdate] = Field(default_factory=list)
+    comment_bounds: list[CommentBoundsUpdate] = Field(default_factory=list)
+    # False -> apply without a new undo entry (folds into a preceding op's snapshot).
+    record_history: bool = True
+
+
+class AddNodeOperation(BaseModel):
+    """Same as ``POST /editor/add_node/``."""
+
+    op: Literal["add_node"]
+    node_id: int
+    node_type: str
+    pos_x: float = 0
+    pos_y: float = 0
+
+
+class UpdateSettingsOperation(BaseModel):
+    """Same as ``POST /update_settings/``; ``settings`` is that route's body (incl. flow_id/node_id)."""
+
+    op: Literal["update_settings"]
+    node_type: str
+    settings: dict[str, Any]
+
+
+class DeleteNodeOperation(BaseModel):
+    """Same as ``POST /editor/delete_node/``."""
+
+    op: Literal["delete_node"]
+    node_id: int
+
+
+class ConnectOperation(BaseModel):
+    """Same as ``POST /editor/connect_node/``."""
+
+    op: Literal["connect"]
+    connection: input_schema.NodeConnection
+
+
+class DeleteConnectionOperation(BaseModel):
+    """Same as ``POST /editor/delete_connection/``."""
+
+    op: Literal["delete_connection"]
+    connection: input_schema.NodeConnection
+
+
+class UpdateLayoutOperation(BaseModel):
+    """Same as ``POST /editor/update_layout/``; ``record_history`` is ignored inside a batch."""
+
+    op: Literal["update_layout"]
+    layout: UpdateLayoutRequest
+
+
+class CopyNodeOperation(BaseModel):
+    """Same as ``POST /editor/copy_node``."""
+
+    op: Literal["copy_node"]
+    node_id_to_copy_from: int
+    flow_id_to_copy_from: int
+    node_promise: input_schema.NodePromise
+
+
+class DeleteCommentOperation(BaseModel):
+    """Same as ``POST /editor/delete_comment/``."""
+
+    op: Literal["delete_comment"]
+    comment_id: int
+
+
+class InsertOnEdgeOperation(BaseModel):
+    """Splice the existing node ``node_id`` into the edge ``connection`` (A -> B), keeping B's input slot and position.
+
+    Batch-only: A(handle) -> node(input-0) and node(output-0) -> B replace the edge; 422 when it does not exist.
+    """
+
+    op: Literal["insert_on_edge"]
+    node_id: int
+    connection: input_schema.NodeConnection
+
+
+class UpdateUserDefinedSettingsOperation(BaseModel):
+    """Same as ``POST /user_defined_components/update_user_defined_node``: a custom node's settings."""
+
+    op: Literal["update_user_defined_settings"]
+    node_type: str
+    settings: dict[str, Any]
+
+
+class SetFlowParametersOperation(BaseModel):
+    """Replace the flow parameters, like ``POST /flow_settings``: applied in the batch, outside its undo step."""
+
+    op: Literal["set_flow_parameters"]
+    parameters: list[FlowParameter]
+
+
+class CreateGroupOperation(BaseModel):
+    """Same as ``POST /editor/create_group/``; ``group.group_id`` names the new group so later ops can refer to it."""
+
+    op: Literal["create_group"]
+    group: CreateGroupRequest
+
+
+class UpdateGroupOperation(BaseModel):
+    """Same as ``POST /editor/update_group/``."""
+
+    op: Literal["update_group"]
+    group_id: int
+    group: UpdateGroupRequest
+
+
+class NestGroupOperation(BaseModel):
+    """Nest group ``group_id`` under ``parent_group_id`` (``None`` for the top level). Batch-only."""
+
+    op: Literal["nest_group"]
+    group_id: int
+    parent_group_id: int | None = None
+
+
+class DeleteGroupOperation(BaseModel):
+    """Same as ``POST /editor/delete_group/``."""
+
+    op: Literal["delete_group"]
+    group_id: int
+
+
+class AddNodesToGroupOperation(BaseModel):
+    """Same as ``POST /editor/group/add_nodes/``."""
+
+    op: Literal["add_nodes_to_group"]
+    group_id: int
+    node_ids: list[int]
+
+
+class RemoveNodesFromGroupOperation(BaseModel):
+    """Same as ``POST /editor/group/remove_nodes/``."""
+
+    op: Literal["remove_nodes_from_group"]
+    node_ids: list[int]
+
+
+EditorOperation = Annotated[
+    AddNodeOperation
+    | UpdateSettingsOperation
+    | DeleteNodeOperation
+    | ConnectOperation
+    | DeleteConnectionOperation
+    | UpdateLayoutOperation
+    | CopyNodeOperation
+    | DeleteCommentOperation
+    | InsertOnEdgeOperation
+    | UpdateUserDefinedSettingsOperation
+    | SetFlowParametersOperation
+    | CreateGroupOperation
+    | UpdateGroupOperation
+    | NestGroupOperation
+    | DeleteGroupOperation
+    | AddNodesToGroupOperation
+    | RemoveNodesFromGroupOperation,
+    Field(discriminator="op"),
+]
+
+
+class ApplyOperationsRequest(BaseModel):
+    """Body for ``POST /editor/apply_operations/``: ordered primitive ops applied atomically as one undo step."""
+
+    flow_id: int
+    label: str
+    operations: list[EditorOperation]
 
 
 class NodeDefault(BaseModel):

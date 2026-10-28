@@ -1,5 +1,4 @@
 // Flow API Service - Handles all flow-related HTTP requests
-// Consolidated from features/designer/nodes/nodeLogic.ts and components/Canvas/backendInterface.ts
 import axios from "../services/axios.config";
 import type {
   FlowSettings,
@@ -13,12 +12,19 @@ import type {
   UndoRedoResult,
   OperationResponse,
   FlowArtifactData,
+  FlowSettingsValidation,
+  CreateGroupRequest,
+  UpdateGroupRequest,
+  UpdateLayoutRequest,
+  GroupOperationResponse,
+  CreateCommentRequest,
+  UpdateCommentRequest,
+  CommentOperationResponse,
+  GraphOperation,
 } from "../types";
 
 export class FlowApi {
-  // ============================================================================
   // Flow CRUD Operations
-  // ============================================================================
 
   /**
    * Get all active flow sessions
@@ -65,7 +71,7 @@ export class FlowApi {
    * Update flow settings
    */
   static async updateFlowSettings(flowSettings: FlowSettings): Promise<null> {
-    const response = await axios.post("/flow_settings/", flowSettings, {
+    const response = await axios.post("/flow_settings", flowSettings, {
       headers: { accept: "application/json" },
     });
     if (response.status === 200) {
@@ -75,20 +81,29 @@ export class FlowApi {
   }
 
   /**
-   * Create a new flow
+   * Create a new flow.
+   *
+   * `registerInCatalog` and `persist` are independent: the first controls the
+   * FlowRegistration row, the second whether the YAML is written immediately.
    */
   static async createFlow(
     flowPath: string | null = null,
     name: string | null = null,
+    namespaceId: number | null = null,
+    registerInCatalog = true,
+    persist = true,
   ): Promise<number> {
     const response = await axios.post(
-      "/editor/create_flow",
+      "/editor/create_flow/",
       {},
       {
         headers: { accept: "application/json" },
         params: {
           flow_path: flowPath,
           name: name,
+          namespace_id: namespaceId,
+          register_in_catalog: registerInCatalog,
+          persist: persist,
         },
       },
     );
@@ -96,6 +111,18 @@ export class FlowApi {
       return response.data;
     }
     throw Error("Error creating flow");
+  }
+
+  /**
+   * Rename a flow (catalog registration + in-memory session name)
+   */
+  static async renameFlow(flowId: number, name: string): Promise<FlowSettings> {
+    const response = await axios.post<FlowSettings>(
+      "/editor/rename_flow/",
+      { flow_id: flowId, name },
+      { headers: { accept: "application/json" } },
+    );
+    return response.data;
   }
 
   /**
@@ -137,9 +164,7 @@ export class FlowApi {
     throw Error("Error fetching flow data");
   }
 
-  // ============================================================================
   // Flow Execution Operations
-  // ============================================================================
 
   /**
    * Run the entire flow
@@ -185,9 +210,7 @@ export class FlowApi {
     });
   }
 
-  // ============================================================================
   // Node Operations within Flow
-  // ============================================================================
 
   /**
    * Insert a new node into the flow
@@ -224,28 +247,13 @@ export class FlowApi {
     flowIdToCopyFrom: number,
     nodePromise: NodePromise,
   ): Promise<OperationResponse> {
-    const response = await axios.post<OperationResponse>("editor/copy_node/", nodePromise, {
+    const response = await axios.post<OperationResponse>("editor/copy_node", nodePromise, {
       params: {
         node_id_to_copy_from: nodeIdToCopyFrom,
         flow_id_to_copy_from: flowIdToCopyFrom,
       },
       headers: { accept: "application/json" },
     });
-    return response.data;
-  }
-
-  /**
-   * Delete a node from the flow
-   */
-  static async deleteNode(flowId: number, nodeId: number): Promise<OperationResponse> {
-    const response = await axios.post<OperationResponse>(
-      "/editor/delete_node/",
-      {},
-      {
-        params: { flow_id: flowId, node_id: nodeId },
-        headers: { accept: "application/json" },
-      },
-    );
     return response.data;
   }
 
@@ -266,27 +274,144 @@ export class FlowApi {
     return response.data;
   }
 
-  /**
-   * Delete a connection between nodes
-   */
-  static async deleteConnection(
+  // Node Group Operations (visual containers; organizational only)
+
+  /** Create a visual group around a set of nodes. Returns the server-assigned group. */
+  static async createGroup(
     flowId: number,
-    nodeConnection: NodeConnection,
-  ): Promise<OperationResponse> {
+    request: CreateGroupRequest,
+  ): Promise<GroupOperationResponse> {
+    const response = await axios.post<GroupOperationResponse>("/editor/create_group/", request, {
+      params: { flow_id: flowId },
+      headers: { "Content-Type": "application/json", accept: "application/json" },
+    });
+    return response.data;
+  }
+
+  /** Rename / recolor / move / resize a group box. */
+  static async updateGroup(
+    flowId: number,
+    groupId: number,
+    request: UpdateGroupRequest,
+  ): Promise<GroupOperationResponse> {
+    const response = await axios.post<GroupOperationResponse>("/editor/update_group/", request, {
+      params: { flow_id: flowId, group_id: groupId },
+      headers: { "Content-Type": "application/json", accept: "application/json" },
+    });
+    return response.data;
+  }
+
+  /** Delete (ungroup) a group box. Member nodes are kept. */
+  static async deleteGroup(flowId: number, groupId: number): Promise<OperationResponse> {
     const response = await axios.post<OperationResponse>(
-      "/editor/delete_connection/",
-      nodeConnection,
+      "/editor/delete_group/",
+      {},
       {
-        params: { flow_id: flowId },
+        params: { flow_id: flowId, group_id: groupId },
         headers: { accept: "application/json" },
       },
     );
     return response.data;
   }
 
-  // ============================================================================
+  /** Add nodes to an existing group. */
+  static async addNodesToGroup(
+    flowId: number,
+    groupId: number,
+    nodeIds: number[],
+  ): Promise<GroupOperationResponse> {
+    const response = await axios.post<GroupOperationResponse>(
+      "/editor/group/add_nodes/",
+      { node_ids: nodeIds },
+      {
+        params: { flow_id: flowId, group_id: groupId },
+        headers: { "Content-Type": "application/json", accept: "application/json" },
+      },
+    );
+    return response.data;
+  }
+
+  /** Remove nodes from their group (a group emptied this way is pruned). */
+  static async removeNodesFromGroup(flowId: number, nodeIds: number[]): Promise<OperationResponse> {
+    const response = await axios.post<OperationResponse>(
+      "/editor/group/remove_nodes/",
+      { node_ids: nodeIds },
+      {
+        params: { flow_id: flowId },
+        headers: { "Content-Type": "application/json", accept: "application/json" },
+      },
+    );
+    return response.data;
+  }
+
+  // Canvas Comment Operations (free text notes; organizational only)
+
+  /** Create a canvas comment. Returns the server-assigned comment. */
+  static async createComment(
+    flowId: number,
+    request: CreateCommentRequest,
+  ): Promise<CommentOperationResponse> {
+    const response = await axios.post<CommentOperationResponse>(
+      "/editor/create_comment/",
+      request,
+      {
+        params: { flow_id: flowId },
+        headers: { "Content-Type": "application/json", accept: "application/json" },
+      },
+    );
+    return response.data;
+  }
+
+  /** Edit, move or resize a canvas comment. */
+  static async updateComment(
+    flowId: number,
+    commentId: number,
+    request: UpdateCommentRequest,
+  ): Promise<CommentOperationResponse> {
+    const response = await axios.post<CommentOperationResponse>(
+      "/editor/update_comment/",
+      request,
+      {
+        params: { flow_id: flowId, comment_id: commentId },
+        headers: { "Content-Type": "application/json", accept: "application/json" },
+      },
+    );
+    return response.data;
+  }
+
+  /** Persist dragged node positions, group bounds and/or comment bounds (one drag-end -> one call). */
+  static async updateLayout(
+    flowId: number,
+    request: UpdateLayoutRequest,
+    mutationSlot?: number,
+  ): Promise<OperationResponse> {
+    const response = await axios.post<OperationResponse>("/editor/update_layout/", request, {
+      params: { flow_id: flowId },
+      headers: { "Content-Type": "application/json", accept: "application/json" },
+      mutationSlot,
+    });
+    return response.data;
+  }
+
+  /** Apply one gesture's primitive operations atomically: all or nothing, one undo step. */
+  static async applyOperations(
+    flowId: number,
+    label: string,
+    operations: GraphOperation[],
+    mutationSlot?: number,
+  ): Promise<OperationResponse> {
+    const response = await axios.post<OperationResponse>(
+      "/editor/apply_operations/",
+      { flow_id: flowId, label, operations },
+      {
+        headers: { "Content-Type": "application/json", accept: "application/json" },
+        mutationSlot,
+      },
+    );
+    return response.data;
+  }
+
   // History/Undo-Redo Operations
-  // ============================================================================
 
   /**
    * Undo the last action on the flow graph
@@ -321,15 +446,24 @@ export class FlowApi {
     return response.data;
   }
 
-  // ============================================================================
   // Artifact Operations
-  // ============================================================================
 
   /**
    * Get artifact visualization data for a flow (badges, edges)
    */
   static async getArtifacts(flowId: number): Promise<FlowArtifactData> {
     const response = await axios.get<FlowArtifactData>("/flow/artifacts", {
+      params: { flow_id: flowId },
+      headers: { accept: "application/json" },
+    });
+    return response.data;
+  }
+
+  /**
+   * Get the backend's conservative settings validation (missing column references) for a flow.
+   */
+  static async getSettingsValidation(flowId: number): Promise<FlowSettingsValidation> {
+    const response = await axios.get<FlowSettingsValidation>("/flow/settings_validation", {
       params: { flow_id: flowId },
       headers: { accept: "application/json" },
     });
@@ -352,10 +486,7 @@ export class FlowApi {
    * Get the named input keys available for a kernel node.
    * Each entry has: name, source_node_id, source_node_type.
    */
-  static async getNodeInputNames(
-    flowId: number,
-    nodeId: number,
-  ): Promise<InputNameInfo[]> {
+  static async getNodeInputNames(flowId: number, nodeId: number): Promise<InputNameInfo[]> {
     const response = await axios.get("/node/input_names", {
       params: { flow_id: flowId, node_id: nodeId },
       headers: { accept: "application/json" },

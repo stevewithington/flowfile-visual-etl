@@ -92,7 +92,7 @@ def _make_table(name: str = "Sales") -> int:
 
 
 def _empty_layout() -> dict:
-    return {"tiles": [], "grid": {"cols": 12, "row_height": 40, "version": 1}, "filters": []}
+    return {"tiles": [], "grid": {"cols": 48, "row_height": 40, "version": 2}, "filters": []}
 
 
 def _layout_with_two_tiles() -> dict:
@@ -153,6 +153,126 @@ class TestDashboardCRUD:
         get_resp = client.get(f"/catalog/dashboards/{body['id']}")
         assert get_resp.status_code == 200
         assert get_resp.json()["layout"]["tiles"][1]["viz_id"] == 2
+
+    def test_create_with_separator_tile(self, client):
+        layout = _layout_with_two_tiles()
+        layout["tiles"].append({"id": "sep-1", "type": "separator", "x": 0, "y": 6, "w": 12, "h": 1})
+        layout["tiles"].append(
+            {
+                "id": "sep-2",
+                "type": "separator",
+                "orientation": "vertical",
+                "thickness": 3,
+                "line_color": "#dc2626",
+                "x": 6,
+                "y": 0,
+                "w": 1,
+                "h": 6,
+            }
+        )
+        resp = client.post("/catalog/dashboards", json={"name": "With separator", "layout": layout})
+        assert resp.status_code == 201, resp.text
+        tiles = client.get(f"/catalog/dashboards/{resp.json()['id']}").json()["layout"]["tiles"]
+        assert tiles[2]["type"] == "separator"
+        assert tiles[2]["viz_id"] is None
+        assert tiles[2]["orientation"] == "horizontal"
+        assert tiles[2]["thickness"] is None
+        assert tiles[3]["orientation"] == "vertical"
+        assert tiles[3]["thickness"] == 3
+        assert tiles[3]["line_color"] == "#dc2626"
+
+    def test_separator_thickness_out_of_range_returns_422(self, client):
+        layout = _layout_with_two_tiles()
+        layout["tiles"].append(
+            {"id": "sep", "type": "separator", "thickness": 0, "x": 0, "y": 6, "w": 12, "h": 1}
+        )
+        resp = client.post("/catalog/dashboards", json={"name": "Thin", "layout": layout})
+        assert resp.status_code == 422
+
+    def test_create_with_kpi_tile(self, client):
+        kpi = {
+            "field": "amount",
+            "agg": "distinctCount",
+            "label": "Unique amounts",
+            "prefix": "$",
+            "suffix": " USD",
+            "decimals": 2,
+            "compact": False,
+            "comparison": "target",
+            "target": 1250.5,
+            "higher_is_better": False,
+            "value_size": "lg",
+        }
+        layout = _layout_with_two_tiles()
+        layout["tiles"].append({"id": "kpi-1", "type": "kpi", "viz_id": 1, "kpi": kpi, "x": 0, "y": 6, "w": 3, "h": 2})
+        layout["tiles"].append({"id": "kpi-2", "type": "kpi", "kpi": None, "x": 3, "y": 6, "w": 3, "h": 2})
+        layout["tiles"].append(
+            {"id": "kpi-3", "type": "kpi", "viz_id": 2, "kpi": {"agg": "count"}, "x": 6, "y": 6, "w": 3, "h": 2}
+        )
+        resp = client.post("/catalog/dashboards", json={"name": "With KPI", "layout": layout})
+        assert resp.status_code == 201, resp.text
+        tiles = client.get(f"/catalog/dashboards/{resp.json()['id']}").json()["layout"]["tiles"]
+        assert tiles[0]["kpi"] is None
+        assert tiles[2]["type"] == "kpi"
+        assert tiles[2]["viz_id"] == 1
+        assert tiles[2]["kpi"] == kpi
+        assert tiles[3]["viz_id"] is None
+        assert tiles[3]["kpi"] is None
+        assert tiles[4]["kpi"] == {
+            "field": None,
+            "agg": "count",
+            "label": None,
+            "prefix": None,
+            "suffix": None,
+            "decimals": None,
+            "compact": True,
+            "comparison": "none",
+            "target": None,
+            "higher_is_better": True,
+            "value_size": "auto",
+        }
+
+    @pytest.mark.parametrize(
+        "bad_kpi",
+        [
+            {"agg": "variance"},
+            {"agg": "sum", "decimals": 7},
+            {"agg": "sum", "comparison": "bogus"},
+            {"agg": "sum", "label": "x" * 121},
+            {"agg": "sum", "value_size": "huge"},
+        ],
+    )
+    def test_invalid_kpi_config_returns_422(self, client, bad_kpi):
+        layout = _layout_with_two_tiles()
+        layout["tiles"].append({"id": "kpi", "type": "kpi", "viz_id": 1, "kpi": bad_kpi, "x": 0, "y": 6, "w": 3, "h": 2})
+        resp = client.post("/catalog/dashboards", json={"name": "Bad KPI", "layout": layout})
+        assert resp.status_code == 422
+
+    def test_filter_can_target_kpi_tile(self, client):
+        layout = _layout_with_two_tiles()
+        layout["tiles"].append(
+            {"id": "kpi-1", "type": "kpi", "viz_id": 1, "kpi": {"field": "amount"}, "x": 0, "y": 6, "w": 3, "h": 2}
+        )
+        layout["filters"] = [
+            {
+                "id": "f1",
+                "field_name": "region",
+                "kind": "categorical",
+                "state": {"selected": ["US"]},
+                "target": "tiles",
+                "target_tile_ids": ["kpi-1"],
+            }
+        ]
+        resp = client.post("/catalog/dashboards", json={"name": "KPI filter", "layout": layout})
+        assert resp.status_code == 201, resp.text
+        filters = client.get(f"/catalog/dashboards/{resp.json()['id']}").json()["layout"]["filters"]
+        assert filters[0]["target_tile_ids"] == ["kpi-1"]
+
+    def test_create_with_unknown_tile_type_returns_422(self, client):
+        layout = _layout_with_two_tiles()
+        layout["tiles"].append({"id": "bad", "type": "image", "x": 0, "y": 6, "w": 12, "h": 1})
+        resp = client.post("/catalog/dashboards", json={"name": "Bad tile", "layout": layout})
+        assert resp.status_code == 422
 
     def test_create_with_namespace(self, client):
         ns_id = _make_namespace()
@@ -264,6 +384,75 @@ class TestDashboardCRUD:
         assert resp.status_code == 404
 
 
+class TestDashboardConcurrency:
+    def test_put_without_token_succeeds(self, client):
+        created = client.post("/catalog/dashboards", json={"name": "NoToken"}).json()
+        resp = client.put(f"/catalog/dashboards/{created['id']}", json={"description": "x"})
+        assert resp.status_code == 200, resp.text
+
+    def test_matching_token_chain_increments(self, client):
+        created = client.post("/catalog/dashboards", json={"name": "Chain"}).json()
+        assert created["layout_version"] == 1
+        first = client.put(
+            f"/catalog/dashboards/{created['id']}",
+            json={"layout": _layout_with_two_tiles(), "expected_layout_version": 1},
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["layout_version"] == 2
+        second = client.put(
+            f"/catalog/dashboards/{created['id']}",
+            json={"description": "again", "expected_layout_version": 2},
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["layout_version"] == 3
+
+    def test_stale_token_returns_409_with_structured_detail(self, client):
+        created = client.post("/catalog/dashboards", json={"name": "Stale"}).json()
+        bump = client.put(
+            f"/catalog/dashboards/{created['id']}",
+            json={"description": "bump", "expected_layout_version": 1},
+        )
+        assert bump.status_code == 200
+        resp = client.put(
+            f"/catalog/dashboards/{created['id']}",
+            json={"name": "clobber", "expected_layout_version": 1},
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert isinstance(detail, dict)
+        assert detail["error"] == "stale_write"
+        assert detail["resource_type"] == "dashboard"
+        assert detail["resource_id"] == created["id"]
+        assert detail["expected"] == 1
+        assert detail["current"] == 2
+        assert "modified in another session" in detail["message"]
+
+    def test_stale_write_leaves_row_unchanged(self, client):
+        created = client.post(
+            "/catalog/dashboards",
+            json={"name": "Untouched", "layout": _layout_with_two_tiles()},
+        ).json()
+        bump = client.put(
+            f"/catalog/dashboards/{created['id']}",
+            json={"description": "bump", "expected_layout_version": 1},
+        )
+        assert bump.status_code == 200
+        resp = client.put(
+            f"/catalog/dashboards/{created['id']}",
+            json={"name": "clobbered", "layout": _empty_layout(), "expected_layout_version": 1},
+        )
+        assert resp.status_code == 409
+        after = client.get(f"/catalog/dashboards/{created['id']}").json()
+        assert after["name"] == "Untouched"
+        assert len(after["layout"]["tiles"]) == 2
+
+    def test_description_only_put_increments_counter(self, client):
+        created = client.post("/catalog/dashboards", json={"name": "DescOnly"}).json()
+        resp = client.put(f"/catalog/dashboards/{created['id']}", json={"description": "note"})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["layout_version"] == 2
+
+
 class TestDashboardFilterDatasource:
     def test_create_with_filter_bound_to_datasource(self, client):
         table_id = _make_table()
@@ -290,6 +479,40 @@ class TestDashboardFilterDatasource:
         # round-trip
         get_resp = client.get(f"/catalog/dashboards/{body['id']}")
         assert get_resp.json()["layout"]["filters"][0]["datasource_id"] == table_id
+
+    def test_filter_scope_defaults_to_datasource_and_round_trips_all(self, client):
+        table_id = _make_table()
+        layout = _layout_with_two_tiles()
+        base = {
+            "field_name": "region",
+            "kind": "categorical",
+            "state": {"selected": []},
+            "target": "all",
+            "target_tile_ids": [],
+            "datasource_id": table_id,
+        }
+        layout["filters"] = [{"id": "f1", **base}, {"id": "f2", "scope": "all", **base}]
+        resp = client.post("/catalog/dashboards", json={"name": "Scoped", "layout": layout})
+        assert resp.status_code == 201, resp.text
+        filters = client.get(f"/catalog/dashboards/{resp.json()['id']}").json()["layout"]["filters"]
+        assert filters[0]["scope"] == "datasource"
+        assert filters[1]["scope"] == "all"
+
+    def test_filter_unknown_scope_returns_422(self, client):
+        layout = _layout_with_two_tiles()
+        layout["filters"] = [
+            {
+                "id": "f1",
+                "field_name": "region",
+                "kind": "categorical",
+                "state": {},
+                "target": "all",
+                "target_tile_ids": [],
+                "scope": "everywhere",
+            }
+        ]
+        resp = client.post("/catalog/dashboards", json={"name": "Bad scope", "layout": layout})
+        assert resp.status_code == 422
 
     def test_create_with_unknown_datasource_returns_422(self, client):
         layout = _empty_layout()

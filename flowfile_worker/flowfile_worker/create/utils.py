@@ -1,16 +1,18 @@
-from collections.abc import Iterable
 from functools import partial
 from random import randint
 
 import polars as pl
 from faker import Faker
 
+from shared.dtype_utils import convert_to_string, create_pl_df_type_save, standardize_col_dtype
+
+__all__ = ["convert_to_string", "create_fake_data", "create_pl_df_type_save", "standardize_col_dtype"]
+
 
 def create_fake_data(n_records: int = 1000) -> pl.DataFrame:
     fake = Faker()
     selector = partial(randint, 0)
     min_range = partial(min, n_records)
-    # Pre-generation of static data
     cities = [fake.city() for _ in range(min_range(7000))]
     companies = [fake.company() for _ in range(min_range(100_000))]
     zipcodes = [fake.zipcode() for _ in range(min_range(200_000))]
@@ -52,36 +54,3 @@ def create_fake_data(n_records: int = 1000) -> pl.DataFrame:
         )
 
     return pl.DataFrame(data)
-
-
-def convert_to_string(v):
-    try:
-        return str(v)
-    except Exception:
-        return None
-
-
-def standardize_col_dtype(vals):
-    types = set(type(val) for val in vals)
-    if len(types) == 1:
-        return vals
-    elif int in types and float in types:
-        return vals
-    else:
-        return [convert_to_string(v) for v in vals]
-
-
-def create_pl_df_type_save(raw_data: Iterable[Iterable], orient: str = "row") -> pl.DataFrame:
-    """
-        orient : {'col', 'row'}, default None
-        Whether to interpret two-dimensional data as columns or as rows. If None,
-        the orientation is inferred by matching the columns and data dimensions. If
-        this does not yield conclusive results, column orientation is used.
-    :param raw_data: iterables with values
-    :param orient:
-    :return: polars dataframe
-    """
-    if orient == "row":
-        raw_data = zip(*raw_data, strict=False)
-    raw_data = [standardize_col_dtype(values) for values in raw_data]
-    return pl.DataFrame(raw_data, orient="col")

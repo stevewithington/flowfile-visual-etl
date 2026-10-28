@@ -1,8 +1,12 @@
+import __future__
+
 import ast
 import base64
+import decimal
 import re
 import textwrap
 import time
+import zoneinfo
 from collections.abc import Callable
 from io import BytesIO
 from typing import Any
@@ -33,24 +37,19 @@ def remove_comments_and_docstrings(source: str) -> str:
         while i < len(line):
             char = line[i]
 
-            # Handle string boundaries
             if char in ('"', "'"):
-                # Check for escaped quotes
                 if i > 0 and line[i - 1] == "\\":
                     result.append(char)
                     i += 1
                     continue
 
                 if not in_string:
-                    # Check if it's the start of a string
                     in_string = True
                     string_char = char
                 elif string_char == char:
-                    # Check if it's the end of a string
                     in_string = False
                     string_char = None
 
-            # Only process comment characters outside strings
             elif char == "#" and not in_string:
                 break
 
@@ -59,11 +58,9 @@ def remove_comments_and_docstrings(source: str) -> str:
 
         return "".join(result).rstrip()
 
-    # First pass: handle comments
     lines = [remove_comments_from_line(line) for line in source.splitlines()]
     source = "\n".join(line for line in lines if line.strip())
 
-    # Second pass: handle docstrings using AST
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -71,7 +68,6 @@ def remove_comments_and_docstrings(source: str) -> str:
 
     class DocstringRemover(ast.NodeTransformer):
         def visit_Module(self, node):
-            # Remove module-level docstrings
             while (
                 node.body
                 and isinstance(node.body[0], ast.Expr)
@@ -82,7 +78,6 @@ def remove_comments_and_docstrings(source: str) -> str:
             return self.generic_visit(node)
 
         def visit_FunctionDef(self, node):
-            # Remove function docstrings
             if (
                 node.body
                 and isinstance(node.body[0], ast.Expr)
@@ -93,7 +88,6 @@ def remove_comments_and_docstrings(source: str) -> str:
             return self.generic_visit(node)
 
         def visit_ClassDef(self, node):
-            # Remove class docstrings
             if (
                 node.body
                 and isinstance(node.body[0], ast.Expr)
@@ -104,7 +98,6 @@ def remove_comments_and_docstrings(source: str) -> str:
             return self.generic_visit(node)
 
         def visit_AsyncFunctionDef(self, node):
-            # Remove async function docstrings
             if (
                 node.body
                 and isinstance(node.body[0], ast.Expr)
@@ -115,7 +108,6 @@ def remove_comments_and_docstrings(source: str) -> str:
             return self.generic_visit(node)
 
         def visit_Expr(self, node):
-            # Remove standalone string literals
             if isinstance(node.value, ast.Str | ast.Constant) and isinstance(getattr(node.value, "value", None), str):
                 return None
             return self.generic_visit(node)
@@ -124,10 +116,86 @@ def remove_comments_and_docstrings(source: str) -> str:
         tree = DocstringRemover().visit(tree)
         ast.fix_missing_locations(tree)
         result = ast.unparse(tree)
-        # Remove empty lines
         return "\n".join(line for line in result.splitlines() if line.strip())
     except Exception:
         return source
+
+
+def _lone_def(code: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """The one top-level def of ``code`` (after an optional module docstring), plain or not, else ``None``."""
+    try:
+        body = ast.parse(textwrap.dedent(code).strip()).body
+    except SyntaxError:
+        return None
+    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0].value, "value", None), str):
+        body = body[1:]
+    if len(body) == 1 and isinstance(body[0], ast.FunctionDef | ast.AsyncFunctionDef):
+        return body[0]
+    return None
+
+
+def function_form(code: str) -> ast.FunctionDef | None:
+    """The ``def`` of function-form Polars Code, else ``None`` (snippet form, or code that does not parse).
+
+    Function form is code whose top level is exactly one undecorated ``def``, optionally after a module
+    docstring; the node calls it with its inputs, in connection order, and its ``return`` is the output.
+    """
+    entry = _lone_def(code)
+    if isinstance(entry, ast.FunctionDef) and not entry.decorator_list:
+        return entry
+    return None
+
+
+def unrunnable_def_error(code: str) -> str | None:
+    """Why a lone top-level def is not function form: it is async or decorated, which Polars Code cannot run."""
+    entry = _lone_def(code)
+    if entry is None or not (isinstance(entry, ast.AsyncFunctionDef) or entry.decorator_list):
+        return None
+    what = "async" if isinstance(entry, ast.AsyncFunctionDef) else "decorated"
+    return f"`{entry.name}` is {what}: Polars Code runs a plain `def` (no `async`, no decorator)"
+
+
+def function_form_error(entry: ast.FunctionDef, num_inputs: int) -> str | None:
+    """Why ``entry`` cannot run as the node's code with ``num_inputs`` frames, or ``None`` when it can."""
+    if not _returns_a_value(entry):
+        return f"`{entry.name}` returns nothing: end it with `return <frame>`, which is the node's output"
+    args = entry.args
+    keywords = [arg.arg for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True) if default is None]
+    if keywords:
+        names = ", ".join(f"`{name}`" for name in keywords)
+        return f"`{entry.name}` has keyword-only {names} without a default: the node passes its inputs by position"
+    positional = len(args.posonlyargs) + len(args.args)
+    required = positional - len(args.defaults)
+    if required <= num_inputs <= positional or (args.vararg and num_inputs >= required):
+        return None
+    if args.vararg:
+        takes = f"at least {_count(required, 'frame')}"
+    elif required == positional:
+        takes = _count(positional, "frame")
+    elif required == 0:
+        takes = f"up to {_count(positional, 'frame')}"
+    else:
+        takes = f"{required} to {_count(positional, 'frame')}"
+    return (
+        f"`{entry.name}` takes {takes} but the node has {_count(num_inputs, 'input')}: "
+        "give it one parameter per connected input"
+    )
+
+
+def _returns_a_value(entry: ast.FunctionDef) -> bool:
+    """Whether ``entry`` has a ``return <value>`` of its own (not one of a function nested in it)."""
+    stack: list[ast.AST] = list(entry.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Return) and node.value is not None:
+            return True
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef):
+            stack.extend(ast.iter_child_nodes(node))
+    return False
+
+
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}" if number == 1 else f"{number or 'no'} {noun}s"
 
 
 class PolarsCodeParser:
@@ -198,6 +266,8 @@ class PolarsCodeParser:
             "BytesIO": BytesIO,
             "base64": base64,
             "datetime": datetime,
+            "decimal": decimal,
+            "zoneinfo": zoneinfo,
         }
 
     @staticmethod
@@ -230,11 +300,9 @@ class PolarsCodeParser:
         try:
             tree = ast.parse(code)
             for node in ast.walk(tree):
-                # Block imports
                 if isinstance(node, ast.Import | ast.ImportFrom):
                     raise ValueError("Import statements are not allowed")
 
-                # Block dangerous function calls
                 if isinstance(node, ast.Call):
                     if isinstance(node.func, ast.Name):
                         if node.func.id in _blocked_functions:
@@ -265,7 +333,6 @@ class PolarsCodeParser:
         # Dedent the code first to handle various indentation styles
         code = textwrap.dedent(code).strip()
 
-        # Create appropriate function signature based on number of inputs
         if num_inputs == 0:
             function_def = "def _transform():\n"
         elif num_inputs == 1:
@@ -274,16 +341,12 @@ class PolarsCodeParser:
             params = ", ".join([f"input_df_{i+1}" for i in range(num_inputs)])
             function_def = f"def _transform({params}):\n"
 
-        # Handle single line expressions
         if "\n" not in code:
-            # For expressions that should return directly
             if any(code.startswith(prefix) for prefix in ["pl.", "col(", "input_df", "expr("]):
                 return function_def + f"    return {code}"
-            # For assignments
             else:
                 return function_def + f"    {code}\n    return output_df"
 
-        # For multi-line code
         indented_code = "\n".join(f"    {line}" for line in code.split("\n"))
         return function_def + indented_code + "\n    return output_df"
 
@@ -298,15 +361,22 @@ class PolarsCodeParser:
         Returns:
             Callable: A function that takes the specified number of DataFrames
         """
-        # Validate and clean the code
         code = remove_comments_and_docstrings(code)
         code = textwrap.dedent(code).strip()
         self._validate_code(code)
 
-        # Wrap the code in a function
+        entry = function_form(code)
+        if entry is not None:
+            error = function_form_error(entry, num_inputs)
+            if error is not None:
+                raise ValueError(error)
+            return self._function_form_executable(code, entry.name)
+        error = unrunnable_def_error(code)
+        if error is not None:
+            raise ValueError(error)
+
         wrapped_code = self._wrap_in_function(code, num_inputs)
         try:
-            # Create namespace for execution
             local_namespace: dict[str, Any] = {}
 
             exec(wrapped_code, self.safe_globals, local_namespace)
@@ -315,6 +385,29 @@ class PolarsCodeParser:
             return transform_func
         except Exception as e:
             raise ValueError(f"Error executing code: {str(e)}") from e
+
+    def _function_form_executable(self, code: str, name: str) -> Callable:
+        """The ``def`` of function-form code, called with the node's inputs positionally as LazyFrames.
+
+        The code runs in its own copy of the sandbox globals (one namespace, so the shared globals
+        never see it) and its annotations are never evaluated, so they are documentation only.
+        """
+        namespace = dict(self.safe_globals)
+        try:
+            flags = __future__.annotations.compiler_flag
+            compiled = compile(code, "<polars_code>", "exec", flags=flags, dont_inherit=True)
+            exec(compiled, namespace)
+        except Exception as e:
+            raise ValueError(f"Error executing code: {str(e)}") from e
+        function = namespace[name]
+
+        def _call(*frames):
+            result = function(*(frame.lazy() for frame in frames))
+            if not isinstance(result, pl.LazyFrame | pl.DataFrame):
+                raise ValueError(f"`{name}` returned {type(result).__name__}, not a Polars LazyFrame or DataFrame")
+            return result
+
+        return _call
 
     def validate_code(self, code: str):
         """

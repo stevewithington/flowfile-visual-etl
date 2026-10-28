@@ -1,6 +1,6 @@
 # Community
 
-Flowfile is an MIT-licensed open source project, and it's built by the people who use it. Whether you want to ask a question, share a flow, report a bug, or propose a feature, there's a place for you here.
+Flowfile is an MIT-licensed open source project. Use the channels below to ask a question, share a flow, report a bug, or propose a feature.
 
 ## Where to go
 
@@ -30,7 +30,7 @@ You don't have to write Python or Vue to help. Useful contributions include:
 - **Improving the docs** — typos, clearer examples, missing pages
 - **Sharing flows** that show off a pattern or solve a real problem
 - **Testing pre-releases** and reporting back
-- **Building custom nodes** — see [Create Custom Nodes](for-developers/creating-custom-nodes.md)
+- **Building custom nodes** — see the [Node Designer](users/visual-editor/node-designer.md) (visual) or [Custom Nodes in Code](users/visual-editor/creating-custom-nodes.md) (Python SDK)
 - **Fixing bugs or adding features** — see [CONTRIBUTING.md](https://github.com/edwardvaneechoud/Flowfile/blob/main/CONTRIBUTING.md)
 
 ## Releases

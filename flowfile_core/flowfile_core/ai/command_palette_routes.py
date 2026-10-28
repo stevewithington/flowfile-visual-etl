@@ -40,9 +40,9 @@ from flowfile_core.ai.command_palette import (
     run_command_palette,
 )
 from flowfile_core.ai.providers import (
-    PROVIDERS,
     UnknownProviderError,
-    list_supported_providers,
+    is_resolvable_provider,
+    resolvable_provider_names,
 )
 from flowfile_core.auth.jwt import get_current_active_user
 from flowfile_core.database.connection import get_db
@@ -51,15 +51,15 @@ router = APIRouter()
 
 
 def _ensure_known_provider(name: str) -> None:
-    if name not in PROVIDERS:
+    if not is_resolvable_provider(name):
         raise HTTPException(
             status_code=404,
-            detail=f"Unknown provider {name!r}; supported: {list_supported_providers()}",
+            detail=f"Unknown provider {name!r}; supported: {resolvable_provider_names()}",
         )
 
 
-def _resolve_flow(flow_id: int):
-    flow = flow_file_handler.get_flow(flow_id)
+def _resolve_flow(flow_id: int, user_id: int):
+    flow = flow_file_handler.get_flow(flow_id, user_id)
     if flow is None:
         raise HTTPException(status_code=422, detail=f"Flow {flow_id} not found")
     return flow
@@ -92,7 +92,7 @@ async def submit_command_palette(
     ``degraded=true``. See :class:`CommandPaletteResponse`.
     """
     _ensure_known_provider(body.provider)
-    flow = _resolve_flow(body.flow_id)
+    flow = _resolve_flow(body.flow_id, current_user.id)
 
     try:
         provider = get_configured_provider(

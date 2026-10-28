@@ -21,27 +21,45 @@ from base64 import b64encode
 from dataclasses import dataclass
 from multiprocessing import Process
 from multiprocessing.queues import Queue
+from time import monotonic
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from flowfile_worker import CACHE_DIR, funcs, models, mp_context, status_dict, status_dict_lock
+from flowfile_worker import CACHE_DIR, funcs, models, mp_context, pool, status_dict, status_dict_lock
+from flowfile_worker.auth import websocket_authorized
 from flowfile_worker.configs import logger
-from flowfile_worker.spawner import process_manager
+from flowfile_worker.pool import PoolMember
+from flowfile_worker.spawner import (
+    _TASK_TIMEOUT,
+    drain_member_envelope,
+    drain_result_queue,
+    process_manager,
+    unpack_result,
+)
+from flowfile_worker.task_errors import FailureKind, describe_exception, split_failure
 
 streaming_router = APIRouter()
 
-# Maps operation type to result type for status tracking
 _POLARS_RESULT_OPERATIONS = frozenset({"store"})
+
+# Poll the child's progress with exponential backoff: snappy at first, capped low
+# so the async monitor yields to the event loop without busy-waiting.
+_MONITOR_INITIAL_DELAY = 0.005
+_MONITOR_MAX_DELAY = 0.3
+_MONITOR_BACKOFF = 1.5
+
+# Re-send the progress frame at least this often even when the value hasn't
+# changed. Core uses these as liveness heartbeats: its receive loop treats
+# prolonged silence as a wedged worker (FLOWFILE_WORKER_WS_TIMEOUT).
+_HEARTBEAT_INTERVAL = 10.0
 
 
 def _get_result_type(operation: str) -> str:
     return "polars" if operation in _POLARS_RESULT_OPERATIONS else "other"
 
 
-# ---------------------------------------------------------------------------
 # Task context
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -70,7 +88,6 @@ def _parse_metadata(metadata: dict) -> _TaskContext:
     except (ValueError, TypeError):
         pass
 
-    # Set up cache directory and file path
     cache_dir = CACHE_DIR / str(flow_id)
     cache_dir.mkdir(parents=True, exist_ok=True)
     file_path = os.path.join(str(cache_dir), f"{task_id}.arrow")
@@ -97,56 +114,72 @@ def _register_status(ctx: _TaskContext) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
 # Subprocess management
-# ---------------------------------------------------------------------------
 
 
-def _spawn_subprocess(ctx: _TaskContext, polars_bytes: bytes) -> tuple[Process, Any, Any, Queue]:
-    """Spawn a worker subprocess and return (process, progress, error_message, queue)."""
-    process_task = getattr(funcs, ctx.operation)
+def _register_running(ctx: _TaskContext, p: Process, pooled: bool) -> None:
+    """Track the task's process and flip its status once it is underway."""
+    process_manager.add_process(ctx.task_id, p)
+    with status_dict_lock:
+        status_dict[ctx.task_id].status = "Processing"
+    logger.info(f"[WS] Started task {ctx.task_id} with operation: {ctx.operation}{' (pooled)' if pooled else ''}")
 
+
+def _spawn_subprocess(ctx: _TaskContext, polars_bytes: bytes) -> tuple[Process, Any, Any, Queue, PoolMember | None]:
+    """Lease a pool member or spawn a subprocess; returns (process, progress, error_message, queue, member).
+
+    *member* is None on the default spawn-per-task path.
+    """
     kwargs = dict(ctx.extra_kwargs)
     kwargs["polars_serializable_object"] = polars_bytes
-
-    progress = mp_context.Value("i", 0)
-    error_message = mp_context.Array("c", 1024)
-    queue = mp_context.Queue(maxsize=1)
-
-    kwargs["progress"] = progress
-    kwargs["error_message"] = error_message
-    kwargs["queue"] = queue
     kwargs["file_path"] = ctx.file_path
     kwargs["flowfile_flow_id"] = ctx.flow_id
     kwargs["flowfile_node_id"] = ctx.node_id
 
-    p = mp_context.Process(target=process_task, kwargs=kwargs)
+    member = pool.task_pool.acquire(ctx.operation)
+    if member is not None:
+        try:
+            member.submit(ctx.operation, kwargs)
+            _register_running(ctx, member.process, pooled=True)
+        except Exception:
+            # A failed lease must not leak the slot; ws_submit owns checkin after this.
+            pool.task_pool.checkin(member, reusable=False)
+            raise
+        return member.process, member.progress, member.error_message, member.result_q, member
+
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+    queue = mp_context.Queue(maxsize=1)
+    kwargs["progress"] = progress
+    kwargs["error_message"] = error_message
+    kwargs["queue"] = queue
+
+    p = mp_context.Process(target=getattr(funcs, ctx.operation), kwargs=kwargs)
     p.start()
-    process_manager.add_process(ctx.task_id, p)
-
-    with status_dict_lock:
-        status_dict[ctx.task_id].status = "Processing"
-
-    logger.info(f"[WS] Started task {ctx.task_id} with operation: {ctx.operation}")
-    return p, progress, error_message, queue
+    _register_running(ctx, p, pooled=False)
+    return p, progress, error_message, queue, None
 
 
-def _read_error_message(error_message) -> str:
-    """Extract error string from shared ctypes array."""
+def _read_error_message(error_message) -> tuple[FailureKind, str]:
+    """Extract the failure kind and error string from the shared ctypes array."""
     with error_message.get_lock():
-        return error_message.value.decode().rstrip("\x00")
+        return split_failure(error_message.value.decode().rstrip("\x00"))
 
 
-def _set_error_status(task_id: str, msg: str) -> None:
+def _set_error_status(task_id: str, msg: str, kind: FailureKind) -> None:
     """Update status_dict to reflect an error."""
     with status_dict_lock:
         status_dict[task_id].status = "Error"
         status_dict[task_id].error_message = msg
+        status_dict[task_id].error_kind = kind
 
 
-# ---------------------------------------------------------------------------
+def _task_error_frame(msg: str, kind: FailureKind) -> dict:
+    """Error frame for a task the worker ran; *kind* tells core whether to fail the node or degrade."""
+    return {"type": "error", "error_message": msg, "status": "Error", "error_kind": kind}
+
+
 # Progress monitoring
-# ---------------------------------------------------------------------------
 
 
 async def _monitor_progress(websocket: WebSocket, p: Process, progress, error_message, task_id: str) -> bool:
@@ -155,39 +188,57 @@ async def _monitor_progress(websocket: WebSocket, p: Process, progress, error_me
     Returns True if an error was detected and sent to the client.
     """
     last_progress = -1
+    last_sent = monotonic()
 
+    delay = _MONITOR_INITIAL_DELAY
+    deadline = (monotonic() + _TASK_TIMEOUT) if _TASK_TIMEOUT else None
     while p.is_alive():
-        await asyncio.sleep(0.3)
-
         with progress.get_lock():
             current = progress.value
 
-        if current != last_progress:
+        if current != last_progress or monotonic() - last_sent >= _HEARTBEAT_INTERVAL:
             try:
                 await websocket.send_json({"type": "progress", "progress": current})
             except Exception:
                 return False
             last_progress = current
+            last_sent = monotonic()
 
         if current == -1:
-            msg = _read_error_message(error_message)
-            _set_error_status(task_id, msg)
-            await websocket.send_json({"type": "error", "error_message": msg})
+            kind, msg = _read_error_message(error_message)
+            _set_error_status(task_id, msg, kind)
+            await websocket.send_json(_task_error_frame(msg, kind))
             return True
+
+        # A child that put() a large result blocks in its feeder thread and never
+        # exits, so p.is_alive() would spin here forever. Break on the completion
+        # signal; the caller drains the queue (which unblocks the child) before joining.
+        if current == 100:
+            return False
+
+        if deadline is not None and monotonic() > deadline:
+            p.terminate()
+            msg = f"Task exceeded the {_TASK_TIMEOUT:.0f}s time limit and was terminated"
+            _set_error_status(task_id, msg, "environment")
+            await websocket.send_json(_task_error_frame(msg, "environment"))
+            return True
+
+        await asyncio.sleep(delay)
+        delay = min(delay * _MONITOR_BACKOFF, _MONITOR_MAX_DELAY)
 
     return False
 
 
-# ---------------------------------------------------------------------------
 # Result handling
-# ---------------------------------------------------------------------------
 
 
-def _update_completed_status(task_id: str, result_data: Any) -> None:
+def _update_completed_status(task_id: str, result_data: Any, number_of_records: int | None) -> None:
     """Update status_dict for a successfully completed task."""
     with status_dict_lock:
         status_dict[task_id].status = "Completed"
         status_dict[task_id].progress = 100
+        if number_of_records is not None:
+            status_dict[task_id].number_of_records = number_of_records
         if result_data is not None:
             if isinstance(result_data, bytes):
                 status_dict[task_id].results = b64encode(result_data).decode("ascii")
@@ -195,10 +246,20 @@ def _update_completed_status(task_id: str, result_data: Any) -> None:
                 status_dict[task_id].results = result_data
 
 
-async def _send_completion(websocket: WebSocket, task_id: str, result_type: str, file_path: str, queue: Queue) -> None:
-    """Send completion message and result data over WebSocket."""
-    result_data = queue.get() if not queue.empty() else None
-    _update_completed_status(task_id, result_data)
+async def _send_completion(
+    websocket: WebSocket,
+    task_id: str,
+    result_type: str,
+    file_path: str,
+    result_data: Any,
+    number_of_records: int | None,
+) -> None:
+    """Send completion message and result data over WebSocket.
+
+    *result_data* is drained from the result queue by the caller before joining the
+    child, so this coroutine never touches the queue (draining after join can deadlock).
+    """
+    _update_completed_status(task_id, result_data, number_of_records)
 
     has_result = result_data is not None
     await websocket.send_json(
@@ -207,6 +268,7 @@ async def _send_completion(websocket: WebSocket, task_id: str, result_type: str,
             "result_type": result_type,
             "file_ref": file_path,
             "has_result": has_result,
+            "number_of_records": number_of_records,
         }
     )
 
@@ -225,9 +287,9 @@ async def _send_final_error(websocket: WebSocket, task_id: str, progress, error_
         final = progress.value
 
     if final == -1:
-        msg = _read_error_message(error_message)
-        _set_error_status(task_id, msg)
-        await websocket.send_json({"type": "error", "error_message": msg})
+        kind, msg = _read_error_message(error_message)
+        _set_error_status(task_id, msg, kind)
+        await websocket.send_json(_task_error_frame(msg, kind))
     else:
         with status_dict_lock:
             status_dict[task_id].status = "Unknown Error"
@@ -239,25 +301,28 @@ async def _send_final_error(websocket: WebSocket, task_id: str, progress, error_
         )
 
 
-# ---------------------------------------------------------------------------
 # Disconnect handling
-# ---------------------------------------------------------------------------
 
 
-def _handoff_to_background(task_id: str, p: Process, progress, error_message, queue: Queue) -> None:
-    """Hand off a running subprocess to a background thread for REST status updates."""
+def _handoff_to_background(
+    task_id: str, p: Process, progress, error_message, queue: Queue, member: PoolMember | None
+) -> None:
+    """Hand off a running subprocess to a background thread for REST status updates.
+
+    handle_task owns the process from here on, including checking a pool member
+    back in when the task finishes off-socket.
+    """
     from flowfile_worker.spawner import handle_task as _handle_task
 
     threading.Thread(
         target=_handle_task,
         args=(task_id, p, progress, error_message, queue),
+        kwargs={"member": member},
         daemon=True,
     ).start()
 
 
-# ---------------------------------------------------------------------------
 # Cleanup
-# ---------------------------------------------------------------------------
 
 
 def _cleanup_process(task_id: str | None, p: Process | None) -> None:
@@ -271,9 +336,7 @@ def _cleanup_process(task_id: str | None, p: Process | None) -> None:
         process_manager.remove_process(task_id)
 
 
-# ---------------------------------------------------------------------------
 # WebSocket endpoint
-# ---------------------------------------------------------------------------
 
 
 @streaming_router.websocket("/ws/submit")
@@ -289,17 +352,23 @@ async def ws_submit(websocket: WebSocket):
         - JSON: {"type": "complete", "result_type": "polars"|"other", "file_ref": "...", "has_result": bool}
         - Binary: raw result bytes (only if has_result=True and result_type="polars")
         - JSON: {"type": "result_data", "data": ...} (only if has_result=True and result_type="other")
-        - JSON: {"type": "error", "error_message": "..."}
+        - JSON: {"type": "error", "error_message": "...", "status": "Error"?, "error_kind": "task"|"environment"?}
+          (status and error_kind only when the task ran and failed; "environment" = the worker
+          could not load the plan, write the result or finish in time, so core degrades)
     """
+    if not websocket_authorized(websocket):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     p = None
     task_id = None
     progress = None
     error_message = None
     queue = None
+    member = None
+    envelope_received = False
 
     try:
-        # 1. Receive metadata + binary payload
         metadata = await websocket.receive_json()
         ctx = _parse_metadata(metadata)
         task_id = ctx.task_id
@@ -307,40 +376,78 @@ async def ws_submit(websocket: WebSocket):
 
         polars_bytes = await websocket.receive_bytes()
 
-        # 2. Spawn subprocess
-        p, progress, error_message, queue = _spawn_subprocess(ctx, polars_bytes)
+        p, progress, error_message, queue, member = _spawn_subprocess(ctx, polars_bytes)
 
-        # 3. Monitor progress (returns True if error was sent)
         had_error = await _monitor_progress(websocket, p, progress, error_message, task_id)
+
+        # A pool member puts one completion envelope per task (also on task error); it is
+        # drained under a watchdog bound and doubles as the result on the success path.
+        # A member the monitor terminated (timeout) or that died is never drained - a
+        # partial envelope from a killed writer can block the recv.
+        raw = None
+        if member is not None:
+            with progress.get_lock():
+                final = progress.value
+            # had_error with final==100 is the timeout branch racing a completion:
+            # the monitor terminated the member after its last read, then the child
+            # flipped to 100. Like handle_task's timed_out guard, a member the
+            # monitor terminated is never drained or reused.
+            if final in (100, -1) and not (had_error and final == 100):
+                # Over for the process manager either way; unmapping first means a
+                # stale /cancel_task can no longer terminate a reusable member.
+                process_manager.remove_process(task_id)
+                envelope_received, raw = await asyncio.to_thread(drain_member_envelope, queue, p)
+            elif not had_error and p.is_alive():
+                # The socket died mid-task (progress send failed): let the task finish
+                # off-socket, mirroring the spawn path's join-to-completion semantics.
+                _handoff_to_background(task_id, p, progress, error_message, queue, member)
+                p = None
+                progress = None
+                error_message = None
+                member = None
+                return
         if had_error:
             return
 
-        p.join()
-
-        # 4. Send result or error
         with progress.get_lock():
             final = progress.value
 
         if final == 100:
-            await _send_completion(websocket, task_id, ctx.result_type, ctx.file_path, queue)
+            if member is None:
+                # Drain the queue BEFORE joining: a large put() blocks the child's feeder
+                # thread until read, so joining first would deadlock.
+                raw = await asyncio.to_thread(drain_result_queue, queue, p)
+                await asyncio.to_thread(p.join)
+            result_data, number_of_records = unpack_result(raw)
+            await _send_completion(websocket, task_id, ctx.result_type, ctx.file_path, result_data, number_of_records)
         else:
+            if member is None:
+                await asyncio.to_thread(p.join)
             await _send_final_error(websocket, task_id, progress, error_message)
 
     except WebSocketDisconnect:
         logger.warning(f"[WS] Client disconnected for task {task_id}")
-        if p is not None and p.is_alive() and queue is not None:
-            _handoff_to_background(task_id, p, progress, error_message, queue)
+        # Once a member's envelope is drained the task is already terminal in
+        # status_dict; handing off would re-drain an empty queue for 30s and
+        # retire a healthy member - fall through to the checkin instead.
+        if p is not None and p.is_alive() and queue is not None and not envelope_received:
+            _handoff_to_background(task_id, p, progress, error_message, queue, member)
             # Prevent finally block from cleaning up - handle_task owns these now
             p = None
             progress = None
             error_message = None
+            member = None
     except Exception as e:
         logger.error(f"[WS] Error for task {task_id}: {e}", exc_info=True)
         try:
-            await websocket.send_json({"type": "error", "error_message": str(e)})
+            await websocket.send_json({"type": "error", "error_message": describe_exception(e)})
         except Exception:
             pass
     finally:
-        _cleanup_process(task_id, p)
+        if member is not None:
+            process_manager.remove_process(task_id)
+            await asyncio.to_thread(pool.task_pool.checkin, member, envelope_received)
+        elif p is not None:
+            await asyncio.to_thread(_cleanup_process, task_id, p)
         del p, progress, error_message
-        gc.collect()
+        gc.collect(0)

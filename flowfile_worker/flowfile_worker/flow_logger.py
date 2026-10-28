@@ -1,11 +1,12 @@
 import logging
 
-import requests
-
 from flowfile_worker.configs import FLOWFILE_CORE_URI
-from flowfile_worker.models import RawLogInput
+from flowfile_worker.internal_token import resolve_internal_token
+from flowfile_worker.log_models import RawLogInput
 
 LOGGING_URL = FLOWFILE_CORE_URI + "/raw_logs"
+# Core's header for worker/kernel callbacks; core→worker calls use X-Flowfile-Internal instead.
+CORE_INTERNAL_TOKEN_HEADER = "X-Internal-Token"
 
 
 class FlowfileLogHandler(logging.Handler):
@@ -27,9 +28,18 @@ class FlowfileLogHandler(logging.Handler):
                 log_type=record.levelname.upper(),
                 extra={},
             )
-            if self.flowfile_flow_id != -1 and self.flowfile_node_id != -1:
+            # Without a token core rejects the post; the stream handler still has the record.
+            if self.flowfile_flow_id != -1 and self.flowfile_node_id != -1 and (token := resolve_internal_token()):
+                import requests
+
                 response = requests.post(
-                    LOGGING_URL, json=raw_log_input.__dict__, headers={"Content-Type": "application/json"}
+                    LOGGING_URL,
+                    json=raw_log_input.__dict__,
+                    headers={
+                        "Content-Type": "application/json",
+                        CORE_INTERNAL_TOKEN_HEADER: token,
+                    },
+                    timeout=(2, 5),
                 )
                 if response.status_code != 200:
                     raise Exception(f"Failed to send log: {response.text}")
@@ -38,9 +48,15 @@ class FlowfileLogHandler(logging.Handler):
 
 
 def get_worker_logger(flowfile_flow_id: int, flowfile_node_id: int | str) -> logging.Logger:
-    logger_name = f"NodeLog: {flowfile_node_id}"
+    """Return the process-cached logger that ships this node's logs to core.
+
+    Keyed on (flow_id, node_id): FlowfileLogHandler freezes flow_id at construction,
+    so a node_id-only key would let a process that serves a second flow (e.g. a pooled
+    worker child) ship that flow's logs to the first flow's /raw_logs.
+    """
+    logger_name = f"NodeLog: {flowfile_flow_id}:{flowfile_node_id}"
     logger = logging.getLogger(logger_name)
-    logger.propagate = False  # Prevent propagation to parent loggers
+    logger.propagate = False
     logger.setLevel(logging.DEBUG)
 
     # Only add handlers if they don't already exist to avoid duplicates

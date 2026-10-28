@@ -18,14 +18,18 @@ def test_every_known_node_type_classified() -> None:
 
 def test_dynamic_set_matches_design() -> None:
     expected_dynamic = {
+        "dynamic_rename",
         "pivot",
         "unpivot",
         "text_to_rows",
         "graph_solver",
         "python_script",
         "polars_code",
-        "sql_query",
+        # sql_query is static: add_sql_query registers a schema_callback that
+        # resolves the output schema by running the query plan over 0-row inputs.
         "user_defined",
+        # run_flow's output schema only exists after the referenced subflow runs.
+        "run_flow",
     }
     actual_dynamic = {nt for nt in NODE_TYPE_TO_SETTINGS_CLASS if classify_node_type(nt) == "dynamic"}
     assert actual_dynamic == expected_dynamic
@@ -35,12 +39,17 @@ def test_source_set_includes_all_readers() -> None:
     expected_source = {
         "manual_input",
         "read",
+        # Source with a fixed output schema, so it predicts via the mirror.
+        "list_files",
         "database_reader",
         "cloud_storage_reader",
         "catalog_reader",
         "kafka_source",
         "google_analytics_reader",
+        "rest_api_reader",
         "external_source",
+        # Flow-in-flow entry point: no input port, source-shaped.
+        "flow_input",
     }
     actual_source = {nt for nt in NODE_TYPE_TO_SETTINGS_CLASS if classify_node_type(nt) == "source"}
     assert actual_source == expected_source

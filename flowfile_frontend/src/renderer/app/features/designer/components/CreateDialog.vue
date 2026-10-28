@@ -36,16 +36,15 @@
             mode="create"
             context="flows"
             :is-visible="isVisible && createMode === 'file'"
+            dense
             @create-file="handleCreateAtPath"
             @overwrite-file="handleCreateAtPath"
           />
-          <div class="catalog-options">
-            <el-checkbox v-model="registerInCatalog"> Also register in catalog </el-checkbox>
-            <div v-if="registerInCatalog" class="namespace-section">
-              <label class="namespace-label">Namespace</label>
-              <catalog-namespace-picker v-model="selectedNamespaceId" />
-            </div>
-          </div>
+          <catalog-register-row
+            ref="filePicker"
+            v-model="registerInCatalog"
+            v-model:namespace-id="selectedNamespaceId"
+          />
         </div>
 
         <!-- Catalog tab -->
@@ -64,7 +63,12 @@
             </div>
             <div class="form-group">
               <label>Namespace</label>
-              <catalog-namespace-picker v-model="selectedNamespaceId" />
+              <catalog-namespace-picker
+                ref="catalogPicker"
+                v-model="selectedNamespaceId"
+                :hide-system-namespaces="true"
+                :writable-only="true"
+              />
             </div>
           </div>
         </div>
@@ -90,11 +94,12 @@
 import { ref, watch, computed } from "vue";
 import { ElMessage } from "element-plus";
 import FileBrowser from "../../../components/common/FileBrowser/fileBrowser.vue";
-import { saveFlow } from "../../../components/layout/Header/utils";
 import { createFlow } from "../../../components/nodes/nodeLogic";
 import { getCatalogFlowsDirectory } from "../../../api/file.api";
 import { ALLOWED_SAVE_EXTENSIONS } from "../../../components/common/FileBrowser/constants";
+import { basenameNoExt } from "../../../composables/useRecentFlows";
 import CatalogNamespacePicker from "./CatalogNamespacePicker.vue";
+import CatalogRegisterRow from "./CatalogRegisterRow.vue";
 
 const props = defineProps({
   visible: {
@@ -107,7 +112,6 @@ const emit = defineEmits(["create-complete", "create-cancelled", "update:visible
 
 const isVisible = ref(props.visible);
 
-// Sidebar tab selection
 const createMode = ref<"file" | "catalog">("file");
 
 // Catalog options
@@ -115,6 +119,16 @@ const registerInCatalog = ref(true);
 const selectedNamespaceId = ref<number | null>(null);
 const catalogFlowName = ref("");
 const catalogFlowsDir = ref("");
+const filePicker = ref<InstanceType<typeof CatalogRegisterRow> | null>(null);
+const catalogPicker = ref<InstanceType<typeof CatalogNamespacePicker> | null>(null);
+
+// Dotted catalog reference ("General.default.my_flow") for the recents list;
+// undefined when the namespace path can't be resolved.
+const catalogRefFor = (flowName: string): string | undefined => {
+  const picker = catalogPicker.value ?? filePicker.value;
+  const nsPath = picker?.getNamespacePath(selectedNamespaceId.value);
+  return nsPath ? `${nsPath}.${flowName}` : undefined;
+};
 
 watch(
   () => props.visible,
@@ -123,7 +137,6 @@ watch(
   },
 );
 
-// Emit visibility + refresh catalog dir when opening
 watch(isVisible, async (newValue) => {
   if (newValue !== props.visible) {
     emit("update:visible", newValue);
@@ -161,24 +174,21 @@ const handleCreateAtPath = async (flowPath: string) => {
   }
 
   try {
-    const newFlowId = await createFlow(flowPath);
-    // The create endpoint auto-registers in the default namespace. If the user
-    // picked a different namespace, re-register by calling save_flow with
-    // namespace_id (same path → backend updates the existing registration).
-    if (registerInCatalog.value && selectedNamespaceId.value !== null) {
-      try {
-        await saveFlow(newFlowId, flowPath, selectedNamespaceId.value);
-      } catch (regErr) {
-        console.warn("Created flow but failed to set catalog namespace:", regErr);
-      }
-    }
-    ElMessage.success("Flow created successfully");
+    // Unchecking must actually opt out: a null namespace_id alone still routes
+    // into auto-registration on the backend.
+    const namespaceId = registerInCatalog.value ? selectedNamespaceId.value : null;
+    const newFlowId = await createFlow(flowPath, null, namespaceId, registerInCatalog.value);
+    ElMessage.success("Flow created");
     isVisible.value = false;
-    emit("create-complete", newFlowId);
+    const catalogRef =
+      registerInCatalog.value && selectedNamespaceId.value !== null
+        ? catalogRefFor(basenameNoExt(flowPath))
+        : undefined;
+    emit("create-complete", newFlowId, catalogRef);
   } catch (error: any) {
     console.error("Error creating flow:", error);
     ElMessage.error({
-      message: error?.message || "Failed to create flow",
+      message: error?.response?.data?.detail || error?.message || "Failed to create flow",
       duration: 5000,
     });
   }
@@ -199,23 +209,17 @@ const canCreateInCatalog = computed(() => {
 const handleCreateInCatalog = async () => {
   if (!canCreateInCatalog.value) return;
   try {
-    const newFlowId = await createFlow(catalogFilePath.value);
-    if (selectedNamespaceId.value !== null) {
-      try {
-        await saveFlow(newFlowId, catalogFilePath.value, selectedNamespaceId.value);
-      } catch (regErr) {
-        console.warn("Created flow but failed to set catalog namespace:", regErr);
-      }
-    }
+    const newFlowId = await createFlow(catalogFilePath.value, null, selectedNamespaceId.value);
     ElMessage.success("Flow created and registered in catalog");
     isVisible.value = false;
+    const catalogRef = catalogRefFor(basenameNoExt(catalogFlowName.value.trim()));
     // Reset catalog name so the next invocation starts clean
     catalogFlowName.value = "";
-    emit("create-complete", newFlowId);
+    emit("create-complete", newFlowId, catalogRef);
   } catch (error: any) {
     console.error("Error creating flow in catalog:", error);
     ElMessage.error({
-      message: error?.message || "Failed to create flow",
+      message: error?.response?.data?.detail || error?.message || "Failed to create flow",
       duration: 5000,
     });
   }
@@ -292,26 +296,10 @@ defineExpose({
   gap: var(--spacing-4);
 }
 
-.catalog-options {
-  padding: var(--spacing-3);
-  border: 1px solid var(--color-border-light);
-  border-radius: var(--border-radius-md);
-  background-color: var(--color-background-muted, #f9f9fb);
-  display: flex;
-  flex-direction: column;
-  gap: var(--spacing-3);
-}
-
-.namespace-section {
-  display: flex;
-  flex-direction: column;
-  gap: var(--spacing-2);
-}
-
-.namespace-label {
-  font-size: var(--font-size-sm);
-  font-weight: var(--font-weight-medium);
-  color: var(--color-text-primary);
+/* Cap the browser (default 70vh) so the one-line register row below it stays
+   visible without scrolling the dialog. */
+.create-panel :deep(.file-browser) {
+  height: 52vh;
 }
 
 .catalog-create-form {

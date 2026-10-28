@@ -1,4 +1,3 @@
-// Node descriptions for settings panel titles
 export interface NodeDescription {
   title: string
   intro: string
@@ -6,8 +5,8 @@ export interface NodeDescription {
 
 export const nodeDescriptions: Record<string, NodeDescription> = {
   read: {
-    title: 'Read CSV',
-    intro: 'Load data from a CSV file. Drag and drop a file or paste CSV content directly.'
+    title: 'Read File',
+    intro: 'Load data from a CSV, Excel (.xlsx) or Parquet file. Excel downloads openpyxl from PyPI and Parquet downloads its engine from the CDN on first use.'
   },
   manual_input: {
     title: 'Manual Input',
@@ -17,9 +16,13 @@ export const nodeDescriptions: Record<string, NodeDescription> = {
     title: 'External Data',
     intro: 'Load data provided by the host application. Select an available dataset from the dropdown.'
   },
+  read_from_catalog: {
+    title: 'Read from Catalog',
+    intro: 'Read a table you uploaded to the Catalog. Select one from the dropdown.'
+  },
   filter: {
     title: 'Filter',
-    intro: 'Filter rows based on conditions. Use basic mode for simple filters or advanced mode for custom Polars expressions.'
+    intro: 'Filter rows based on conditions. Use basic mode for a single comparison, or advanced mode to write a formula like [quantity] > 7.'
   },
   select: {
     title: 'Select',
@@ -33,13 +36,41 @@ export const nodeDescriptions: Record<string, NodeDescription> = {
     title: 'Group By',
     intro: 'Group rows by columns and calculate aggregations like sum, count, mean, min, max, and more.'
   },
+  record_count: {
+    title: 'Count Records',
+    intro: 'Reduce the table to a single row holding the total number of records in a number_of_records column. No configuration needed.'
+  },
   join: {
     title: 'Join',
     intro: 'Combine two datasets based on matching column values. Supports inner, left, right, full, semi, and anti joins.'
   },
+  cross_join: {
+    title: 'Cross Join',
+    intro: 'Pair every row of the left input with every row of the right input (cartesian product). No join keys required.'
+  },
+  union: {
+    title: 'Union',
+    intro: 'Stack the rows of all connected inputs into one table. Match by identical columns (vertical) or take the union of columns, null-filling gaps (diagonal).'
+  },
+  gate: {
+    title: 'Gate',
+    intro: 'Pass data through only when a condition holds — a flow parameter rule, or a formula that matches at least one row of the data (or an optional control input). When the gate is closed everything downstream is skipped instead of failing, and an optional else output routes the data to a second exit when the condition does not hold — a one-node if/else. Full Flowfile app only.'
+  },
+  formula: {
+    title: 'Formula',
+    intro: 'Add a calculated column from a simple expression like [price] * 1.21 or concat([first], " ", [last]). Loads the formula engine from PyPI on first use.'
+  },
   unique: {
     title: 'Unique',
     intro: 'Remove duplicate rows from your data. Optionally specify which columns to consider for uniqueness.'
+  },
+  dynamic_rename: {
+    title: 'Rename',
+    intro: 'Bulk-rename columns by prefix, suffix, formula, or first row — applied to all columns, a chosen list, or by data type.'
+  },
+  record_id: {
+    title: 'Record ID',
+    intro: 'Add a sequential row-number column to the start of the table. Choose the column name and the starting number.'
   },
   head: {
     title: 'Take Sample',
@@ -50,8 +81,8 @@ export const nodeDescriptions: Record<string, NodeDescription> = {
     intro: 'Write custom Polars code for advanced transformations. Access input_df and return a DataFrame. Supports full Python/Polars syntax.'
   },
   explore_data: {
-    title: 'Preview',
-    intro: 'Preview your data at this point in the flow. Does not modify the data.'
+    title: 'Explore Data',
+    intro: 'Interactively explore and visualize your data with Graphic Walker. Drag fields to build charts; saved chart specifications persist on the node.'
   },
   pivot: {
     title: 'Pivot',
@@ -68,6 +99,10 @@ export const nodeDescriptions: Record<string, NodeDescription> = {
   external_output: {
     title: 'External Output',
     intro: 'Send the result data back to the host application via the output callback. Use this to return processed data from the embedded editor.'
+  },
+  write_to_catalog: {
+    title: 'Write to Catalog',
+    intro: 'Save the flow result as a reusable table in the Catalog. Name the table, then run the flow — it can be read back with a Read from Catalog node and persists across flows.'
   }
 }
 

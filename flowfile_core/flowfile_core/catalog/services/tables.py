@@ -5,21 +5,30 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from deltalake import DeltaTable
 from pyarrow import dataset as ds
+from sqlalchemy.orm.attributes import flag_modified
 
 from flowfile_core.catalog.delta_utils import (
     delete_table_storage,
     get_delta_table_size_bytes,
     is_delta_table,
+    is_legacy_parquet,
     table_exists,
 )
 from flowfile_core.catalog.exceptions import (
     AmbiguousTableError,
+    CdcCursorNotFoundError,
+    CdcCursorsAtRiskError,
+    CdcNotSupportedError,
+    InvalidNamespaceStorageError,
     NamespaceNotFoundError,
+    StaleWriteError,
     TableExistsError,
     TableFavoriteNotFoundError,
     TableNotFoundError,
@@ -29,18 +38,83 @@ from flowfile_core.catalog.services._resolve import resolve_or_log
 from flowfile_core.catalog.services.flows import FlowRegistrationService
 from flowfile_core.catalog.services.namespaces import NamespaceService
 from flowfile_core.catalog.services.schedules import ScheduleService
+from flowfile_core.catalog.storage_backend import (
+    CatalogStorageTarget,
+    _catalog_table_dir_name,
+    _is_cloud_uri,
+    join_catalog_uri,
+    resolve_for_namespace,
+)
 from flowfile_core.catalog.validators import format_full_name, validate_table_registration
-from flowfile_core.database.models import CatalogNamespace, CatalogTable, TableFavorite
+from flowfile_core.database.models import CatalogCdcCursor, CatalogNamespace, CatalogTable, TableFavorite
 from flowfile_core.flowfile.flow_data_engine.subprocess_operations.subprocess_operations import (
+    trigger_add_key_column,
+    trigger_apply_table_edits,
+    trigger_optimize_catalog_table,
     trigger_read_table_metadata,
+    trigger_vacuum_catalog_table,
 )
 from flowfile_core.schemas.catalog_schema import (
     CatalogTableOut,
+    CdcCursorOut,
+    CdcStatusOut,
     ColumnSchema,
     FlowSummary,
+    OptimizeTableResponse,
+    Scd2TableConfig,
+    VacuumTableResponse,
+    scd2_system_columns_missing,
 )
+from shared.storage_config import storage
+
+if TYPE_CHECKING:
+    from flowfile_core.catalog.access import AccessResolver
 
 logger = logging.getLogger(__name__)
+
+# Sentinel: the caller did not speak about scd2_config, so leave whatever is stored untouched.
+# ``/refresh`` and the kernel write paths must preserve the flag; only the flow writer is
+# authoritative and always passes an explicit dict (SCD2) or ``None`` (any other mode, which
+# destroyed the history and therefore clears the flag).
+_KEEP_SCD2 = object()
+
+# Sentinel: the caller did not speak about prediction_table_id, so leave the association untouched.
+# An explicit ``None`` clears it; only the update route distinguishes the two.
+# Public, unlike the sibling _KEEP_SCD2: the update route needs it to distinguish
+# "field absent" from an explicit null.
+KEEP_PREDICTION = object()
+
+
+def _scd2_columns_missing_from_schema(raw_scd2_config: str | None, schema_list: list[dict[str, str]] | None) -> bool:
+    """True when a persisted SCD2 config names columns the schema about to be stored no longer has.
+
+    The catalog record is the single source of truth for a table's SCD2 shape, so it must not
+    outlive the columns it describes. An unreadable config is left alone — the writer path reports
+    that far more usefully than a silent clear here would.
+    """
+    if not raw_scd2_config or not schema_list:
+        return False
+    try:
+        cfg = json.loads(raw_scd2_config)
+    except (TypeError, ValueError):
+        return False
+    return scd2_system_columns_missing(cfg, schema_list)
+
+
+def _is_managed_table_path(file_path: str) -> bool:
+    """True when the storage path lives under Flowfile's managed catalog dir.
+
+    External/user-registered paths (registered by pointing at an existing file
+    outside the managed dir) return False and must never be deleted. Object-storage
+    URIs are never managed locally, so cloud tables are not auto-deleted.
+    """
+    if _is_cloud_uri(file_path):
+        return False
+    try:
+        Path(file_path).resolve().relative_to(storage.catalog_tables_directory.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
 
 
 def _should_offload() -> bool:
@@ -48,6 +122,14 @@ def _should_offload() -> bool:
     from flowfile_core.configs.settings import OFFLOAD_TO_WORKER
 
     return OFFLOAD_TO_WORKER.value
+
+
+def _project_sync_tables(owner_id: int) -> None:
+    """Mirror a table create/overwrite/update/delete into the active project's tables.yaml (no-op
+    when none active)."""
+    from flowfile_core.project import project_sync
+
+    project_sync.tables_changed(owner_id)
 
 
 @dataclass(frozen=True)
@@ -69,11 +151,16 @@ class TableService:
         namespaces: NamespaceService,
         flows: FlowRegistrationService,
         schedules: ScheduleService,
+        access: AccessResolver | None = None,
     ) -> None:
         self.repo = repo
         self._namespaces = namespaces
         self._flows = flows
         self._schedules = schedules
+        # None (internal callers, electron mode, tests) ⇒ unrestricted enrichment.
+        self._access = access
+        # Per-request cache of cloud connection availability by namespace_id (resolved once per catalog).
+        self._cloud_conn_cache: dict[int | None, bool] = {}
 
     # ---- Validation + resolution ----------------------------------------- #
 
@@ -92,15 +179,23 @@ class TableService:
         default_namespace_id: int | None = None,
         strict: bool = False,
     ) -> CatalogTable:
-        """Resolve a ``"ns.table"`` or bare ``"table"`` reference to a single CatalogTable."""
+        """Resolve a ``"catalog.schema.table"``, ``"ns.table"`` or bare ``"table"`` reference.
+
+        Splitting on every dot is unambiguous because ``reject_dot_in_name`` forbids
+        dots in namespace and table names.
+        """
         if not reference:
             raise TableNotFoundError(name=reference)
 
         if "." in reference:
-            ns_name, _, table_name = reference.partition(".")
-            if not ns_name or not table_name:
+            parts = reference.split(".")
+            if not all(parts):
                 raise TableNotFoundError(name=reference)
-            return self._resolve_qualified(ns_name, table_name, strict=strict)
+            if len(parts) == 2:
+                return self._resolve_qualified(parts[0], parts[1], strict=strict)
+            if len(parts) == 3:
+                return self._resolve_fully_qualified(parts[0], parts[1], parts[2])
+            raise TableNotFoundError(name=reference)
 
         return self._resolve_bare(reference, default_namespace_id, strict=strict)
 
@@ -126,6 +221,16 @@ class TableService:
         if len(tables) == 1:
             return tables[0]
         return self._disambiguate(f"{ns_name}.{table_name}", tables, strict=strict)
+
+    def _resolve_fully_qualified(self, catalog_name: str, schema_name: str, table_name: str) -> CatalogTable:
+        """Resolve ``catalog.schema.table``; unambiguous, so no disambiguation pass."""
+        namespace_id = self._namespaces.resolve_namespace_id_by_path(catalog_name, schema_name)
+        if namespace_id is None:
+            raise NamespaceNotFoundError(name=f"{catalog_name}.{schema_name}")
+        table = self.repo.get_table_by_name(table_name, namespace_id)
+        if table is None:
+            raise TableNotFoundError(name=f"{catalog_name}.{schema_name}.{table_name}")
+        return table
 
     def _resolve_bare(self, name: str, default_namespace_id: int | None, *, strict: bool) -> CatalogTable:
         if default_namespace_id is not None:
@@ -168,14 +273,23 @@ class TableService:
     # ---- Metadata helpers ------------------------------------------------ #
 
     @staticmethod
-    def _read_table_metadata(table_path: str, storage_format: str) -> tuple[list[dict[str, str]], int, int, int]:
-        """Read schema, row_count, column_count, size_bytes from a table."""
-        if _should_offload():
+    def _read_table_metadata(
+        table_path: str, storage_format: str, storage: dict | None = None
+    ) -> tuple[list[dict[str, str]], int, int, int]:
+        """Read schema, row_count, column_count, size_bytes from a table.
+
+        When *storage* is set the table is in object storage; the read offloads to the
+        worker with no local fallback.
+        """
+        is_cloud = storage is not None
+        if is_cloud or _should_offload():
             try:
-                data = trigger_read_table_metadata(Path(table_path).name)
+                data = trigger_read_table_metadata(_catalog_table_dir_name(table_path), storage=storage)
                 schema_list = [{"name": c["name"], "dtype": c["dtype"]} for c in data["column_schema"]]
                 return schema_list, data["row_count"], data["column_count"], data["size_bytes"]
             except (RuntimeError, OSError, ValueError, KeyError):
+                if is_cloud:
+                    raise
                 logger.warning("Worker metadata read failed, falling back to local read", exc_info=True)
 
         path = Path(table_path)
@@ -205,6 +319,29 @@ class TableService:
         except (json.JSONDecodeError, KeyError, TypeError):
             return []
 
+    @staticmethod
+    def _parse_partition_columns(table: CatalogTable) -> list[str] | None:
+        """Parse the JSON-encoded partition columns from a catalog table."""
+        raw = getattr(table, "partition_columns", None)
+        if not raw:
+            return None
+        try:
+            return list(json.loads(raw))
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    @staticmethod
+    def _parse_scd2_config(table: CatalogTable) -> Scd2TableConfig | None:
+        """Parse the JSON-encoded SCD2 shape from a catalog table, or ``None`` if not SCD2."""
+        raw = getattr(table, "scd2_config", None)
+        if not raw:
+            return None
+        try:
+            return Scd2TableConfig.model_validate(json.loads(raw))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("Unreadable scd2_config on catalog table %s", table.id)
+            return None
+
     def _resolve_flow_name(self, registration_id: int | None) -> str | None:
         """Look up a flow registration name by id, returning None when absent."""
         if not registration_id:
@@ -212,12 +349,63 @@ class TableService:
         reg = self.repo.get_flow(registration_id)
         return reg.name if reg else None
 
+    def _can_read_table(self, table_id: int) -> bool:
+        """Whether the caller may see *table_id* at all; always True when unrestricted.
+
+        Mirrors the id set ``CatalogService._filter_by_access`` uses, so a cross-referenced
+        table's name is exposed exactly when that table would itself be listed.
+        """
+        if self._access is None or not self._access.restricted:
+            return True
+        return table_id in self._access.accessible_ids("catalog_table")
+
+    def _resolve_table_name(self, table_id: int | None) -> str | None:
+        """Name of a cross-referenced catalog table, or None when it is gone or off-limits.
+
+        Row filtering drops whole tables but never enrichment fields, so an inaccessible
+        target must degrade to a bare id here rather than leak its name.
+        """
+        if not table_id or not self._can_read_table(table_id):
+            return None
+        target = self.repo.get_table(table_id)
+        return target.name if target else None
+
+    def _cloud_storage_connection_available(self, namespace_id: int | None) -> bool:
+        """True when the catalog's object-storage connection still resolves (memoized per request, no data probe)."""
+        if namespace_id in self._cloud_conn_cache:
+            return self._cloud_conn_cache[namespace_id]
+        try:
+            available = resolve_for_namespace(namespace_id).is_cloud
+        except Exception:
+            logger.debug("Catalog cloud storage connection unavailable for namespace %s", namespace_id, exc_info=True)
+            available = False
+        self._cloud_conn_cache[namespace_id] = available
+        return available
+
+    def _is_remote_storage(self, table: CatalogTable) -> bool:
+        """True when the table's data lives on object storage.
+
+        Either its ``file_path`` is a cloud URI, or its catalog is backed by object
+        storage (where physical tables are stored under a bare dir name that resolves
+        to S3). This gates the UI so remote previews load on demand, not eagerly.
+        """
+        if getattr(table, "table_type", "physical") == "virtual":
+            return False
+        if _is_cloud_uri(table.file_path or ""):
+            return True
+        return self._cloud_storage_connection_available(table.namespace_id)
+
     def _check_file_exists(self, table: CatalogTable) -> bool:
         """Determine whether the backing data for a table is available."""
         is_virtual = getattr(table, "table_type", "physical") == "virtual"
         if is_virtual:
             return True
-        file_exists = table_exists(table.file_path) if table.file_path else False
+        if not table.file_path:
+            file_exists = False
+        elif self._is_remote_storage(table):
+            file_exists = self._cloud_storage_connection_available(table.namespace_id)
+        else:
+            file_exists = table_exists(table.file_path)
         if not file_exists:
             logger.warning(
                 "Catalog table %s (id=%d) references missing file: %s",
@@ -287,6 +475,7 @@ class TableService:
 
         namespace_name = self._namespaces.resolve_namespace_name(table.namespace_id)
         full_table_name = format_full_name(namespace_name, table.name)
+        qualified_name = format_full_name(self._namespaces.resolve_namespace_path(table.namespace_id), table.name)
 
         return CatalogTableOut(
             id=table.id,
@@ -294,14 +483,17 @@ class TableService:
             namespace_id=table.namespace_id,
             namespace_name=namespace_name,
             full_table_name=full_table_name,
+            qualified_name=qualified_name,
             description=table.description,
             owner_id=table.owner_id,
             file_exists=file_exists_flag,
+            is_remote_storage=self._is_remote_storage(table),
             is_favorite=is_favorite,
             schema_columns=columns,
             row_count=table.row_count,
             column_count=table.column_count,
             size_bytes=table.size_bytes,
+            file_path=table.file_path,
             source_registration_id=table.source_registration_id,
             source_registration_name=source_registration_name,
             source_run_id=table.source_run_id,
@@ -314,6 +506,12 @@ class TableService:
             sql_query=getattr(table, "sql_query", None),
             polars_plan=getattr(table, "polars_plan", None),
             source_table_versions=getattr(table, "source_table_versions", None),
+            partition_columns=self._parse_partition_columns(table),
+            scd2=self._parse_scd2_config(table),
+            cdc_enabled=bool(table.cdc_enabled),
+            cdc_enabled_version=table.cdc_enabled_version,
+            prediction_table_id=table.prediction_table_id,
+            prediction_table_name=self._resolve_table_name(table.prediction_table_id),
             created_at=table.created_at,
             updated_at=table.updated_at,
         )
@@ -327,9 +525,13 @@ class TableService:
         favorite_ids = self.repo.bulk_get_favorite_table_ids(user_id, table_ids)
 
         ns_name_cache: dict[int, str | None] = {}
+        ns_path_cache: dict[int, str | None] = {}
         for t in tables:
             if t.namespace_id is not None and t.namespace_id not in ns_name_cache:
                 ns_name_cache[t.namespace_id] = self._namespaces.resolve_namespace_name(t.namespace_id)
+                ns_path_cache[t.namespace_id] = self._namespaces.resolve_namespace_path(t.namespace_id)
+
+        prediction_name_cache: dict[int, str | None] = {t.id: t.name for t in tables if self._can_read_table(t.id)}
 
         result: list[CatalogTableOut] = []
         for table in tables:
@@ -343,7 +545,16 @@ class TableService:
             file_exists_flag = self._check_file_exists(table)
 
             namespace_name = ns_name_cache.get(table.namespace_id) if table.namespace_id is not None else None
+            namespace_path = ns_path_cache.get(table.namespace_id) if table.namespace_id is not None else None
             full_table_name = format_full_name(namespace_name, table.name)
+            qualified_name = format_full_name(namespace_path, table.name)
+
+            prediction_table_id = table.prediction_table_id
+            prediction_table_name = None
+            if prediction_table_id:
+                if prediction_table_id not in prediction_name_cache:
+                    prediction_name_cache[prediction_table_id] = self._resolve_table_name(prediction_table_id)
+                prediction_table_name = prediction_name_cache[prediction_table_id]
 
             result.append(
                 CatalogTableOut(
@@ -352,14 +563,17 @@ class TableService:
                     namespace_id=table.namespace_id,
                     namespace_name=namespace_name,
                     full_table_name=full_table_name,
+                    qualified_name=qualified_name,
                     description=table.description,
                     owner_id=table.owner_id,
                     file_exists=file_exists_flag,
+                    is_remote_storage=self._is_remote_storage(table),
                     is_favorite=table.id in favorite_ids,
                     schema_columns=columns,
                     row_count=table.row_count,
                     column_count=table.column_count,
                     size_bytes=table.size_bytes,
+                    file_path=table.file_path,
                     source_registration_id=table.source_registration_id,
                     source_registration_name=source_registration_name,
                     source_run_id=table.source_run_id,
@@ -371,6 +585,12 @@ class TableService:
                     sql_query=getattr(table, "sql_query", None),
                     polars_plan=getattr(table, "polars_plan", None),
                     source_table_versions=getattr(table, "source_table_versions", None),
+                    partition_columns=self._parse_partition_columns(table),
+                    scd2=self._parse_scd2_config(table),
+                    cdc_enabled=bool(table.cdc_enabled),
+                    cdc_enabled_version=table.cdc_enabled_version,
+                    prediction_table_id=prediction_table_id,
+                    prediction_table_name=prediction_table_name,
                     created_at=table.created_at,
                     updated_at=table.updated_at,
                 )
@@ -383,6 +603,7 @@ class TableService:
         self,
         source_file_path: str,
         table_name: str | None = None,
+        storage: dict | None = None,
     ) -> CatalogMaterializationResult:
         # Lazy module lookup so monkeypatches on ``catalog.service.trigger_catalog_materialize``
         # — used by tests — flow through.
@@ -391,6 +612,7 @@ class TableService:
         response = _service_module.trigger_catalog_materialize(
             source_file_path=source_file_path,
             table_name=table_name,
+            storage=storage,
         )
         if response.ok:
             data = response.json()
@@ -438,9 +660,11 @@ class TableService:
         """Register a new table by materializing it as a Delta table."""
         self.validate_table_registration(name, namespace_id)
 
+        target = resolve_for_namespace(namespace_id)
         materialized = self._materialize_table_with_worker(
             source_file_path=file_path,
             table_name=name,
+            storage=target.to_worker_payload(),
         )
 
         return self._create_table_record_from_metadata(
@@ -472,6 +696,8 @@ class TableService:
         row_count: int | None = None,
         column_count: int | None = None,
         size_bytes: int | None = None,
+        partition_columns: list[str] | None = None,
+        scd2_config: dict | None = None,
     ) -> CatalogTableOut:
         """Register an already-materialized table (Delta or Parquet) in the catalog."""
         self.validate_table_registration(name, namespace_id)
@@ -481,7 +707,10 @@ class TableService:
             if column_count is None:
                 column_count = len(schema_list)
         else:
-            schema_list, row_count, column_count, size_bytes = self._read_table_metadata(table_path, storage_format)
+            target = resolve_for_namespace(namespace_id)
+            schema_list, row_count, column_count, size_bytes = self._read_table_metadata(
+                table_path, storage_format, storage=target.to_worker_payload()
+            )
 
         return self._create_table_record_from_metadata(
             name=name,
@@ -496,6 +725,8 @@ class TableService:
             source_registration_id=source_registration_id,
             source_run_id=source_run_id,
             storage_format=storage_format,
+            partition_columns=partition_columns,
+            scd2_config=scd2_config,
         )
 
     def register_table_from_parquet(
@@ -533,6 +764,8 @@ class TableService:
         row_count: int | None = None,
         column_count: int | None = None,
         size_bytes: int | None = None,
+        partition_columns: list[str] | None = None,
+        scd2_config: dict | None | object = _KEEP_SCD2,
     ) -> CatalogTableOut:
         """Replace the data of an existing catalog table **in-place**."""
         table = self.repo.get_table(table_id)
@@ -540,31 +773,52 @@ class TableService:
             raise TableNotFoundError(table_id=table_id)
 
         resolved_path_str = table_path or parquet_path
-        dest_path = Path(resolved_path_str)
+        if resolved_path_str is None:
+            raise ValueError("overwrite_table_data requires either table_path or parquet_path")
+        is_cloud = _is_cloud_uri(resolved_path_str)
 
         if storage_format is None:
-            storage_format = "delta" if is_delta_table(dest_path) else "parquet"
+            storage_format = "delta" if (is_cloud or is_delta_table(Path(resolved_path_str))) else "parquet"
 
         if schema is not None and row_count is not None and size_bytes is not None:
             schema_list = schema
             if column_count is None:
                 column_count = len(schema_list)
         else:
-            schema_list, row_count, column_count, size_bytes = self._read_table_metadata(str(dest_path), storage_format)
+            target = resolve_for_namespace(table.namespace_id)
+            schema_list, row_count, column_count, size_bytes = self._read_table_metadata(
+                resolved_path_str, storage_format, storage=target.to_worker_payload()
+            )
 
-        old_path = Path(table.file_path)
-        if old_path != dest_path and old_path.exists():
-            try:
-                delete_table_storage(old_path)
-            except OSError:
-                logger.warning("Failed to delete old table storage %s", old_path, exc_info=True)
+        if not is_cloud:
+            old_path = Path(table.file_path)
+            if old_path != Path(resolved_path_str) and old_path.exists():
+                try:
+                    delete_table_storage(old_path)
+                except OSError:
+                    logger.warning("Failed to delete old table storage %s", old_path, exc_info=True)
 
-        table.file_path = str(dest_path)
+        table.file_path = resolved_path_str
         table.storage_format = storage_format
         table.schema_json = json.dumps(schema_list)
         table.row_count = row_count
         table.column_count = column_count
         table.size_bytes = size_bytes
+        if partition_columns is not None:
+            table.partition_columns = json.dumps(partition_columns) if partition_columns else None
+        if scd2_config is not _KEEP_SCD2:
+            # Explicit ``None`` clears the flag: a plain overwrite/append over an SCD2 table
+            # destroys the version history, so the table stops being SCD2.
+            table.scd2_config = json.dumps(scd2_config) if scd2_config else None
+        elif _scd2_columns_missing_from_schema(table.scd2_config, schema_list):
+            # An unaware caller (kernel write, /refresh) replaced the data with something that no
+            # longer carries the SCD2 system columns. Keeping the flag would leave readers filtering
+            # on columns that do not exist, so the record self-heals into a plain table.
+            logger.warning(
+                "Catalog table %s: clearing stale SCD2 tracking: table data no longer carries its SCD2 columns",
+                table.id,
+            )
+            table.scd2_config = None
         if source_registration_id is not None:
             table.source_registration_id = source_registration_id
         if source_run_id is not None:
@@ -575,6 +829,7 @@ class TableService:
         table = self.repo.update_table(table)
 
         self._schedules.safely_fire_table_trigger_schedules(table.id, table.updated_at)
+        _project_sync_tables(table.owner_id)
 
         return self.table_to_out(table)
 
@@ -592,6 +847,8 @@ class TableService:
         source_registration_id: int | None,
         source_run_id: int | None,
         storage_format: str = "delta",
+        partition_columns: list[str] | None = None,
+        scd2_config: dict | None = None,
     ) -> CatalogTableOut:
         table = CatalogTable(
             name=name,
@@ -604,11 +861,459 @@ class TableService:
             row_count=row_count,
             column_count=column_count,
             size_bytes=size_bytes,
+            partition_columns=json.dumps(partition_columns) if partition_columns else None,
+            scd2_config=json.dumps(scd2_config) if scd2_config else None,
             source_registration_id=source_registration_id,
             source_run_id=source_run_id,
         )
         table = self.repo.create_table(table)
+        _project_sync_tables(owner_id)
         return self.table_to_out(table)
+
+    # ---- Delta maintenance (optimize / vacuum) --------------------------- #
+
+    def _require_delta_table_path(self, table: CatalogTable) -> str:
+        """Guard: ensure *table* is a physical Delta table, else raise ``ValueError``.
+
+        Returns the local path or object-storage URI; a cloud delta table is accepted on
+        trust (no local ``_delta_log`` probe).
+        """
+        if getattr(table, "table_type", "physical") == "virtual" or not table.file_path:
+            raise ValueError(f"Table '{table.name}' is virtual and has no Delta storage to maintain")
+        if _is_cloud_uri(table.file_path):
+            if table.storage_format != "delta":
+                raise ValueError(f"Table '{table.name}' is not a Delta table and cannot be optimized or vacuumed")
+            return table.file_path
+        path = Path(table.file_path)
+        if table.storage_format != "delta" or is_legacy_parquet(path) or not is_delta_table(path):
+            raise ValueError(f"Table '{table.name}' is not a Delta table and cannot be optimized or vacuumed")
+        return str(path)
+
+    def _update_table_size(self, table: CatalogTable, size_bytes: int | None) -> None:
+        """Persist a recomputed size after a maintenance op."""
+        if size_bytes is None:
+            return
+        table.size_bytes = size_bytes
+        # Maintenance must not look like a data change: table-trigger schedules fire on
+        # updated_at, so force the current value into the UPDATE to suppress onupdate.
+        flag_modified(table, "updated_at")
+        self.repo.update_table(table)
+
+    def optimize_table(self, table_id: int, z_order_columns: list[str] | None = None) -> OptimizeTableResponse:
+        """Compact (and optionally Z-order) a Delta catalog table, refreshing its size."""
+        table = self.repo.get_table(table_id)
+        if table is None:
+            raise TableNotFoundError(table_id=table_id)
+        data_path = self._require_delta_table_path(table)
+        is_cloud = _is_cloud_uri(data_path)
+
+        if z_order_columns:
+            valid = {c.name for c in self._parse_schema_columns(table)}
+            missing = [c for c in z_order_columns if c not in valid]
+            if missing:
+                raise ValueError(f"z_order_columns not in table schema: {missing}")
+
+        target = resolve_for_namespace(table.namespace_id) if is_cloud else None
+        storage_options = target.storage_options if target else None
+
+        if _should_offload():
+            result = trigger_optimize_catalog_table(
+                _catalog_table_dir_name(data_path),
+                z_order_columns,
+                storage=target.to_worker_payload() if target else None,
+            )
+            metrics, size_bytes = result.get("metrics", {}), result.get("size_bytes")
+        else:
+            from shared.delta_utils import get_delta_size_bytes, optimize_delta
+
+            metrics = optimize_delta(
+                data_path, z_order_columns=z_order_columns or None, storage_options=storage_options
+            )
+            size_bytes = (
+                get_delta_size_bytes(data_path, storage_options=storage_options)
+                if is_cloud
+                else get_delta_table_size_bytes(Path(data_path))
+            )
+
+        self._update_table_size(table, size_bytes)
+        return OptimizeTableResponse(metrics=metrics, size_bytes=size_bytes)
+
+    def vacuum_table(
+        self,
+        table_id: int,
+        retention_hours: int = 168,
+        dry_run: bool = True,
+        force: bool = False,
+    ) -> VacuumTableResponse:
+        """Vacuum tombstoned files from a Delta catalog table; refresh size on a real run."""
+        table = self.repo.get_table(table_id)
+        if table is None:
+            raise TableNotFoundError(table_id=table_id)
+        data_path = self._require_delta_table_path(table)
+        is_cloud = _is_cloud_uri(data_path)
+        if not force:
+            at_risk = self._cdc_cursors_at_risk(table, retention_hours)
+            if at_risk:
+                raise CdcCursorsAtRiskError(at_risk)
+
+        target = resolve_for_namespace(table.namespace_id) if is_cloud else None
+        storage_options = target.storage_options if target else None
+
+        if _should_offload():
+            result = trigger_vacuum_catalog_table(
+                _catalog_table_dir_name(data_path),
+                retention_hours,
+                dry_run,
+                storage=target.to_worker_payload() if target else None,
+            )
+            files, size_bytes = result.get("files_removed", []), result.get("size_bytes")
+        else:
+            from shared.delta_utils import get_delta_size_bytes, vacuum_delta
+
+            files = vacuum_delta(
+                data_path, retention_hours=retention_hours, dry_run=dry_run, storage_options=storage_options
+            )
+            size_bytes = (
+                get_delta_size_bytes(data_path, storage_options=storage_options)
+                if is_cloud
+                else get_delta_table_size_bytes(Path(data_path))
+            )
+
+        if not dry_run:
+            self._update_table_size(table, size_bytes)
+        return VacuumTableResponse(
+            dry_run=dry_run,
+            files_removed=list(files),
+            file_count=len(files),
+            size_bytes=size_bytes,
+        )
+
+    # ---- Change tracking (CDC) ------------------------------------------- #
+
+    def _require_cdc_capable_path(self, table: CatalogTable) -> str:
+        """Guard: only a physical, non-SCD2 Delta table can carry a change data feed.
+
+        Returns the local path or object-storage URI.
+        """
+        if getattr(table, "table_type", "physical") == "virtual" or not table.file_path:
+            raise CdcNotSupportedError(f"Table '{table.name}' is virtual and has no Delta history to track")
+        if table.scd2_config:
+            raise CdcNotSupportedError(
+                f"Table '{table.name}' is SCD2-tracked; its history already lives in its validity columns"
+            )
+        if _is_cloud_uri(table.file_path):
+            if table.storage_format != "delta":
+                raise CdcNotSupportedError(f"Table '{table.name}' is not a Delta table and cannot track changes")
+            return table.file_path
+        path = Path(table.file_path)
+        if table.storage_format != "delta" or is_legacy_parquet(path) or not is_delta_table(path):
+            raise CdcNotSupportedError(f"Table '{table.name}' is not a Delta table and cannot track changes")
+        return str(path)
+
+    def _cdc_storage_options(self, table: CatalogTable) -> dict[str, str] | None:
+        if not table.file_path or not _is_cloud_uri(table.file_path):
+            return None
+        target = resolve_for_namespace(table.namespace_id)
+        return target.storage_options if target else None
+
+    def _live_delta_version(self, table: CatalogTable) -> int | None:
+        """Live Delta head, or ``None`` when the table has no readable Delta log."""
+        from shared.delta_utils import get_delta_head_version
+
+        if not table.file_path or table.storage_format != "delta":
+            return None
+        try:
+            return get_delta_head_version(table.file_path, storage_options=self._cdc_storage_options(table))
+        except Exception:
+            logger.debug("Could not read Delta head for table %s", table.id, exc_info=True)
+            return None
+
+    def _cursor_out(self, cursor: CatalogCdcCursor, head: int | None) -> CdcCursorOut:
+        out = CdcCursorOut.model_validate(cursor)
+        if head is not None:
+            out.pending_commits = max(0, head - cursor.last_version)
+        return out
+
+    def get_cdc_status(self, table_id: int) -> CdcStatusOut:
+        """Change-tracking state plus every consumer's position in the table's feed."""
+        table = self.repo.get_table(table_id)
+        if table is None:
+            raise TableNotFoundError(table_id=table_id)
+        head = self._live_delta_version(table)
+        return CdcStatusOut(
+            cdc_enabled=bool(table.cdc_enabled),
+            cdc_enabled_version=table.cdc_enabled_version,
+            current_version=head,
+            cursors=[self._cursor_out(c, head) for c in self.repo.list_cdc_cursors(table_id)],
+        )
+
+    def enable_cdc(self, table_id: int) -> CdcStatusOut:
+        """Turn the Delta change data feed on and mirror it onto the catalog row.
+
+        Idempotent: an already-enabled table keeps the floor recorded when it was first
+        enabled, which is the version its feed genuinely became readable at.
+        """
+        from shared.delta_utils import enable_change_data_feed
+
+        table = self.repo.get_table(table_id)
+        if table is None:
+            raise TableNotFoundError(table_id=table_id)
+        data_path = self._require_cdc_capable_path(table)
+        enabled_version = enable_change_data_feed(data_path, storage_options=self._cdc_storage_options(table))
+        self.repo.set_cdc_enabled(table_id, enabled_version)
+        return self.get_cdc_status(table_id)
+
+    def reset_cdc_cursor(self, table_id: int, consumer_key: str, to: str | int) -> CdcCursorOut:
+        """Move a cursor to the live head (``"now"``), below the floor (``"beginning"``) or a version."""
+        from flowfile_core.flowfile.catalog_cdc import init_cursor_value
+
+        table = self.repo.get_table(table_id)
+        if table is None:
+            raise TableNotFoundError(table_id=table_id)
+        if self.repo.get_cdc_cursor(table_id, consumer_key) is None:
+            raise CdcCursorNotFoundError(table_id, consumer_key)
+        head = self._live_delta_version(table)
+        if to in ("now", "beginning"):
+            if head is None:
+                raise ValueError(f"Could not read the Delta version of table '{table.name}'")
+            version = init_cursor_value(str(to), head, table.cdc_enabled_version)
+        else:
+            version = int(to)
+        cursor = self.repo.reset_cdc_cursor(table_id, consumer_key, version)
+        return self._cursor_out(cursor, head)
+
+    def delete_cdc_cursor(self, table_id: int, consumer_key: str) -> None:
+        """Forget a consumer's position; its next read re-initialises per the node's start mode."""
+        if not self.repo.delete_cdc_cursor(table_id, consumer_key):
+            raise CdcCursorNotFoundError(table_id, consumer_key)
+
+    def _cdc_cursors_at_risk(self, table: CatalogTable, retention_hours: int) -> list[dict]:
+        """Cursors whose next read reaches into history a vacuum at *retention_hours* would drop.
+
+        A cursor already at head is safe (its window is entirely in the future). For the rest the
+        best available stamp is when the cursor last moved, since ``last_commit_timestamp`` is
+        descriptive and may be unset.
+        """
+        if not table.cdc_enabled:
+            return []
+        cursors = self.repo.list_cdc_cursors(table.id)
+        if not cursors:
+            return []
+        head = self._live_delta_version(table)
+        threshold = datetime.now() - timedelta(hours=retention_hours)
+        at_risk = []
+        for cursor in cursors:
+            if head is not None and cursor.last_version >= head:
+                continue
+            stamp = cursor.last_commit_timestamp or cursor.updated_at
+            if stamp is not None and stamp >= threshold:
+                continue
+            at_risk.append(self._cursor_out(cursor, head).model_dump(mode="json"))
+        return at_risk
+
+    # ---- In-place table edits (catalog edit surface) --------------------- #
+
+    def _require_editable_delta_path(self, table: CatalogTable) -> str:
+        """Guard: only physical, non-SCD2 Delta tables accept in-place edits.
+
+        Returns the local path or object-storage URI. SCD2 tables are refused for
+        the same reason the writer paths refuse incremental writes to them: a plain
+        keyed merge would corrupt the validity-window history.
+        """
+        if getattr(table, "table_type", "physical") == "virtual" or not table.file_path:
+            raise ValueError(f"Table '{table.name}' is virtual and has no physical data to edit")
+        if table.scd2_config:
+            raise ValueError(f"Table '{table.name}' is SCD2-tracked; in-place edits would corrupt its history")
+        if _is_cloud_uri(table.file_path):
+            if table.storage_format != "delta":
+                raise ValueError(f"Table '{table.name}' is not a Delta table and cannot be edited")
+            return table.file_path
+        path = Path(table.file_path)
+        if table.storage_format != "delta" or is_legacy_parquet(path) or not is_delta_table(path):
+            raise ValueError(
+                f"Table '{table.name}' is not a Delta table and cannot be edited; "
+                "convert legacy Parquet tables to Delta first"
+            )
+        return str(path)
+
+    def apply_table_edits(
+        self,
+        table_id: int,
+        *,
+        key_columns: list[str],
+        expected_version: int | None = None,
+        upsert_columns: list[str] | None = None,
+        upsert_rows: list[list] | None = None,
+        new_columns: list[dict] | None = None,
+        delete_keys: list[list] | None = None,
+        edited_by: str | None = None,
+    ) -> tuple[CatalogTableOut, dict]:
+        """Apply keyed row edits (upserts / deletes / new columns) to a catalog table.
+
+        The Delta merge executes on the worker in offload mode (merge cost scales with
+        the *target* table, not the UI-sized payload); the in-process path serves
+        worker-less local runs. On success the catalog record is refreshed through
+        ``overwrite_table_data``, which fires table-trigger schedules — a manual edit
+        is a data change, so dependent scheduled flows re-run.
+        """
+        table = self.repo.get_table(table_id)
+        if table is None:
+            raise TableNotFoundError(table_id=table_id)
+        data_path = self._require_editable_delta_path(table)
+
+        schema_names = {c.name for c in self._parse_schema_columns(table)}
+        new_columns = new_columns or []
+        missing_keys = [k for k in key_columns if k not in schema_names]
+        if missing_keys:
+            raise ValueError(f"Key columns not in table schema: {missing_keys}")
+        colliding = [c["name"] for c in new_columns if c["name"] in schema_names]
+        if colliding:
+            raise ValueError(f"New columns already exist in the table: {colliding}")
+
+        is_cloud = _is_cloud_uri(data_path)
+        target = resolve_for_namespace(table.namespace_id) if is_cloud else None
+        commit_metadata = None
+        if edited_by:
+            commit_metadata = {"flowfile_user": edited_by, "flowfile_operation": "catalog_table_edit"}
+
+        # The worker resolves catalog routes by bare directory name under its managed
+        # catalog dir, so only managed (or cloud) tables may offload: an externally
+        # registered path's basename could collide with a managed table and the edit
+        # would land on the wrong table. External local tables run in-process — their
+        # payloads are UI-sized and this mirrors how local previews read in core.
+        offload = _should_offload() and (is_cloud or _is_managed_table_path(data_path))
+
+        try:
+            if offload:
+                result = trigger_apply_table_edits(
+                    _catalog_table_dir_name(data_path),
+                    table_id,
+                    {
+                        "key_columns": key_columns,
+                        "expected_version": expected_version,
+                        "upsert_columns": upsert_columns,
+                        "upsert_rows": upsert_rows,
+                        "new_columns": new_columns,
+                        "delete_keys": delete_keys,
+                        "commit_metadata": commit_metadata,
+                    },
+                    storage=target.to_worker_payload() if target else None,
+                )
+            else:
+                from shared.delta_utils import DeltaEditError, DeltaEditStaleError, apply_delta_edits
+
+                try:
+                    result = apply_delta_edits(
+                        data_path,
+                        key_columns=key_columns,
+                        upsert_columns=upsert_columns,
+                        upsert_rows=upsert_rows,
+                        new_columns=new_columns,
+                        delete_keys=delete_keys,
+                        expected_version=expected_version,
+                        storage_options=(target.storage_options or None) if target else None,
+                        commit_metadata=commit_metadata,
+                    )
+                except DeltaEditStaleError as e:
+                    raise StaleWriteError("catalog_table", table_id, expected=e.expected, current=e.current) from e
+                except DeltaEditError as e:
+                    raise ValueError(str(e)) from e
+        except (StaleWriteError, ValueError):
+            raise
+        except Exception:
+            # A failure mid-sequence (edits apply as up to three commits) may have
+            # landed some of them; refresh the catalog record from disk so it stays
+            # truthful before surfacing the error.
+            try:
+                self.overwrite_table_data(table_id, table_path=data_path, storage_format="delta")
+            except Exception:
+                logger.warning("Post-failure metadata refresh failed for table %s", table_id, exc_info=True)
+            raise
+
+        schema_list = result.get("column_schema") or result.get("schema") or []
+        table_out = self.overwrite_table_data(
+            table_id,
+            table_path=data_path,
+            storage_format="delta",
+            schema=schema_list,
+            row_count=result.get("row_count"),
+            column_count=result.get("column_count"),
+            size_bytes=result.get("size_bytes"),
+        )
+        return table_out, result
+
+    def add_table_key_column(
+        self,
+        table_id: int,
+        column_name: str = "record_id",
+        expected_version: int | None = None,
+    ) -> tuple[CatalogTableOut, dict]:
+        """Rewrite a catalog table with a sequential row-id column appended.
+
+        The escape hatch for editing tables with no natural unique key. A full-table
+        rewrite, so it runs on the worker in offload mode.
+        """
+        table = self.repo.get_table(table_id)
+        if table is None:
+            raise TableNotFoundError(table_id=table_id)
+        data_path = self._require_editable_delta_path(table)
+
+        schema_names = {c.name for c in self._parse_schema_columns(table)}
+        if column_name in schema_names:
+            raise ValueError(f"Column '{column_name}' already exists in the table")
+
+        is_cloud = _is_cloud_uri(data_path)
+        target = resolve_for_namespace(table.namespace_id) if is_cloud else None
+
+        # Same offload gate as apply_table_edits: bare-name resolution is only
+        # unambiguous for managed catalog directories.
+        offload = _should_offload() and (is_cloud or _is_managed_table_path(data_path))
+
+        try:
+            if offload:
+                result = trigger_add_key_column(
+                    _catalog_table_dir_name(data_path),
+                    table_id,
+                    column_name,
+                    expected_version=expected_version,
+                    storage=target.to_worker_payload() if target else None,
+                )
+            else:
+                from shared.delta_utils import DeltaEditError, DeltaEditStaleError, add_delta_row_id_column
+
+                try:
+                    result = add_delta_row_id_column(
+                        data_path,
+                        column_name=column_name,
+                        expected_version=expected_version,
+                        storage_options=(target.storage_options or None) if target else None,
+                    )
+                except DeltaEditStaleError as e:
+                    raise StaleWriteError("catalog_table", table_id, expected=e.expected, current=e.current) from e
+                except DeltaEditError as e:
+                    raise ValueError(str(e)) from e
+        except (StaleWriteError, ValueError):
+            raise
+        except Exception:
+            # Mirrors apply_table_edits: a response lost after the rewrite committed
+            # would leave schema_json describing the pre-rewrite schema.
+            try:
+                self.overwrite_table_data(table_id, table_path=data_path, storage_format="delta")
+            except Exception:
+                logger.warning("Post-failure metadata refresh failed for table %s", table_id, exc_info=True)
+            raise
+
+        schema_list = result.get("column_schema") or result.get("schema") or []
+        table_out = self.overwrite_table_data(
+            table_id,
+            table_path=data_path,
+            storage_format="delta",
+            schema=schema_list,
+            row_count=result.get("row_count"),
+            column_count=result.get("column_count"),
+            size_bytes=result.get("size_bytes"),
+        )
+        return table_out, result
 
     # ---- Path resolution ------------------------------------------------- #
 
@@ -617,24 +1322,41 @@ class TableService:
         table_name: str,
         namespace_id: int | None,
         write_mode: str,
-        catalog_dir: Path,
-    ) -> tuple[CatalogTable | None, Path, str]:
-        """Resolve the destination path and Delta write mode for a catalog write."""
+        target: CatalogStorageTarget,
+    ) -> tuple[CatalogTable | None, str, str]:
+        """Resolve the destination (local path or object-storage URI) and Delta write mode.
+
+        Forward-only: an existing table writes back to its own stored location; *target*
+        only chooses where a new table is created.
+        """
         existing = self.repo.get_table_by_name(table_name, namespace_id)
 
         if existing is not None:
             if write_mode == "error":
                 raise TableExistsError(name=table_name, namespace_id=namespace_id)
 
-            old_path = Path(existing.file_path)
-            if is_delta_table(old_path):
+            if write_mode == "overwrite" and getattr(existing, "scd2_config", None):
+                # Rebuilding an SCD2 table as a normal one needs a fresh Delta log: the old table
+                # is partitioned by its is-current column and Delta cannot drop partition columns
+                # on overwrite. The record is repointed at registration; the old directory is
+                # cleaned up afterwards (local only, mirroring the delete posture for cloud).
+                dir_name = f"{table_name}_{uuid4().hex[:8]}"
+                return existing, join_catalog_uri(target.base, dir_name), write_mode
+
+            old_path = existing.file_path
+            if _is_cloud_uri(old_path):
+                # Existing object-storage table: reuse its URI (assume delta).
                 return existing, old_path, write_mode
 
-            new_dir = old_path.parent / old_path.stem
-            return existing, new_dir, write_mode
+            old_path_p = Path(old_path)
+            if is_delta_table(old_path_p):
+                return existing, str(old_path_p), write_mode
+
+            new_dir = old_path_p.parent / old_path_p.stem
+            return existing, str(new_dir), write_mode
 
         dir_name = f"{table_name}_{uuid4().hex[:8]}"
-        return None, catalog_dir / dir_name, write_mode
+        return None, join_catalog_uri(target.base, dir_name), write_mode
 
     def resolve_table_file_path(
         self,
@@ -693,14 +1415,34 @@ class TableService:
             return self.bulk_enrich_tables(tables, user_id)
         return [self.table_to_out(t) for t in tables]
 
+    def _reject_invalid_reparent(self, table: CatalogTable, new_namespace_id: int) -> None:
+        """Reject reparenting a physical table into a catalog on different storage — its bytes aren't moved."""
+        if not table.file_path or table.table_type != "physical":
+            return
+        dest = resolve_for_namespace(new_namespace_id)
+        if dest.is_cloud:
+            in_dest = table.file_path.startswith(dest.base.rstrip("/"))
+        else:
+            in_dest = not _is_cloud_uri(table.file_path)
+        if not in_dest:
+            raise InvalidNamespaceStorageError(
+                f"Cannot move table '{table.name}' into a catalog backed by different storage; its data "
+                "is not relocated. Re-create the table in the target catalog instead."
+            )
+
     def update_table(
         self,
         table_id: int,
         name: str | None = None,
         description: str | None = None,
         namespace_id: int | None = None,
+        prediction_table_id: int | None | object = KEEP_PREDICTION,
     ) -> CatalogTableOut:
-        """Update a catalog table's metadata."""
+        """Update a catalog table's metadata.
+
+        ``prediction_table_id`` defaults to the ``KEEP_PREDICTION`` sentinel: an explicit ``None``
+        clears the association, an int must name a different, existing catalog table.
+        """
         table = self.repo.get_table(table_id)
         if table is None:
             raise TableNotFoundError(table_id=table_id)
@@ -708,21 +1450,41 @@ class TableService:
             table.name = name
         if description is not None:
             table.description = description
-        if namespace_id is not None:
+        if namespace_id is not None and namespace_id != table.namespace_id:
+            self._reject_invalid_reparent(table, namespace_id)
             table.namespace_id = namespace_id
+        if prediction_table_id is not KEEP_PREDICTION:
+            if prediction_table_id is not None:
+                if prediction_table_id == table_id:
+                    raise ValueError("A table cannot be its own prediction table")
+                if self.repo.get_table(prediction_table_id) is None:
+                    raise TableNotFoundError(table_id=prediction_table_id)
+            table.prediction_table_id = prediction_table_id
+        # A metadata edit is not a data change: force the current value into the UPDATE
+        # to suppress onupdate, so table-trigger schedules don't fire on a rename.
+        flag_modified(table, "updated_at")
         table = self.repo.update_table(table)
+        _project_sync_tables(table.owner_id)
         return self.table_to_out(table)
 
-    def delete_table(self, table_id: int) -> None:
-        """Delete a catalog table and its materialized storage."""
+    def delete_table(self, table_id: int, delete_file: bool = False) -> None:
+        """Delete a catalog table; optionally delete its materialized storage.
+
+        Storage is only removed when ``delete_file`` is set AND the path is
+        Flowfile-managed (under the local catalog tables dir) — external/user-owned
+        files are never touched. Virtual tables have no file to delete. Object-storage
+        tables are not auto-deleted: the row is removed but the Delta objects remain.
+        """
         table = self.repo.get_table(table_id)
         if table is None:
             raise TableNotFoundError(table_id=table_id)
 
         file_path = table.file_path
+        owner_id = table.owner_id
         self.repo.delete_table(table_id)
+        _project_sync_tables(owner_id)
 
-        if file_path:
+        if delete_file and file_path and _is_managed_table_path(file_path):
             try:
                 storage_path = Path(file_path)
                 if storage_path.exists():

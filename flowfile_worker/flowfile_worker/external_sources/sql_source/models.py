@@ -13,8 +13,9 @@ class DataBaseConnection(BaseModel):
     password: SecretStr | None = None  # Encrypted password
     host: str | None = None
     port: int | None = None
-    database: str | None = None  # The database name
+    database: str | None = None
     database_type: str = "postgresql"  # Database type (postgresql, mysql, etc.)
+    ssl_enabled: bool | None = False
     url: str | None = None
 
     def get_decrypted_secret(self) -> SecretStr:
@@ -40,6 +41,8 @@ class DataBaseConnection(BaseModel):
             password=password_str,
             database=self.database,
             url=self.url,
+            ssl_enabled=bool(self.ssl_enabled),
+            connect_timeout=10,
         )
 
     def create_sqlalchemy_uri(self) -> str:

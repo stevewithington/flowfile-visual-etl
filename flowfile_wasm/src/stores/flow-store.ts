@@ -1,10 +1,18 @@
 import { defineStore } from 'pinia'
-import { ref, computed, watch } from 'vue'
+import { ref, computed, shallowRef, watch } from 'vue'
 import { usePyodideStore } from './pyodide-store'
 import yaml from 'js-yaml'
+import { toCoreCompatibleFlow, editorNodeType, editorNodeSettings } from '../utils/coreExport'
 import { inferOutputSchema, isSourceNode, inferSchemaFromCsv, inferSchemaFromRawData } from './schema-inference'
-import { fileStorage } from './file-storage'
+import { fileStorage, SIZE_THRESHOLD } from './file-storage'
+import { asFileContent, contentByteSize, isBinary, type FileContent } from '../types/file-content'
+import { ipcStreamToParquet, parquetToIpcStream } from '../utils/parquet-bridge'
+import { fetchRemoteFile } from '../utils/remote-file'
+import { isPlaceholderNode as isPlaceholderNodeDef, placeholderLabel, placeholderReason } from '../utils/placeholder'
+import { EXPR_TRANSFORMER_PACKAGE } from '../composables/useFormulaTranslation'
+import { DEFAULT_POLARS_CODE } from '../config/polarsCompletions'
 import type {
+  BlockedInfo,
   FlowNode,
   FlowEdge,
   NodeResult,
@@ -16,7 +24,10 @@ import type {
   NodeReadSettings,
   NodeManualInputSettings,
   NodeExternalDataSettings,
+  NodeReadFromCatalogSettings,
   NodeExternalOutputSettings,
+  NodeOutputSettings,
+  NodeWriteToCatalogSettings,
   NodeFilterSettings,
   NodeSelectSettings,
   NodeGroupBySettings
@@ -25,6 +36,52 @@ import type {
 // Session storage keys
 const STORAGE_KEY = 'flowfile_wasm_state'
 const STORAGE_VERSION = '2'  // Increment when storage format changes
+
+// Single-input transform nodes share one bridge shape —
+// execute_<fn>(nodeId, inputId, settings) — and differ only in the engine
+// function name. Keep these keys in sync with the single-input `case` labels
+// in executeNode.
+const SINGLE_INPUT_EXECUTORS: Record<string, string> = {
+  filter: 'execute_filter',
+  select: 'execute_select',
+  group_by: 'execute_group_by',
+  sort: 'execute_sort',
+  record_id: 'execute_record_id',
+  record_count: 'execute_record_count',
+  unique: 'execute_unique',
+  head: 'execute_head',
+  explore_data: 'execute_explore_data',
+  pivot: 'execute_pivot',
+  unpivot: 'execute_unpivot',
+  formula: 'execute_formula',
+  dynamic_rename: 'execute_dynamic_rename',
+}
+
+// Lazily-installed packages some single-input executors need before running.
+// Returns the packages required for the given settings (empty = none).
+const SINGLE_INPUT_PACKAGES: Record<string, (settings: any) => string[]> = {
+  formula: () => [EXPR_TRANSFORMER_PACKAGE],
+  // dynamic_rename only needs the expr engine in formula mode.
+  dynamic_rename: (s) =>
+    s?.dynamic_rename_input?.rename_mode === 'formula' ? [EXPR_TRANSFORMER_PACKAGE] : [],
+  // an advanced filter is a flowfile formula, so it needs the same engine.
+  filter: (s) => (s?.filter_input?.mode === 'advanced' ? [EXPR_TRANSFORMER_PACKAGE] : []),
+}
+
+
+/**
+ * A full, self-contained snapshot of a flow's live state — graph (FlowfileData),
+ * in-memory CSV file contents (by node id), the node-id counter, and the flow
+ * name. Used by the multi-flow tabs store to stash/restore tabs.
+ */
+export interface FlowStateSnapshot {
+  name: string
+  /** Stable library id, or null for a flow not yet saved to the library. */
+  flowId: string | null
+  snapshot: FlowfileData
+  fileContents: Record<number, FileContent>
+  nodeIdCounter: number
+}
 
 // Preview cache limits to prevent memory bloat
 const PREVIEW_CACHE_MAX_SIZE = 20  // Max number of cached previews in TypeScript
@@ -90,6 +147,27 @@ function toPythonJson(value: unknown): string {
   return JSON.stringify(JSON.stringify(value))
 }
 
+function defaultDynamicRenameInput() {
+  return {
+    rename_mode: 'prefix',
+    prefix: '',
+    suffix: '',
+    formula: '',
+    selection_mode: 'all',
+    selected_columns: [],
+    selected_data_type: null,
+  }
+}
+
+// A legacy `rename` node (an arbitrary 1:1 old->new map) can't be expressed as a
+// single dynamic-rename rule, so migrate by type only with default settings.
+function migrateLegacyRenameSettings(settings: any): any {
+  if (!settings) return settings
+  if (!settings.dynamic_rename_input) settings.dynamic_rename_input = defaultDynamicRenameInput()
+  delete settings.rename_input
+  return settings
+}
+
 export const useFlowStore = defineStore('flow', () => {
   const pyodideStore = usePyodideStore()
 
@@ -98,19 +176,58 @@ export const useFlowStore = defineStore('flow', () => {
   const edges = ref<FlowEdge[]>([])
   const nodeResults = ref<Map<number, NodeResult>>(new Map())
   const selectedNodeId = ref<number | null>(null)
+  // Panel visibility is independent of selection: the Settings panel and the
+  // Table preview each have their own flag so a single click no longer forces
+  // both open (mirrors the main flowfile_frontend). Session-only — not persisted.
+  const showSettings = ref(false)
+  const showTablePreview = ref(false)
   const isExecuting = ref(false)
   const executionError = ref<string | null>(null)
   const nodeIdCounter = ref(0)
+  // Name of the flow currently open (drives the library + Run History + header).
+  const currentFlowName = ref<string>('Untitled Flow')
+  // Stable library id of the flow currently open, or null until first saved.
+  // Re-saving updates this entry; rename keeps it (non-lossy).
+  const currentFlowId = ref<string | null>(null)
+
+  function genFlowId(): string {
+    return globalThis.crypto?.randomUUID?.() ?? `flow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  }
 
   // File content storage for CSV nodes
-  const fileContents = ref<Map<number, string>>(new Map())
+  const fileContents = ref<Map<number, FileContent>>(new Map())
 
   // Output callbacks for embeddable mode
   type OutputCallback = (data: { nodeId: number; content: string; fileName: string; mimeType: string }) => void
   const outputCallbacks = new Set<OutputCallback>()
 
   // External datasets provided by the host application (for embedded mode)
-  const externalDatasets = ref<Map<string, string>>(new Map())
+  const externalDatasets = ref<Map<string, FileContent>>(new Map())
+  // Catalog datasets: CSV tables the user uploads in the Catalog (persisted to
+  // IndexedDB). Independent from host-injected externalDatasets. Read by the
+  // dedicated "Read from Catalog" node.
+  const catalogDatasets = ref<Map<string, string>>(new Map())
+
+  // Before-export hooks: called right before the flow is exported to YAML.
+  // Used by ExploreData.vue to flush the live Graphic Walker chart spec
+  // into the node settings so it survives round-trip save/load.
+  type BeforeExportHook = () => void | Promise<void>
+  const beforeExportHooks = new Set<BeforeExportHook>()
+
+  function registerBeforeExportHook(hook: BeforeExportHook): () => void {
+    beforeExportHooks.add(hook)
+    return () => beforeExportHooks.delete(hook)
+  }
+
+  async function runBeforeExportHooks(): Promise<void> {
+    for (const hook of beforeExportHooks) {
+      try {
+        await hook()
+      } catch (err) {
+        console.warn('[flow-store] beforeExport hook failed:', err)
+      }
+    }
+  }
 
   // Preview cache state (for lazy loading)
   const previewCache = ref<Map<number, {
@@ -123,7 +240,6 @@ export const useFlowStore = defineStore('flow', () => {
   // Track nodes that have been modified since last execution (dirty state)
   const dirtyNodes = ref<Set<number>>(new Set())
 
-  // Load state from session storage on init
   async function loadFromStorage() {
     try {
       const saved = sessionStorage.getItem(STORAGE_KEY)
@@ -133,45 +249,8 @@ export const useFlowStore = defineStore('flow', () => {
         if (state.version === STORAGE_VERSION && state.flowfileData) {
           const data = state.flowfileData as FlowfileData
 
-          // Import from FlowfileData
           for (const flowfileNode of data.nodes) {
-            // Migrate old node types to new names (for backward compatibility)
-            let nodeType = flowfileNode.type
-            if (nodeType === 'read_csv') nodeType = 'read'
-            if (nodeType === 'preview') nodeType = 'explore_data'
-
-            // Migrate old settings field names
-            let settings = flowfileNode.setting_input as NodeSettings
-            if (settings && (settings as any).received_table && !(settings as any).received_file) {
-              (settings as any).received_file = (settings as any).received_table
-              delete (settings as any).received_table
-            }
-
-            // Get description and node_reference from FlowfileNode level (this is where flowfile_core stores them)
-            const nodeDescription = flowfileNode.description || ''
-            const nodeReference = flowfileNode.node_reference || undefined
-
-            // Sync description and node_reference to settings for backward compatibility
-            if (settings) {
-              (settings as NodeBase).description = nodeDescription
-              if (nodeReference) {
-                (settings as NodeBase).node_reference = nodeReference
-              }
-            }
-
-            const node: FlowNode = {
-              id: flowfileNode.id,
-              type: nodeType,
-              x: flowfileNode.x_position,
-              y: flowfileNode.y_position,
-              settings,
-              inputIds: flowfileNode.input_ids || [],
-              leftInputId: flowfileNode.left_input_id,
-              rightInputId: flowfileNode.right_input_id,
-              description: nodeDescription,  // Set node-level description
-              node_reference: nodeReference   // Set node-level reference
-            }
-            nodes.value.set(flowfileNode.id, node)
+            nodes.value.set(flowfileNode.id, hydrateFlowfileNode(flowfileNode))
           }
 
           // Import connections - support both explicit connections array and implicit derivation
@@ -191,20 +270,21 @@ export const useFlowStore = defineStore('flow', () => {
             deriveEdgesFromNodes(data.nodes)
           }
 
-          // Restore file contents from sessionStorage (small files)
+          // Restore file contents from sessionStorage (small text files)
           if (state.fileContents) {
-            fileContents.value = new Map(state.fileContents)
+            fileContents.value = new Map(
+              (state.fileContents as Array<[number, string]>).map(([nid, content]) => [nid, asFileContent(content)])
+            )
           }
 
-          // Restore large file contents from IndexedDB
+          // Restore large/binary file contents from IndexedDB
           if (state.largeFileNodeIds && Array.isArray(state.largeFileNodeIds)) {
-            // Load large files asynchronously from IndexedDB
             await Promise.all(
               state.largeFileNodeIds.map(async (nodeId: number) => {
                 try {
                   const content = await fileStorage.getFileContent(nodeId)
                   if (content) {
-                    fileContents.value.set(nodeId, content)
+                    fileContents.value.set(nodeId, asFileContent(content))
                   }
                 } catch (err) {
                   console.error(`Failed to load large file for node ${nodeId} from IndexedDB:`, err)
@@ -223,15 +303,23 @@ export const useFlowStore = defineStore('flow', () => {
             }
           }
 
-          // Restore counter
           const maxId = Math.max(0, ...data.nodes.map(n => n.id))
           nodeIdCounter.value = state.nodeIdCounter ?? maxId
+
+          // Restore the active flow's library identity + name (safety net for a
+          // page reload; the tabs store also carries these per tab).
+          if (typeof state.currentFlowName === 'string') currentFlowName.value = state.currentFlowName
+          if (typeof state.currentFlowId === 'string') currentFlowId.value = state.currentFlowId
         }
         // Fallback: legacy format (version 1)
         else if (state.nodes) {
           nodes.value = new Map(state.nodes)
           if (state.edges) edges.value = state.edges
-          if (state.fileContents) fileContents.value = new Map(state.fileContents)
+          if (state.fileContents) {
+            fileContents.value = new Map(
+              (state.fileContents as Array<[number, string]>).map(([nid, content]) => [nid, asFileContent(content)])
+            )
+          }
           if (state.nodeIdCounter !== undefined) nodeIdCounter.value = state.nodeIdCounter
         }
       }
@@ -241,14 +329,106 @@ export const useFlowStore = defineStore('flow', () => {
   }
 
   /**
+   * The single hydration path for a serialized node — used by both the
+   * sessionStorage restore and file/share/snapshot import so type renames,
+   * settings migrations and description sync can never diverge.
+   */
+  function hydrateFlowfileNode(flowfileNode: FlowfileNode): FlowNode {
+    // Node types this editor renamed, plus the core spellings the download writes.
+    const nodeType = editorNodeType(flowfileNode.type)
+
+    // Migrate old settings field names
+    let settings = editorNodeSettings(flowfileNode.type, flowfileNode.setting_input) as NodeSettings
+    if (settings && (settings as any).received_table && !(settings as any).received_file) {
+      (settings as any).received_file = (settings as any).received_table
+      delete (settings as any).received_table
+    }
+    if (nodeType === 'dynamic_rename') settings = migrateLegacyRenameSettings(settings)
+
+    // Description and node_reference live at the FlowfileNode level (where
+    // flowfile_core stores them); sync into settings for backward compatibility.
+    const nodeDescription = flowfileNode.description || ''
+    const nodeReference = flowfileNode.node_reference || undefined
+    if (settings) {
+      (settings as NodeBase).description = nodeDescription
+      if (nodeReference) {
+        (settings as NodeBase).node_reference = nodeReference
+      }
+    }
+
+    return {
+      id: flowfileNode.id,
+      type: nodeType,
+      x: flowfileNode.x_position ?? 0,
+      y: flowfileNode.y_position ?? 0,
+      settings,
+      inputIds: flowfileNode.input_ids || [],
+      leftInputId: flowfileNode.left_input_id,
+      rightInputId: flowfileNode.right_input_id,
+      description: nodeDescription,
+      node_reference: nodeReference
+    }
+  }
+
+  /** A locked, non-runnable node (share-link placeholder or unimplemented type). */
+  function isPlaceholderNode(nodeId: number): boolean {
+    const node = nodes.value.get(nodeId)
+    return !!node && isPlaceholderNodeDef(node.type, node.settings)
+  }
+
+  /**
+   * Every node that cannot run in this build: placeholder nodes plus everything
+   * downstream of one. BFS over the edge list only (buildDownstreamGraph), never
+   * getExecutionOrder — that throws on a cycle and this must stay total.
+   */
+  const blockedNodes = computed<Map<number, BlockedInfo>>(() => {
+    const blocked = new Map<number, BlockedInfo>()
+    const roots: number[] = []
+    nodes.value.forEach((node, id) => {
+      if (isPlaceholderNodeDef(node.type, node.settings)) {
+        blocked.set(id, {
+          reason: 'placeholder',
+          message: placeholderReason(node.settings),
+          sourceNodeId: id
+        })
+        roots.push(id)
+      }
+    })
+    if (roots.length === 0) return blocked
+
+    const downstream = buildDownstreamGraph()
+    const queue = [...roots]
+    const visited = new Set<number>(roots)
+    while (queue.length > 0) {
+      const current = queue.shift()!
+      const source = blocked.get(current)!
+      for (const next of downstream[current] || []) {
+        if (visited.has(next)) continue
+        visited.add(next)
+        const rootId = source.sourceNodeId
+        const rootNode = nodes.value.get(rootId)
+        blocked.set(next, {
+          reason: 'upstream_placeholder',
+          message: `Depends on "${rootNode ? placeholderLabel(rootNode.type, rootNode.settings) : `node ${rootId}`}" (#${rootId}), which can't run in the browser`,
+          sourceNodeId: rootId
+        })
+        queue.push(next)
+      }
+    }
+    return blocked
+  })
+
+  function getBlockedInfo(nodeId: number): BlockedInfo | undefined {
+    return blockedNodes.value.get(nodeId)
+  }
+
+  /**
    * Derive edges from node relationships (flowfile_core format)
    * This handles imports from flowfile_core which doesn't have explicit connections
    */
   function deriveEdgesFromNodes(flowfileNodes: FlowfileNode[]) {
-    // Collect all derived edges first
     const derivedEdges: FlowEdge[] = []
 
-    // For each node, look at incoming connections based on input_ids, left_input_id, right_input_id
     for (const targetNode of flowfileNodes) {
       // Handle right_input_id (for join nodes - second input goes to input-1)
       if (targetNode.right_input_id !== undefined && targetNode.right_input_id !== null) {
@@ -293,9 +473,7 @@ export const useFlowStore = defineStore('flow', () => {
       }
     }
 
-    // Add all edges at once
     edges.value.push(...derivedEdges)
-    console.log('[deriveEdgesFromNodes] Created edges:', derivedEdges.map(e => `${e.source}->${e.target}`))
   }
 
   // Save state to session storage using FlowfileData format (flowfile_core compatible)
@@ -342,21 +520,21 @@ export const useFlowStore = defineStore('flow', () => {
       nodes: flowfileNodes
     }
 
-    // Separate small and large files for hybrid storage
+    // Separate small and large files for hybrid storage. sessionStorage keeps
+    // the legacy [nodeId, string] shape; binary always lives in IndexedDB.
     const smallFiles: Array<[number, string]> = []
     const largeFileNodeIds: number[] = []
 
     for (const [nodeId, content] of fileContents.value.entries()) {
-      if (fileStorage.shouldUseIndexedDB(content)) {
-        // Large file: save to IndexedDB
+      if (isBinary(content) || fileStorage.shouldUseIndexedDB(content)) {
         largeFileNodeIds.push(nodeId)
-        // Save asynchronously (don't await to avoid blocking)
-        fileStorage.setFileContent(nodeId, content).catch(err => {
+        // Save asynchronously (don't await to avoid blocking). Promise.resolve
+        // guards against a non-promise return (mock reset after test teardown).
+        Promise.resolve(fileStorage.setFileContent(nodeId, content)).catch(err => {
           console.error(`Failed to save large file for node ${nodeId} to IndexedDB:`, err)
         })
       } else {
-        // Small file: save to sessionStorage
-        smallFiles.push([nodeId, content])
+        smallFiles.push([nodeId, content.data])
       }
     }
 
@@ -367,6 +545,8 @@ export const useFlowStore = defineStore('flow', () => {
         fileContents: smallFiles,
         largeFileNodeIds,
         nodeIdCounter: nodeIdCounter.value,
+        currentFlowName: currentFlowName.value,
+        currentFlowId: currentFlowId.value,
         // Save schemas separately for quick reload
         nodeSchemas: Array.from(nodeResults.value.entries()).map(([id, result]) => [id, result.schema])
       }
@@ -419,33 +599,36 @@ export const useFlowStore = defineStore('flow', () => {
 
   watch([nodes, edges, fileContents, nodeIdCounter], scheduleSave, { deep: true })
 
-  // Watch for edge changes to trigger schema propagation
   watch(() => edges.value, () => {
     debouncedPropagateSchemas()
   }, { deep: true })
 
-  // Watch for node settings changes to trigger schema propagation
-  // We need to watch the settings of each node for changes
+  // Re-run schema propagation once Pyodide finishes warming up, so column
+  // pickers fill in automatically without requiring a manual run. Until then,
+  // propagateSchemasTS() provides instant (less precise) source/inference paint.
+  watch(() => pyodideStore.isReady, (ready) => {
+    if (ready) debouncedPropagateSchemas()
+  })
+
+  // Watch for node settings changes to trigger schema propagation. The source
+  // is a single string so Vue's Object.is comparison skips no-op re-runs
+  // (e.g. node drags churning the Map) instead of firing on every mutation.
   watch(
     () => {
-      // Create a dependency on all node settings
-      const settingsSnapshot: Record<number, string> = {}
+      const parts: string[] = []
       nodes.value.forEach((node, id) => {
-        // Stringify settings to detect deep changes
-        settingsSnapshot[id] = JSON.stringify(node.settings)
+        parts.push(`${id}:${JSON.stringify(node.settings)}`)
       })
-      return settingsSnapshot
+      return parts.join('\n')
     },
     () => {
       debouncedPropagateSchemas()
-    },
-    { deep: true }
+    }
   )
 
-  // Load on init (async)
+  loadCatalogDatasets()
   loadFromStorage()
     .then(() => {
-      // Initial schema propagation after loading
       // Ensure nodeResults are populated from storage before propagating
       return propagateSchemas()
     })
@@ -466,7 +649,6 @@ export const useFlowStore = defineStore('flow', () => {
     const node = nodes.value.get(nodeId)
     if (!node) return []
 
-    // Find input node(s) and get their schema
     const inputIds = node.inputIds
     if (inputIds.length > 0) {
       const result = nodeResults.value.get(inputIds[0])
@@ -499,6 +681,16 @@ export const useFlowStore = defineStore('flow', () => {
     return result?.schema || []
   }
 
+  // Whether this node's input schema is fully known without a run. False when an
+  // upstream output is data-dependent (e.g. pivot) and only known after running.
+  const isInputSchemaResolved = (nodeId: number): boolean => {
+    const node = nodes.value.get(nodeId)
+    if (!node) return true
+    const inputId = node.leftInputId || node.inputIds[0]
+    if (!inputId) return true
+    return nodeResults.value.get(inputId)?.schemaResolved !== false
+  }
+
   // Actions
   function generateNodeId(): number {
     nodeIdCounter.value++
@@ -518,10 +710,111 @@ export const useFlowStore = defineStore('flow', () => {
       inputIds: [],
       leftInputId: undefined,
       rightInputId: undefined,
-      description: ''  // Initialize node-level description
+      description: ''
     }
 
     nodes.value.set(id, node)
+    return id
+  }
+
+  // Node clipboard persisted to localStorage so copy/paste survives reloads.
+  // Loaded file content (keyed by node id) travels with the copy; content too
+  // large for localStorage rides the in-memory clipboard for same-session paste.
+  const CLIPBOARD_KEY = 'flowfile-wasm-node-clipboard'
+
+  interface NodeClipboardPayload {
+    type: string
+    settings: Record<string, any>
+    description?: string
+    /** localStorage carries plain strings only; the in-memory clipboard may hold binary FileContent. */
+    fileContent?: string | FileContent
+    copiedAt?: number
+  }
+
+  const memoryClipboard = shallowRef<NodeClipboardPayload | null>(null)
+
+  function copyNode(nodeId: number): boolean {
+    const node = nodes.value.get(nodeId)
+    if (!node) return false
+    let payload: NodeClipboardPayload
+    try {
+      payload = {
+        type: node.type,
+        settings: JSON.parse(JSON.stringify(node.settings ?? {})),
+        description: node.description || '',
+        fileContent: fileContents.value.get(nodeId),
+        copiedAt: Date.now()
+      }
+    } catch {
+      return false
+    }
+    memoryClipboard.value = payload
+    // Persist text-only: JSON.stringify corrupts Uint8Array (index-keyed object);
+    // binary copies remain paste-able in-session via the in-memory clipboard.
+    const fc = payload.fileContent as FileContent | undefined
+    const persistedContent =
+      fc !== undefined && !isBinary(fc) && !fileStorage.shouldUseIndexedDB(fc) ? fc.data : undefined
+    try {
+      localStorage.setItem(
+        CLIPBOARD_KEY,
+        JSON.stringify({ ...payload, fileContent: persistedContent })
+      )
+    } catch {
+      // Quota exceeded — persist settings only; content stays in memory.
+      try {
+        localStorage.setItem(CLIPBOARD_KEY, JSON.stringify({ ...payload, fileContent: undefined }))
+      } catch {
+        /* localStorage unavailable — the in-memory clipboard still works */
+      }
+    }
+    return true
+  }
+
+  function hasClipboard(): boolean {
+    if (memoryClipboard.value) return true
+    try {
+      return !!localStorage.getItem(CLIPBOARD_KEY)
+    } catch {
+      return false
+    }
+  }
+
+  function pasteNode(x: number, y: number): number | null {
+    let stored: NodeClipboardPayload | null = null
+    try {
+      const raw = localStorage.getItem(CLIPBOARD_KEY)
+      if (raw) stored = JSON.parse(raw)
+    } catch {
+      /* fall back to the in-memory clipboard */
+    }
+    // Prefer the in-memory copy (it can carry file content too large to
+    // persist) unless another tab copied something newer into localStorage.
+    const inMemory = memoryClipboard.value
+    let payload = stored
+    if (inMemory && (!stored || (stored.copiedAt ?? 0) <= (inMemory.copiedAt ?? 0))) {
+      payload = inMemory
+    }
+    if (!payload?.type) return null
+
+    const id = addNode(payload.type, x, y)
+    const node = nodes.value.get(id)
+    if (node) {
+      // Merge copied settings but keep the new node's identity/position and drop
+      // any input linkage from the source node.
+      const merged: Record<string, any> = { ...(payload.settings || {}), node_id: id, pos_x: x, pos_y: y }
+      delete merged.depending_on_id
+      delete merged.depending_on_ids
+      node.settings = merged as NodeSettings
+      node.description = payload.description || ''
+      nodes.value.set(id, { ...node })
+      if (payload.fileContent !== undefined) {
+        // Re-key the copied node's loaded data to the new id so the paste can
+        // actually run (also seeds the inferred schema + preview invalidation).
+        setFileContent(id, payload.fileContent)
+      } else {
+        invalidatePreviewCache(id)
+      }
+    }
     return id
   }
 
@@ -538,8 +831,28 @@ export const useFlowStore = defineStore('flow', () => {
       node.settings = settings
       nodes.value.set(id, node)
 
-      // Invalidate preview cache for this node and downstream
       invalidatePreviewCache(id)
+
+      // A stale download must not survive settings edits — the panel would
+      // serve the OLD bytes under the NEW name/format until the next run.
+      const result = nodeResults.value.get(id)
+      if (result?.download) {
+        nodeResults.value.set(id, { ...result, download: undefined })
+        dirtyNodes.value.add(id)
+      }
+    }
+  }
+
+  /**
+   * Update a subset of node settings without triggering cache invalidation
+   * or re-execution. Used by explore_data to persist saved Graphic Walker
+   * chart specs back to the node settings without re-running the flow.
+   */
+  function updateNodeSettingsSilent(id: number, partial: Record<string, any>) {
+    const node = nodes.value.get(id)
+    if (node) {
+      node.settings = { ...(node.settings as any), ...partial } as NodeSettings
+      nodes.value.set(id, { ...node })
     }
   }
 
@@ -551,7 +864,6 @@ export const useFlowStore = defineStore('flow', () => {
   function updateNodeDescription(id: number, description: string) {
     const node = nodes.value.get(id)
     if (node) {
-      // Update node-level description (primary)
       node.description = description
       // Also sync to settings for backward compatibility with flowfile_core
       if (node.settings) {
@@ -614,7 +926,6 @@ export const useFlowStore = defineStore('flow', () => {
     previewCache.value.delete(id)
     dirtyNodes.value.delete(id)
 
-    // Delete file from IndexedDB if it exists there
     fileStorage.deleteFileContent(id).catch(err => {
       // Silently ignore if file doesn't exist in IndexedDB
       if (err && err.name !== 'NotFoundError') {
@@ -622,12 +933,10 @@ export const useFlowStore = defineStore('flow', () => {
       }
     })
 
-    // Remove related edges
     edges.value = edges.value.filter(
       e => e.source !== String(id) && e.target !== String(id)
     )
 
-    // Remove from other nodes' inputs
     nodes.value.forEach(node => {
       node.inputIds = node.inputIds.filter(inputId => inputId !== id)
       if (node.leftInputId === id) node.leftInputId = undefined
@@ -636,7 +945,6 @@ export const useFlowStore = defineStore('flow', () => {
   }
 
   function addEdge(edge: FlowEdge) {
-    // Check if edge already exists
     const exists = edges.value.some(
       e => e.source === edge.source &&
            e.target === edge.target &&
@@ -647,13 +955,11 @@ export const useFlowStore = defineStore('flow', () => {
     if (!exists) {
       edges.value.push(edge)
 
-      // Update node inputs
       const targetId = parseInt(edge.target)
       const sourceId = parseInt(edge.source)
       const targetNode = nodes.value.get(targetId)
 
       if (targetNode) {
-        // Determine which input based on handle
         if (edge.targetHandle === 'input-0' || !edge.targetHandle) {
           // input-0 is the default/left input
           if (!targetNode.inputIds.includes(sourceId)) {
@@ -666,11 +972,9 @@ export const useFlowStore = defineStore('flow', () => {
           targetNode.rightInputId = sourceId
         }
 
-        // Invalidate preview cache for target node
         invalidatePreviewCache(targetId)
       }
 
-      // Trigger immediate schema propagation for new connection
       debouncedPropagateSchemas()
     }
   }
@@ -693,62 +997,114 @@ export const useFlowStore = defineStore('flow', () => {
           nodeResults.value.delete(targetId)
         }
 
-        // Invalidate preview cache for target node
         invalidatePreviewCache(targetId)
       }
 
       edges.value = edges.value.filter(e => e.id !== edgeId)
 
-      // Trigger schema propagation to update downstream nodes
       debouncedPropagateSchemas()
     }
   }
 
-  function setFileContent(nodeId: number, content: string) {
-    fileContents.value.set(nodeId, content)
+  function setFileContent(nodeId: number, content: string | FileContent) {
+    const fc = asFileContent(content)
+    fileContents.value.set(nodeId, fc)
 
-    // If file is large, immediately save to IndexedDB for performance
-    if (fileStorage.shouldUseIndexedDB(content)) {
-      fileStorage.setFileContent(nodeId, content).catch(err => {
+    // Binary always persists to IndexedDB; large text too (sessionStorage can't hold it)
+    if (isBinary(fc) || fileStorage.shouldUseIndexedDB(fc)) {
+      fileStorage.setFileContent(nodeId, fc).catch(err => {
         console.error(`Failed to save large file for node ${nodeId} to IndexedDB:`, err)
       })
     }
 
-    // Get node to check settings for CSV parsing options
     const node = nodes.value.get(nodeId)
-    if (node && (node.type === 'read' || node.type === 'manual_input')) {
+    if (fc.kind === 'text' && node && (node.type === 'read' || node.type === 'manual_input')) {
       let hasHeaders = true
       let delimiter = ','
+      let inferTypes = true
 
       if (node.type === 'read') {
         const settings = node.settings as any
         hasHeaders = settings?.received_file?.table_settings?.has_headers ?? true
         delimiter = settings?.received_file?.table_settings?.delimiter ?? ','
+        inferTypes = settings?.received_file?.table_settings?.infer_schema ?? true
       }
 
-      // Infer schema from CSV content
-      const schema = inferSchemaFromCsv(content, hasHeaders, delimiter)
+      const schema = inferSchemaFromCsv(fc.data, hasHeaders, delimiter, inferTypes)
       if (schema) {
         // Set schema for source node (success undefined = not yet executed, shows grey)
         nodeResults.value.set(nodeId, { schema })
 
-        // Trigger schema propagation to update downstream nodes
         debouncedPropagateSchemas()
       }
     }
 
-    // Invalidate preview cache
     invalidatePreviewCache(nodeId)
+  }
+
+  /** Whether a node currently has loaded file content in memory. */
+  function hasFileContent(nodeId: number): boolean {
+    return fileContents.value.has(nodeId)
+  }
+
+  /** Get a node's loaded content (in-memory), if any. */
+  function getFileContent(nodeId: number): FileContent | undefined {
+    return fileContents.value.get(nodeId)
+  }
+
+  /** Text content for text-only consumers (CSV bridge, inference); undefined for binary. */
+  function getTextContent(nodeId: number): string | undefined {
+    const fc = fileContents.value.get(nodeId)
+    return fc?.kind === 'text' ? fc.data : undefined
+  }
+
+  // _temp_bytes is ONE shared Pyodide global with four writers (the sheet
+  // picker plus the excel/parquet/external_data execution branches); a write
+  // landing inside another caller's set→run→delete window swaps its bytes or
+  // NameErrors it. Serialize the window through a promise chain.
+  let tempBytesChain: Promise<unknown> = Promise.resolve()
+  function withTempBytes<T>(bytes: Uint8Array, fn: () => Promise<T>): Promise<T> {
+    const run = tempBytesChain.then(async () => {
+      pyodideStore.setGlobal('_temp_bytes', bytes)
+      try {
+        return await fn()
+      } finally {
+        pyodideStore.deleteGlobal('_temp_bytes')
+      }
+    })
+    tempBytesChain = run.catch(() => {})
+    return run
+  }
+
+  /** A node's result frame as Arrow IPC stream bytes (host pull API);
+   * null when the node has no executed frame. */
+  async function getNodeResultArrow(nodeId: number): Promise<Uint8Array | null> {
+    if (!pyodideStore.isReady) return null
+    return pyodideStore.runPythonGetBytes(`get_node_arrow(${nodeId})`)
+  }
+
+  /** Worksheet names of a node's loaded xlsx (settings-panel sheet picker).
+   * Throws with an actionable message when openpyxl can't be installed. */
+  async function listExcelSheets(nodeId: number): Promise<string[]> {
+    const fc = getFileContent(nodeId)
+    if (!fc || !isBinary(fc) || fc.format !== 'excel' || !pyodideStore.isReady) return []
+    await pyodideStore.ensurePyPackages(['openpyxl==3.1.5'])
+    const res = await withTempBytes(fc.data, () =>
+      pyodideStore.runPythonWithResult('list_excel_sheets(_temp_bytes.to_py())')
+    )
+    if (res?.success) return (res.sheets as string[]) ?? []
+    throw new Error(res?.error || 'Could not list worksheets')
   }
 
   /**
    * Set external datasets available from the host application.
-   * Called by FlowfileEditor when inputData prop changes.
+   * Called by FlowfileEditor when inputData prop changes. Hosts may pass text
+   * (CSV) or binary FileContent (Arrow IPC / Parquet bytes).
    */
-  function setExternalDatasets(datasets: Record<string, string>) {
+  function setExternalDatasets(datasets: Record<string, string | FileContent>) {
     externalDatasets.value.clear()
     for (const [name, content] of Object.entries(datasets)) {
-      externalDatasets.value.set(name, content)
+      externalDatasets.value.set(name, asFileContent(content))
     }
 
     // Auto-load data into any external_data nodes that reference these datasets
@@ -772,8 +1128,102 @@ export const useFlowStore = defineStore('flow', () => {
   /**
    * Get content for an external dataset by name
    */
-  function getExternalDatasetContent(name: string): string | undefined {
+  function getExternalDatasetContent(name: string): FileContent | undefined {
     return externalDatasets.value.get(name)
+  }
+
+  // ── Catalog datasets (user-uploaded tables, persisted to IndexedDB) ─────────
+
+  /** Load persisted catalog datasets into memory (called at store init). */
+  async function loadCatalogDatasets() {
+    try {
+      const entries = await fileStorage.getAllCatalogDatasets()
+      catalogDatasets.value.clear()
+      for (const e of entries) catalogDatasets.value.set(e.name, e.content)
+    } catch (err) {
+      console.warn('[flow-store] failed to load catalog datasets:', err)
+    }
+  }
+
+  /** Upload/replace a named catalog dataset (persisted). Auto-loads into any
+   *  read_from_catalog nodes that reference it. */
+  async function addCatalogDataset(name: string, content: string) {
+    catalogDatasets.value.set(name, content)
+    catalogDatasets.value = new Map(catalogDatasets.value) // trigger reactivity
+    nodes.value.forEach((node, nodeId) => {
+      if (node.type === 'read_from_catalog') {
+        const settings = node.settings as { dataset_name?: string }
+        if (settings.dataset_name === name) setFileContent(nodeId, content)
+      }
+    })
+    try {
+      await fileStorage.putCatalogDataset({ name, content })
+    } catch (err) {
+      // Keep the in-memory entry (UI stays responsive) but tell the caller it was
+      // NOT persisted — otherwise the table looks saved yet vanishes on refresh.
+      console.warn('[flow-store] failed to persist catalog dataset:', err)
+      throw err instanceof Error ? err : new Error(String(err))
+    }
+  }
+
+  function getCatalogDatasetNames(): string[] {
+    return Array.from(catalogDatasets.value.keys())
+  }
+
+  function getCatalogDatasetContent(name: string): string | undefined {
+    return catalogDatasets.value.get(name)
+  }
+
+  async function removeCatalogDataset(name: string) {
+    catalogDatasets.value.delete(name)
+    catalogDatasets.value = new Map(catalogDatasets.value)
+    try {
+      await fileStorage.deleteCatalogDataset(name)
+    } catch (err) {
+      console.warn('[flow-store] failed to delete catalog dataset:', err)
+    }
+  }
+
+  /**
+   * Materialise a catalog (or external) dataset into a Graphic Walker payload
+   * for the Visuals feature: parse the CSV in Pyodide and return its fields +
+   * up to GW_MAX_ROWS JSON-safe rows. Pyodide must already be ready (the caller
+   * gates on it). Bridges the CSV via `_temp_content`, like the read node.
+   */
+  async function loadDatasetForVisual(name: string): Promise<{
+    success: boolean
+    fields?: Record<string, unknown>[]
+    data?: Record<string, unknown>[]
+    rowInfo?: Record<string, unknown>
+    error?: string
+  }> {
+    const external = getExternalDatasetContent(name)
+    const content = getCatalogDatasetContent(name) ?? (external?.kind === 'text' ? external.data : undefined)
+    if (content === undefined) {
+      if (isBinary(external)) {
+        return { success: false, error: `Dataset "${name}" is binary (Arrow/Parquet) — visuals support CSV datasets only.` }
+      }
+      return { success: false, error: `Dataset "${name}" is not in the catalog.` }
+    }
+    const { runPythonWithResult, setGlobal, deleteGlobal } = pyodideStore
+    setGlobal('_temp_content', content)
+    try {
+      const result = await runPythonWithResult(`
+result = prepare_visual_data(_temp_content)
+result
+`)
+      if (!result?.success) {
+        return { success: false, error: result?.error ?? 'Failed to load dataset.' }
+      }
+      return {
+        success: true,
+        fields: result.fields ?? [],
+        data: result.data ?? [],
+        rowInfo: result.row_info,
+      }
+    } finally {
+      deleteGlobal('_temp_content')
+    }
   }
 
   /**
@@ -786,7 +1236,6 @@ export const useFlowStore = defineStore('flow', () => {
       // Set schema for source node (success undefined = not yet executed, shows grey)
       nodeResults.value.set(nodeId, { schema })
 
-      // Trigger schema propagation
       debouncedPropagateSchemas()
     }
   }
@@ -801,17 +1250,17 @@ export const useFlowStore = defineStore('flow', () => {
       if (prevResult?.data) {
         nodeResults.value.set(previousId, {
           ...prevResult,
-          data: undefined  // Clear the large preview data
+          data: undefined
         })
       }
-      // Also clear from preview cache
       previewCache.value.delete(previousId)
     }
 
     selectedNodeId.value = id
 
-    // Auto-fetch preview when selecting a node that has data
-    if (id !== null) {
+    // Only materialize a preview when the Table panel is actually open — a plain
+    // settings-click should stay cheap and not run hidden compute.
+    if (id !== null && showTablePreview.value) {
       const result = nodeResults.value.get(id)
       if (result?.success && !hasPreviewCached(id)) {
         // Use more rows for explore_data nodes (Preview Settings)
@@ -828,38 +1277,32 @@ export const useFlowStore = defineStore('flow', () => {
    * This helps prevent memory leaks when nodes are deleted.
    */
   async function cleanupOrphanedData() {
-    // Get current node IDs
     const currentNodeIds = new Set(nodes.value.keys())
 
-    // Clean up file contents for removed nodes
     for (const [nodeId] of fileContents.value) {
       if (!currentNodeIds.has(nodeId)) {
         fileContents.value.delete(nodeId)
       }
     }
 
-    // Clean up node results for removed nodes
     for (const [nodeId] of nodeResults.value) {
       if (!currentNodeIds.has(nodeId)) {
         nodeResults.value.delete(nodeId)
       }
     }
 
-    // Clean up preview cache for removed nodes
     for (const [nodeId] of previewCache.value) {
       if (!currentNodeIds.has(nodeId)) {
         previewCache.value.delete(nodeId)
       }
     }
 
-    // Clean up dirty flags for removed nodes
     for (const nodeId of dirtyNodes.value) {
       if (!currentNodeIds.has(nodeId)) {
         dirtyNodes.value.delete(nodeId)
       }
     }
 
-    // Clean up Python lazyframes for removed nodes
     if (pyodideStore.isReady) {
       const nodeIdList = Array.from(currentNodeIds).join(',')
       await pyodideStore.runPython(`
@@ -893,7 +1336,6 @@ gc.collect()
         return null
       }
 
-      // Get all dependencies (nodes this node depends on)
       const dependencies: number[] = [...node.inputIds]
       if (node.leftInputId) dependencies.push(node.leftInputId)
       if (node.rightInputId) dependencies.push(node.rightInputId)
@@ -904,7 +1346,6 @@ gc.collect()
           const cycleStart = dfs(depId)
           if (cycleStart !== null) return cycleStart
         } else if (recursionStack.has(depId)) {
-          // Found a cycle - return the start of the cycle
           parent.set(depId, id)
           return depId
         }
@@ -919,14 +1360,13 @@ gc.collect()
       if (!visited.has(id)) {
         const cycleStart = dfs(id)
         if (cycleStart !== null) {
-          // Reconstruct cycle path
           const cyclePath: number[] = [cycleStart]
           let current = parent.get(cycleStart)
           while (current !== undefined && current !== cycleStart) {
             cyclePath.push(current)
             current = parent.get(current)
           }
-          cyclePath.push(cycleStart) // Complete the cycle
+          cyclePath.push(cycleStart)
           return cyclePath
         }
       }
@@ -936,7 +1376,6 @@ gc.collect()
   }
 
   function getExecutionOrder(): number[] {
-    // Check for cycles first
     const cycle = detectCycle()
     if (cycle) {
       const cycleDescription = cycle
@@ -948,7 +1387,6 @@ gc.collect()
       throw new Error(`Circular dependency detected: ${cycleDescription}`)
     }
 
-    // Topological sort for execution order
     const visited = new Set<number>()
     const order: number[] = []
 
@@ -959,7 +1397,6 @@ gc.collect()
       const node = nodes.value.get(id)
       if (!node) return
 
-      // Visit dependencies first
       for (const inputId of node.inputIds) {
         visit(inputId)
       }
@@ -975,35 +1412,35 @@ gc.collect()
 
   /**
    * Sync a node's settings with its input schema
-   * This updates column-based settings (like select_input) when upstream schema changes
-   * Returns true if settings were modified (triggers re-set in nodes Map for reactivity)
+   * This updates column-based settings (like select_input) when upstream schema changes.
+   * Mutations are gated on a real value change so a no-op sync never retriggers
+   * the settings watcher (which would loop schema propagation forever).
+   * Returns true if settings were modified.
    */
-  function syncNodeSettingsWithSchema(node: FlowNode, inputSchema: ColumnSchema[], rightInputSchema?: ColumnSchema[] | null): boolean {
+  function syncNodeSettingsWithSchema(node: FlowNode, inputSchema: ColumnSchema[]): boolean {
     const settings = node.settings as any
     let modified = false
 
     if (node.type === 'select') {
-      // Sync select_input with available columns
       const currentSelectInput = settings.select_input || []
       const existingColumns = new Map<string, any>(currentSelectInput.map((s: any) => [s.old_name, s]))
       const inputColumnNames = new Set(inputSchema.map(c => c.name))
 
-      // Build new select_input array
       const newSelectInput: any[] = []
 
-      // First, add all columns from input schema
       inputSchema.forEach((col, index) => {
         const existing = existingColumns.get(col.name)
         if (existing) {
-          // Keep existing settings but update position and mark as available
           newSelectInput.push({
             ...existing,
-            data_type: col.data_type,
+            // A chosen cast target must survive an upstream schema refresh; the
+            // desktop app's updateNodeSelect makes the same data_type_change
+            // exception. Everything else follows the incoming type.
+            data_type: existing.data_type_change ? existing.data_type : col.data_type,
             is_available: true,
             position: (existing as any).position ?? index
           })
         } else {
-          // New column - add with defaults
           newSelectInput.push({
             old_name: col.name,
             new_name: col.name,
@@ -1025,47 +1462,28 @@ gc.collect()
         }
       })
 
-      // Sort by position
       newSelectInput.sort((a: any, b: any) => (a.position ?? 0) - (b.position ?? 0))
 
-      // Update settings
-      settings.select_input = newSelectInput
-      node.settings = settings
-      modified = true
+      if (JSON.stringify(settings.select_input ?? null) !== JSON.stringify(newSelectInput)) {
+        settings.select_input = newSelectInput
+        modified = true
+      }
     }
 
     if (node.type === 'group_by') {
-      // Sync groupby agg_cols with available columns
       const groupbyInput = settings.groupby_input || { agg_cols: [] }
       const currentAggCols = groupbyInput.agg_cols || []
       const inputColumnNames = new Set(inputSchema.map(c => c.name))
 
-      // Mark unavailable columns
       const newAggCols = currentAggCols.map((col: any) => ({
         ...col,
         is_available: inputColumnNames.has(col.old_name)
       }))
 
-      settings.groupby_input = { ...groupbyInput, agg_cols: newAggCols }
-      node.settings = settings
-      modified = true
-    }
-
-    if (node.type === 'join' && rightInputSchema) {
-      // Store available columns for join configuration UI
-      // The join settings UI can use getLeftInputSchema and getRightInputSchema
-      // but we can also store column availability here if needed
-    }
-
-    if (node.type === 'filter') {
-      // Check if the filtered field still exists
-      const filterInput = settings.filter_input
-      if (filterInput?.basic_filter?.field) {
-        const fieldExists = inputSchema.some(c => c.name === filterInput.basic_filter.field)
-        if (!fieldExists && filterInput.basic_filter.field !== '') {
-          // Field no longer exists - we could clear it or mark it
-          // For now, just leave it as is so user can see and fix
-        }
+      const newGroupbyInput = { ...groupbyInput, agg_cols: newAggCols }
+      if (JSON.stringify(settings.groupby_input ?? null) !== JSON.stringify(newGroupbyInput)) {
+        settings.groupby_input = newGroupbyInput
+        modified = true
       }
     }
 
@@ -1074,12 +1492,14 @@ gc.collect()
       const sortInput = settings.sort_input as any[]
       if (sortInput && Array.isArray(sortInput)) {
         const inputColumnNames = new Set(inputSchema.map(c => c.name))
-        settings.sort_input = sortInput.map((col: any) => ({
+        const newSortInput = sortInput.map((col: any) => ({
           ...col,
           is_available: inputColumnNames.has(col.column)
         }))
-        node.settings = settings
-        modified = true
+        if (JSON.stringify(settings.sort_input) !== JSON.stringify(newSortInput)) {
+          settings.sort_input = newSortInput
+          modified = true
+        }
       }
     }
 
@@ -1094,16 +1514,156 @@ gc.collect()
   }
 
   /**
-   * Propagate schemas through the flow graph
-   * This updates nodeResults with inferred schemas for all nodes that can be computed
-   * For polars_code/formula nodes, lazy execution is used when input data is available
+   * Propagate schemas through the flow graph.
+   * When Pyodide is ready, the Polars engine is the authority: an always-on,
+   * data-free pass builds the real lazy chain on empty (0-row) frames and reads
+   * collect_schema() for every node (mirrors flowfile_core's create_from_schema).
+   * Before Pyodide is ready, falls back to instant TypeScript inference.
    */
   async function propagateSchemas() {
+    if (!pyodideStore.isReady) {
+      await propagateSchemasTS()
+      return
+    }
+
+    const order = getExecutionOrder()
+
+    // Tiny JSON payload — graph shape + source schemas only, never CSV content.
+    const graphNodes: Record<number, {
+      type: string
+      input_ids: number[]
+      left: number | null
+      right: number | null
+      settings: unknown
+    }> = {}
+    const sourceSchemas: Record<number, ColumnSchema[]> = {}
+    const knownSchemas: Record<number, ColumnSchema[]> = {}
+
+    for (const nodeId of order) {
+      const node = nodes.value.get(nodeId)
+      if (!node) continue
+      // A placeholder's settings must never cross the bridge (they're stubs, or
+      // sender-authored content that must not be interpreted). Its downstream
+      // still travels and resolves loudly as "Upstream schema unavailable".
+      if (isPlaceholderNodeDef(node.type, node.settings)) continue
+      graphNodes[nodeId] = {
+        type: node.type,
+        input_ids: node.inputIds,
+        left: node.leftInputId ?? null,
+        right: node.rightInputId ?? null,
+        settings: node.settings
+      }
+      if (isSourceNode(node.type)) {
+        const schema = getSourceSchemaForPropagation(node)
+        if (schema && schema.length > 0) sourceSchemas[nodeId] = schema
+      }
+      const knownSchema = nodeResults.value.get(nodeId)?.schema
+      if (knownSchema && knownSchema.length > 0) knownSchemas[nodeId] = knownSchema
+    }
+
+    const graphJson = { order, nodes: graphNodes }
+
+    let res: Record<string, { schema?: ColumnSchema[]; schema_resolved?: boolean; error?: string }> | undefined
+    try {
+      res = await pyodideStore.runPythonWithResult(`
+import json
+result = propagate_schemas(json.loads(${toPythonJson(graphJson)}), json.loads(${toPythonJson(sourceSchemas)}), json.loads(${toPythonJson(knownSchemas)}))
+result
+`)
+    } catch (error) {
+      console.warn('Lazy schema propagation failed, falling back to inference:', error)
+      await propagateSchemasTS()
+      return
+    }
+
+    if (!res) return
+    applyPropagatedSchemas(order, res)
+  }
+
+  /**
+   * Apply the Python schema-propagation results to nodeResults, keeping node
+   * settings (select_input/agg_cols/…) in sync with each node's input schema.
+   * Iterates in topological order so an upstream node's freshly-written schema
+   * is visible when syncing a downstream node's settings.
+   */
+  function applyPropagatedSchemas(
+    order: number[],
+    res: Record<string, { schema?: ColumnSchema[]; schema_resolved?: boolean; error?: string }>
+  ) {
+    for (const nodeId of order) {
+      const node = nodes.value.get(nodeId)
+      if (!node) continue
+      if (isSourceNode(node.type)) continue
+      // Keep a blocked node's marker/state untouched by propagation refreshes.
+      if (blockedNodes.value.has(nodeId)) continue
+
+      const primaryInputId = node.leftInputId || node.inputIds[0]
+      const inputSchema = primaryInputId ? (nodeResults.value.get(primaryInputId)?.schema || null) : null
+      if (inputSchema && inputSchema.length > 0) {
+        syncNodeSettingsWithSchema(node, inputSchema)
+      }
+
+      const info = res[String(nodeId)]
+      if (!info) continue
+
+      const existing = nodeResults.value.get(nodeId)
+      const wasExecuted = existing?.success !== undefined
+      // Unresolved nodes (pivot / errored polars_code) keep their last-known schema.
+      const outputSchema = (info.schema && info.schema.length > 0) ? info.schema : existing?.schema
+      // A successfully-executed node has a real schema even if the lazy pass
+      // couldn't resolve it (e.g. pivot), so don't flag it as unresolved.
+      const resolved = info.schema_resolved === true
+        || (existing?.success === true && !!(existing?.schema && existing.schema.length > 0))
+      // Skip no-op writes: a fresh result object would re-render the whole canvas.
+      if (existing && existing.schemaResolved === resolved
+        && JSON.stringify(existing.schema ?? null) === JSON.stringify(outputSchema ?? null)) continue
+      nodeResults.value.set(nodeId, {
+        ...existing,
+        success: wasExecuted ? existing!.success : undefined,
+        schema: outputSchema,
+        schemaResolved: resolved
+      })
+    }
+  }
+
+  /**
+   * Resolve a source node's schema for the lazy pass: prefer an already-known
+   * schema (from prior execution or load), else infer it once from content.
+   */
+  function getSourceSchemaForPropagation(node: FlowNode): ColumnSchema[] | null {
+    const existing = nodeResults.value.get(node.id)?.schema
+    if (existing && existing.length > 0) return existing
+
+    const content = fileContents.value.get(node.id)
+    if (!content) return null
+
+    if (node.type === 'manual_input') {
+      const rawData = (node.settings as any)?.raw_data_format
+      if (rawData?.columns?.length) return inferSchemaFromRawData(rawData.columns)
+    }
+
+    // Binary sources (xlsx/parquet) can't be inferred in TS — schema resolves on execution
+    if (content.kind !== 'text') return null
+
+    const s = node.settings as any
+    const hasHeaders = s?.received_file?.table_settings?.has_headers ?? s?.manual_input?.has_headers ?? true
+    const delimiter = s?.received_file?.table_settings?.delimiter ?? s?.manual_input?.delimiter ?? ','
+    const inferTypes = s?.received_file?.table_settings?.infer_schema ?? true
+    return inferSchemaFromCsv(content.data, hasHeaders, delimiter, inferTypes)
+  }
+
+  /**
+   * TypeScript fallback used before Pyodide is ready (instant, less precise).
+   * Updates nodeResults with inferred schemas for all nodes that can be computed.
+   */
+  async function propagateSchemasTS() {
     const order = getExecutionOrder()
 
     for (const nodeId of order) {
       const node = nodes.value.get(nodeId)
       if (!node) continue
+      // Blocked nodes never run — also guards the lazy-execution branch below.
+      if (blockedNodes.value.has(nodeId)) continue
 
       // Skip source nodes - their schema comes from actual data
       if (isSourceNode(node.type)) {
@@ -1111,11 +1671,9 @@ gc.collect()
         continue
       }
 
-      // Get input schema from upstream node
       let inputSchema: ColumnSchema[] | null = null
       let rightInputSchema: ColumnSchema[] | null = null
 
-      // Get primary input schema and check if input has been executed
       const primaryInputId = node.leftInputId || node.inputIds[0]
       let inputHasData = false
       if (primaryInputId) {
@@ -1125,25 +1683,19 @@ gc.collect()
         inputHasData = !!(inputResult?.success || inputResult?.data)
       }
 
-      // For join nodes, also get right input schema
-      if (node.type === 'join' && node.rightInputId) {
+      // For join nodes, also get right input schema (used by inferOutputSchema below)
+      if ((node.type === 'join' || node.type === 'cross_join') && node.rightInputId) {
         const rightResult = nodeResults.value.get(node.rightInputId)
         rightInputSchema = rightResult?.schema || null
       }
 
-      // Sync node settings with input schema (updates select_input, agg_cols, etc.)
       if (inputSchema && inputSchema.length > 0) {
-        const modified = syncNodeSettingsWithSchema(node, inputSchema, rightInputSchema)
-        // Trigger Vue reactivity by re-setting the node in the Map
-        if (modified) {
-          nodes.value.set(nodeId, { ...node })
-        }
+        syncNodeSettingsWithSchema(node, inputSchema)
       }
 
       // For polars_code/formula nodes, try lazy execution if input data is available
       if (requiresLazyExecution(node.type) && inputHasData && pyodideStore.isReady) {
         try {
-          // Execute the node to get its actual output schema
           const result = await executeNode(nodeId)
           if (result.success && result.schema) {
             // Schema is already set by executeNode, continue to next node
@@ -1165,15 +1717,22 @@ gc.collect()
 
         if (inferredSchema) {
           const existingResult = nodeResults.value.get(nodeId)
+          // Skip no-op writes: a fresh result object would re-render the whole canvas.
+          if (existingResult && JSON.stringify(existingResult.schema ?? null) === JSON.stringify(inferredSchema)) {
+            continue
+          }
           // Preserve success if it was explicitly set (true OR false means it was executed)
           const wasExecuted = existingResult?.success !== undefined
           nodeResults.value.set(nodeId, {
             success: wasExecuted ? existingResult.success : undefined,
             schema: inferredSchema,
             data: existingResult?.data,
-            error: existingResult?.error,  // ADD THIS - preserve error!
+            error: existingResult?.error,
             execution_time: existingResult?.execution_time,
-            download: existingResult?.download
+            download: existingResult?.download,
+            // Preserve explore_data Graphic Walker payload across schema propagation
+            graphic_walker_input: existingResult?.graphic_walker_input,
+            row_info: existingResult?.row_info
           })
       } else {
         // inferOutputSchema returned null - this means:
@@ -1181,9 +1740,10 @@ gc.collect()
         // 2. For other nodes: input schema might be missing
         //
         // Keep any existing executed result (which has actual schema from Python)
-        // Only clear if there's no input AND no existing data
+        // Only clear never-executed placeholders (success === false is a real
+        // execution failure that must stay visible on the node)
         const existingResult = nodeResults.value.get(nodeId)
-        if (!inputSchema && !isSourceNode(node.type) && existingResult && !existingResult.data && !existingResult.success) {
+        if (!inputSchema && !isSourceNode(node.type) && existingResult && !existingResult.data && existingResult.success === undefined) {
           nodeResults.value.delete(nodeId)
         }
         // If there's an existing result with actual data, keep it - the schema from
@@ -1193,7 +1753,6 @@ gc.collect()
   }
 
   // Debounced schema propagation to avoid excessive updates
-  // Using a wrapper to handle async
   let propagateTimeout: ReturnType<typeof setTimeout> | null = null
   function debouncedPropagateSchemas() {
     if (propagateTimeout) clearTimeout(propagateTimeout)
@@ -1203,9 +1762,7 @@ gc.collect()
     }, 50)
   }
 
-  // =============================================================================
   // Preview Cache Management (Lazy Loading)
-  // =============================================================================
 
   /**
    * Evict old entries from previewCache to prevent memory bloat.
@@ -1215,14 +1772,12 @@ gc.collect()
     const now = Date.now()
     const entries = Array.from(previewCache.value.entries())
 
-    // First, evict expired entries
     for (const [nodeId, entry] of entries) {
       if (now - entry.timestamp > PREVIEW_CACHE_MAX_AGE_MS) {
         previewCache.value.delete(nodeId)
       }
     }
 
-    // Then, if still over limit, evict oldest entries
     if (previewCache.value.size > PREVIEW_CACHE_MAX_SIZE) {
       const sortedEntries = Array.from(previewCache.value.entries())
         .sort((a, b) => a[1].timestamp - b[1].timestamp)
@@ -1269,7 +1824,6 @@ gc.collect()
 
       previewCache.value.delete(current)
 
-      // Mark node as dirty (has changes since last run)
       dirtyNodes.value.add(current)
 
       const downstream = downstreamGraph[current] || []
@@ -1304,7 +1858,6 @@ invalidate_downstream_previews(${nodeId}, node_graph)
     if (cached && !cached.loading && cached.data !== null) {
       return true
     }
-    // Also check nodeResults for data
     const result = nodeResults.value.get(nodeId)
     return !!(result?.data)
   }
@@ -1334,11 +1887,9 @@ invalidate_downstream_previews(${nodeId}, node_graph)
   ): Promise<{ success: boolean; data?: any; error?: string; fromCache?: boolean }> {
     const { maxRows = 100, forceRefresh = false } = options
 
-    // Check local cache first (unless force refresh)
     if (!forceRefresh) {
       const cached = previewCache.value.get(nodeId)
       if (cached && !cached.loading && cached.data) {
-        // Also update nodeResults for display
         const existingResult = nodeResults.value.get(nodeId)
         if (existingResult) {
           nodeResults.value.set(nodeId, {
@@ -1349,7 +1900,6 @@ invalidate_downstream_previews(${nodeId}, node_graph)
         return { success: true, data: cached.data, fromCache: true }
       }
 
-      // Check nodeResults too
       const result = nodeResults.value.get(nodeId)
       if (result?.data) {
         return { success: true, data: result.data, fromCache: true }
@@ -1360,7 +1910,6 @@ invalidate_downstream_previews(${nodeId}, node_graph)
       return { success: false, error: 'Pyodide is not ready' }
     }
 
-    // Mark as loading
     previewLoadingNodes.value.add(nodeId)
     previewCache.value.set(nodeId, {
       data: null,
@@ -1384,7 +1933,6 @@ result
         // Evict old entries to prevent memory bloat
         evictPreviewCacheIfNeeded()
 
-        // Also update nodeResults with the preview data for display
         const existingResult = nodeResults.value.get(nodeId)
         if (existingResult) {
           nodeResults.value.set(nodeId, {
@@ -1422,26 +1970,180 @@ result
     }
   }
 
-  // =============================================================================
   // Node Execution
-  // =============================================================================
+
+  /**
+   * Topologically-ordered chain of a node's transitive inputs, ending with the
+   * node itself. Used to materialize data on demand ("Fetch data") without a
+   * full flow run — executing the chain rebuilds the upstream LazyFrames the
+   * node needs (cheap: nothing collects until the final preview).
+   */
+  function getAncestorChain(nodeId: number): number[] {
+    const needed = new Set<number>()
+    const stack = [nodeId]
+    while (stack.length) {
+      const id = stack.pop()!
+      if (needed.has(id)) continue
+      needed.add(id)
+      const node = nodes.value.get(id)
+      if (!node) continue
+      const inputs = [...node.inputIds]
+      if (node.leftInputId) inputs.push(node.leftInputId)
+      if (node.rightInputId) inputs.push(node.rightInputId)
+      for (const inp of inputs) stack.push(inp)
+    }
+    return getExecutionOrder().filter((id) => needed.has(id))
+  }
+
+  /**
+   * Ensure a node's LazyFrame pointer is wired and current, then return it ready
+   * to collect — without re-running upstream steps that are already built and
+   * unchanged. Each node is just a pointer to a LazyFrame (`_lazyframes[id]`);
+   * once wired it persists, so we only (re)build pointers that are MISSING (never
+   * built this session) or DIRTY (their settings/edges/inputs changed). Built &
+   * clean upstream is reused as-is — its source frame is already in memory.
+   * Stops and surfaces the first failing node's error.
+   */
+  async function executeNodeWithUpstream(nodeId: number): Promise<NodeResult> {
+    const chain = getAncestorChain(nodeId)
+
+    // Ground truth for "pointer already wired in this runtime" is the Python data
+    // store itself — NOT nodeResults.success, which survives a page refresh while
+    // _lazyframes does not (refresh => empty => everything correctly rebuilds).
+    let built = new Set<number>()
+    if (pyodideStore.isReady) {
+      try {
+        const ids = await pyodideStore.runPythonWithResult('list(_lazyframes.keys())')
+        if (Array.isArray(ids)) built = new Set(ids.map(Number))
+      } catch {
+        /* leave empty → rebuild the chain */
+      }
+    }
+
+    let last: NodeResult = { success: false, error: 'Node not found' }
+    for (const id of chain) {
+      if (built.has(id) && !isNodeDirty(id)) {
+        // Pointer already wired and current — reuse it, don't re-run the step.
+        last = { success: true }
+        continue
+      }
+      last = await executeNode(id)
+      if (!last.success) return last
+    }
+    return last
+  }
+
+  /**
+   * Record a pre-execution failure (missing file/input/config) on the node so
+   * it surfaces in the UI (red status + preview error) instead of leaving the
+   * node looking never-executed after a run.
+   */
+  function failNode(nodeId: number, error: string): NodeResult {
+    console.warn(`[flowfile] node ${nodeId} (${nodes.value.get(nodeId)?.type}) not executed: ${error}`)
+    const existing = nodeResults.value.get(nodeId)
+    const result: NodeResult = { ...existing, success: false, error, data: undefined }
+    nodeResults.value.set(nodeId, result)
+    return result
+  }
+
+  /** Mark a node blocked (placeholder / downstream of one). Not a failure:
+   *  nothing was attempted, so success stays undefined. */
+  function blockNode(nodeId: number, info: BlockedInfo): NodeResult {
+    const existing = nodeResults.value.get(nodeId)
+    const result: NodeResult = { ...existing, success: undefined, error: undefined, data: undefined, blocked: info }
+    nodeResults.value.set(nodeId, result)
+    return result
+  }
 
   async function executeNode(nodeId: number): Promise<NodeResult> {
     const node = nodes.value.get(nodeId)
     if (!node) {
+      console.warn(`[flowfile] executeNode skipped: node ${nodeId} not found`)
       return { success: false, error: 'Node not found' }
     }
 
+    // The single execution choke point for blocked nodes: every run path (Run
+    // flow, Run Now, Apply, Fetch data, upstream chains, lazy propagation)
+    // funnels through here, so a placeholder's settings can never reach the
+    // Pyodide bridge.
+    const blocked = blockedNodes.value.get(nodeId)
+    if (blocked) return blockNode(nodeId, blocked)
+
+    console.debug(`[flowfile] executeNode ${nodeId} (${node.type})`)
     const { runPythonWithResult, setGlobal, deleteGlobal } = pyodideStore
+
+    // Build + run an `execute_*` bridge whose call expression is `call`.
+    const runExecutor = (call: string): Promise<NodeResult> =>
+      runPythonWithResult(`
+import json
+result = ${call}
+result
+`)
 
     try {
       let result: NodeResult
 
       switch (node.type) {
         case 'read': {
-          const content = fileContents.value.get(nodeId)
+          const fileType = (node.settings as NodeReadSettings).received_file?.file_type ?? 'csv'
+          let fc = getFileContent(nodeId)
+          if (!fc && getRemoteSourceUrl(nodeId)) {
+            const [failure] = await refetchRemoteFiles([nodeId])
+            if (failure) return failNode(nodeId, failure.error)
+            fc = getFileContent(nodeId)
+          }
+          if (!fc) {
+            return failNode(nodeId, 'No file loaded')
+          }
+
+          if (fileType === 'excel') {
+            if (!isBinary(fc)) {
+              return failNode(nodeId, 'Node is configured for Excel but holds text content — re-pick the file')
+            }
+            try {
+              await pyodideStore.ensurePyPackages(['openpyxl==3.1.5'])
+            } catch (err) {
+              return failNode(nodeId, err instanceof Error ? err.message : String(err))
+            }
+            result = await withTempBytes(fc.data, () => runPythonWithResult(`
+import json
+result = execute_read_excel(${nodeId}, _temp_bytes.to_py(), json.loads(${toPythonJson(node.settings)}))
+result
+`))
+            break
+          }
+
+          if (fileType === 'json') {
+            return failNode(nodeId, 'JSON read is not supported in the browser — use the desktop app or convert to CSV')
+          }
+
+          if (fileType === 'parquet') {
+            if (!isBinary(fc)) {
+              return failNode(nodeId, 'Node is configured for Parquet but holds text content — re-pick the file')
+            }
+            let ipc: Uint8Array
+            try {
+              // Decode in JS (parquet-wasm, CDN-loaded on first use); the engine
+              // only sees Arrow IPC stream bytes. Original parquet bytes stay in
+              // fileContents (compressed); the IPC copy is transient.
+              ipc = await parquetToIpcStream(fc.data)
+            } catch (err) {
+              return failNode(nodeId, err instanceof Error ? err.message : String(err))
+            }
+            result = await withTempBytes(ipc, () => runPythonWithResult(`
+import json
+result = execute_read_ipc(${nodeId}, _temp_bytes.to_py(), json.loads(${toPythonJson(node.settings)}))
+result
+`))
+            break
+          }
+
+          const content = getTextContent(nodeId)
+          if (content === undefined) {
+            return failNode(nodeId, 'File content is binary but the node is configured as CSV — re-pick the file')
+          }
           if (!content) {
-            return { success: false, error: 'No file loaded' }
+            return failNode(nodeId, 'The loaded file is empty')
           }
           setGlobal('_temp_content', content)
           try {
@@ -1457,11 +2159,15 @@ result
         }
 
         case 'manual_input': {
-          const content = fileContents.value.get(nodeId)
-          if (!content) {
-            return { success: false, error: 'No data entered' }
+          // raw_data_format (core-imported flows) executes without CSV text;
+          // execute_manual_input prefers it and only falls back to _temp_content.
+          const rd = (node.settings as any)?.raw_data_format
+          const hasRawData = rd?.columns?.length > 0 && rd?.data?.length > 0
+          const content = getTextContent(nodeId)
+          if (!content && !hasRawData) {
+            return failNode(nodeId, 'No data entered')
           }
-          setGlobal('_temp_content', content)
+          setGlobal('_temp_content', content ?? '')
           try {
             result = await runPythonWithResult(`
 import json
@@ -1475,14 +2181,59 @@ result
         }
 
         case 'external_data': {
-          // Reuses execute_manual_input because the data format is identical (CSV string + settings).
-          // If execute_manual_input ever adds manual-input-specific logic, this should be split
-          // into a dedicated Python function.
-          const content = fileContents.value.get(nodeId)
-          if (!content) {
+          const fc = getFileContent(nodeId)
+          if (!fc) {
             const settings = node.settings as NodeExternalDataSettings
             const dsName = settings.dataset_name
-            return { success: false, error: dsName ? `No data loaded for dataset "${dsName}". Ensure the host provides this dataset.` : 'No dataset selected' }
+            return failNode(nodeId, dsName ? `No data loaded for dataset "${dsName}". Ensure the host provides this dataset.` : 'No dataset selected')
+          }
+
+          if (isBinary(fc)) {
+            // Host-provided binary: Arrow IPC executes directly; Parquet decodes
+            // to IPC in JS first. (Excel bytes are not part of the host contract.)
+            let ipc = fc.data
+            if (fc.format === 'parquet') {
+              try {
+                ipc = await parquetToIpcStream(fc.data)
+              } catch (err) {
+                return failNode(nodeId, err instanceof Error ? err.message : String(err))
+              }
+            } else if (fc.format !== 'arrow-ipc') {
+              return failNode(nodeId, `External datasets support CSV, Arrow IPC or Parquet — got ${fc.format}`)
+            }
+            result = await withTempBytes(ipc, () => runPythonWithResult(`
+import json
+result = execute_read_ipc(${nodeId}, _temp_bytes.to_py(), json.loads(${toPythonJson(node.settings)}))
+result
+`))
+            break
+          }
+
+          // Text reuses execute_manual_input because the data format is identical
+          // (CSV string + settings).
+          setGlobal('_temp_content', fc.data)
+          try {
+            result = await runPythonWithResult(`
+import json
+result = execute_manual_input(${nodeId}, _temp_content, json.loads(${toPythonJson(node.settings)}))
+result
+`)
+          } finally {
+            deleteGlobal('_temp_content')
+          }
+          break
+        }
+
+        case 'read_from_catalog': {
+          // Reads a CSV table uploaded to the Catalog. The settings panel loads
+          // the chosen dataset's content into fileContents; execution reuses
+          // execute_manual_input (CSV string in → frame). Independent from
+          // external_data so the two can diverge later.
+          const content = getTextContent(nodeId)
+          if (!content) {
+            const settings = node.settings as { dataset_name?: string }
+            const dsName = settings.dataset_name
+            return failNode(nodeId, dsName ? `Catalog table "${dsName}" not found. Upload it in the Catalog.` : 'No catalog table selected')
           }
           setGlobal('_temp_content', content)
           try {
@@ -1497,149 +2248,81 @@ result
           break
         }
 
-        case 'filter': {
+        // Single-input transforms: one bridge shape, keyed by node type via
+        // SINGLE_INPUT_EXECUTORS (+ optional lazy packages via SINGLE_INPUT_PACKAGES).
+        case 'filter':
+        case 'select':
+        case 'group_by':
+        case 'sort':
+        case 'record_id':
+        case 'record_count':
+        case 'unique':
+        case 'head':
+        case 'explore_data':
+        case 'pivot':
+        case 'unpivot':
+        case 'formula':
+        case 'dynamic_rename': {
           const inputId = node.inputIds[0]
           if (!inputId) {
-            return { success: false, error: 'No input connected' }
+            return failNode(nodeId, 'No input connected')
           }
-          result = await runPythonWithResult(`
-import json
-result = execute_filter(${nodeId}, ${inputId}, json.loads(${toPythonJson(node.settings)}))
-result
-`)
+          const pkgs = SINGLE_INPUT_PACKAGES[node.type]?.(node.settings) ?? []
+          if (pkgs.length) {
+            try {
+              await pyodideStore.ensurePyPackages(pkgs)
+            } catch (err) {
+              return failNode(nodeId, err instanceof Error ? err.message : String(err))
+            }
+          }
+          result = await runExecutor(
+            `${SINGLE_INPUT_EXECUTORS[node.type]}(${nodeId}, ${inputId}, json.loads(${toPythonJson(node.settings)}))`
+          )
           break
         }
 
-        case 'select': {
-          const inputId = node.inputIds[0]
-          if (!inputId) {
-            return { success: false, error: 'No input connected' }
-          }
-          result = await runPythonWithResult(`
-import json
-result = execute_select(${nodeId}, ${inputId}, json.loads(${toPythonJson(node.settings)}))
-result
-`)
-          break
-        }
-
-        case 'group_by': {
-          const inputId = node.inputIds[0]
-          if (!inputId) {
-            return { success: false, error: 'No input connected' }
-          }
-          result = await runPythonWithResult(`
-import json
-result = execute_group_by(${nodeId}, ${inputId}, json.loads(${toPythonJson(node.settings)}))
-result
-`)
-          break
-        }
-
-        case 'join': {
+        // Two-input joins: identical except the engine fn name + operation label.
+        case 'join':
+        case 'cross_join': {
           const leftId = node.leftInputId || node.inputIds[0]
           const rightId = node.rightInputId
           if (!leftId || !rightId) {
-            return { success: false, error: 'Both left and right inputs required for join' }
+            const label = node.type === 'cross_join' ? 'cross join' : 'join'
+            return failNode(nodeId, `Both left and right inputs required for ${label}`)
           }
-          result = await runPythonWithResult(`
-import json
-result = execute_join(${nodeId}, ${leftId}, ${rightId}, json.loads(${toPythonJson(node.settings)}))
-result
-`)
+          const fn = node.type === 'cross_join' ? 'execute_cross_join' : 'execute_join'
+          result = await runExecutor(
+            `${fn}(${nodeId}, ${leftId}, ${rightId}, json.loads(${toPythonJson(node.settings)}))`
+          )
           break
         }
 
-        case 'sort': {
-          const inputId = node.inputIds[0]
-          if (!inputId) {
-            return { success: false, error: 'No input connected' }
+        // Multi-input: pass the full ordered input list.
+        case 'polars_code':
+        case 'union': {
+          // polars_code may synthesize data with no inputs; union needs ≥1.
+          if (node.type === 'union' && node.inputIds.length < 1) {
+            return failNode(nodeId, 'No input connected')
           }
-          result = await runPythonWithResult(`
-import json
-result = execute_sort(${nodeId}, ${inputId}, json.loads(${toPythonJson(node.settings)}))
-result
-`)
-          break
-        }
-
-        case 'polars_code': {
-          result = await runPythonWithResult(`
-import json
-result = execute_polars_code(${nodeId}, [${node.inputIds.join(', ')}], json.loads(${toPythonJson(node.settings)}))
-result
-`)
-          break
-        }
-
-        case 'unique': {
-          const inputId = node.inputIds[0]
-          if (!inputId) {
-            return { success: false, error: 'No input connected' }
-          }
-          result = await runPythonWithResult(`
-import json
-result = execute_unique(${nodeId}, ${inputId}, json.loads(${toPythonJson(node.settings)}))
-result
-`)
-          break
-        }
-
-        case 'head': {
-          const inputId = node.inputIds[0]
-          if (!inputId) {
-            return { success: false, error: 'No input connected' }
-          }
-          result = await runPythonWithResult(`
-import json
-result = execute_head(${nodeId}, ${inputId}, json.loads(${toPythonJson(node.settings)}))
-result
-`)
-          break
-        }
-
-        case 'explore_data': {
-          const inputId = node.inputIds[0]
-          if (!inputId) {
-            return { success: false, error: 'No input connected' }
-          }
-          result = await runPythonWithResult(`
-result = execute_preview(${nodeId}, ${inputId})
-result
-`)
-          break
-        }
-
-        case 'pivot': {
-          const inputId = node.inputIds[0]
-          if (!inputId) {
-            return { success: false, error: 'No input connected' }
-          }
-          result = await runPythonWithResult(`
-import json
-result = execute_pivot(${nodeId}, ${inputId}, json.loads(${toPythonJson(node.settings)}))
-result
-`)
-          break
-        }
-
-        case 'unpivot': {
-          const inputId = node.inputIds[0]
-          if (!inputId) {
-            return { success: false, error: 'No input connected' }
-          }
-          result = await runPythonWithResult(`
-import json
-result = execute_unpivot(${nodeId}, ${inputId}, json.loads(${toPythonJson(node.settings)}))
-result
-`)
+          const fn = node.type === 'union' ? 'execute_union' : 'execute_polars_code'
+          result = await runExecutor(
+            `${fn}(${nodeId}, [${node.inputIds.join(', ')}], json.loads(${toPythonJson(node.settings)}))`
+          )
           break
         }
 
         case 'output': {
           const inputId = node.inputIds[0]
           if (!inputId) {
-            return { success: false, error: 'No input connected' }
+            return failNode(nodeId, 'No input connected')
+          }
+          const outputFileType = (node.settings as NodeOutputSettings).output_settings?.file_type
+          if (outputFileType === 'excel') {
+            try {
+              await pyodideStore.ensurePyPackages(['XlsxWriter==3.2.0'])
+            } catch (err) {
+              return failNode(nodeId, err instanceof Error ? err.message : String(err))
+            }
           }
           const outputResult = await runPythonWithResult(`
 import json
@@ -1648,7 +2331,30 @@ result
 `)
           // Store download content separately in IndexedDB (not in nodeResults)
           if (outputResult?.success && outputResult?.download) {
-            const { content, file_name, file_type, mime_type, row_count } = outputResult.download
+            const { file_name, file_type, mime_type, row_count, content_kind, transport } = outputResult.download
+            let content: string | Uint8Array = outputResult.download.content
+            if (content_kind === 'binary') {
+              // Bytes don't survive the toJs() bridge — one-shot pull from the registry.
+              // Failures here happen AFTER the engine stored the node's LazyFrame, so
+              // mark the node dirty or the next run reuses the "built" pointer and
+              // never regenerates the download.
+              const bytes = await pyodideStore.runPythonGetBytes(`take_output_binary(${nodeId})`)
+              if (!bytes) {
+                dirtyNodes.value.add(nodeId)
+                return failNode(nodeId, 'Output file bytes were not produced — re-run the node')
+              }
+              if (transport === 'arrow-ipc') {
+                // The engine staged Arrow IPC; encode the final .parquet in JS
+                try {
+                  content = await ipcStreamToParquet(bytes)
+                } catch (err) {
+                  dirtyNodes.value.add(nodeId)
+                  return failNode(nodeId, err instanceof Error ? err.message : String(err))
+                }
+              } else {
+                content = bytes
+              }
+            }
             await fileStorage.setDownloadContent(
               nodeId,
               content,
@@ -1657,13 +2363,16 @@ result
               mime_type,
               row_count
             )
-            // Notify output callbacks (for embeddable mode)
-            outputCallbacks.forEach(cb => cb({
-              nodeId,
-              content,
-              fileName: file_name,
-              mimeType: mime_type
-            }))
+            // Notify output callbacks (for embeddable mode) — text outputs only;
+            // binary results are pulled by hosts via the Arrow API.
+            if (typeof content === 'string') {
+              outputCallbacks.forEach(cb => cb({
+                nodeId,
+                content: content as string,
+                fileName: file_name,
+                mimeType: mime_type
+              }))
+            }
             // Create result without content - just metadata
             result = {
               success: outputResult.success,
@@ -1687,11 +2396,10 @@ result
           // External output: execute like output but always emit CSV to callbacks
           const inputId = node.inputIds[0]
           if (!inputId) {
-            return { success: false, error: 'No input connected' }
+            return failNode(nodeId, 'No input connected')
           }
           const settings = node.settings as NodeExternalOutputSettings
           const outputName = settings.output_name || 'result'
-          // Build the output settings object and serialize safely via toPythonJson
           const outputSettings = {
             output_settings: {
               name: `${outputName}.csv`,
@@ -1731,8 +2439,54 @@ result
           break
         }
 
+        case 'write_to_catalog': {
+          // Write the input result to the persistent Catalog as a reusable table.
+          // Materialize to CSV via execute_output (same as external_output), then
+          // persist the CSV through addCatalogDataset (IndexedDB-backed).
+          const inputId = node.inputIds[0]
+          if (!inputId) {
+            return failNode(nodeId, 'No input connected')
+          }
+          const settings = node.settings as NodeWriteToCatalogSettings
+          const tableName = (settings.dataset_name || '').trim()
+          if (!tableName) {
+            return failNode(nodeId, 'No catalog table name set. Open the node settings and name the table.')
+          }
+          const outputSettings = {
+            output_settings: {
+              name: `${tableName}.csv`,
+              directory: '.',
+              file_type: 'csv',
+              write_mode: 'overwrite',
+              table_settings: {
+                file_type: 'csv',
+                delimiter: ',',
+                encoding: 'utf-8'
+              },
+              polars_method: 'sink_csv'
+            }
+          }
+          const writeResult = await runPythonWithResult(`
+import json
+result = execute_output(${nodeId}, ${inputId}, json.loads(${toPythonJson(outputSettings)}))
+result
+`)
+          if (writeResult?.success && writeResult?.download) {
+            // Persist + make it appear in the Catalog (reactive, survives flow switches).
+            await addCatalogDataset(tableName, writeResult.download.content)
+            result = {
+              success: true,
+              schema: writeResult.schema,
+              data: writeResult.data
+            }
+          } else {
+            result = writeResult
+          }
+          break
+        }
+
         default:
-          return { success: false, error: `Unknown node type: ${node.type}` }
+          return failNode(nodeId, `Unknown node type: ${node.type}`)
       }
 
       // Store result - success=true indicates data is available in Python
@@ -1747,13 +2501,14 @@ result
         schema: result.schema,
         error: result.error,
         download: result.download,
+        graphic_walker_input: result.graphic_walker_input,
+        row_info: result.row_info,
         // Preserve data if schema unchanged (prevents data loss during schema propagation)
         data: schemaUnchanged ? existingResult?.data : undefined
       }
 
       nodeResults.value.set(nodeId, nodeResult)
 
-      // Clear dirty flag since we just executed
       if (result.success) {
         dirtyNodes.value.delete(nodeId)
       }
@@ -1766,6 +2521,7 @@ result
       return nodeResult
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
+      console.error(`[flowfile] executeNode ${nodeId} (${node.type}) threw:`, error)
       const errorResult: NodeResult = {
         success: false,
         error: errorMessage
@@ -1777,43 +2533,59 @@ result
 
   async function executeFlow() {
     if (!pyodideStore.isReady) {
+      console.warn('[flowfile] executeFlow skipped: Pyodide is not ready yet')
       return
+    }
+
+    // A pending debounced propagation (e.g. the isReady watcher's) landing
+    // mid-run would race the executors; executeFlow ends with its own pass.
+    if (propagateTimeout) {
+      clearTimeout(propagateTimeout)
+      propagateTimeout = null
     }
 
     isExecuting.value = true
     executionError.value = null
     nodeResults.value.clear()
-    previewCache.value.clear()  // Clear all preview cache
+    previewCache.value.clear()
     dirtyNodes.value.clear()    // Clear all dirty flags (will be re-set if execution fails)
 
+    // Re-seed blocked markers so the canvas state survives the results wipe.
+    for (const [id, info] of blockedNodes.value) {
+      nodeResults.value.set(id, { blocked: info })
+    }
+
+    const runStartedAt = Date.now()
     try {
-      // Clean up orphaned data before execution
       await cleanupOrphanedData()
 
-      // Clear Python state
       await pyodideStore.runPython('clear_all()')
 
-      // Get execution order and execute nodes
       // This builds the lazy query plans - should be fast!
       const order = getExecutionOrder()
+      console.debug(`[flowfile] executeFlow: ${order.length} nodes in order [${order.join(', ')}]`)
 
+      const failedNodes: string[] = []
       for (const nodeId of order) {
-        await executeNode(nodeId)
+        const result = await executeNode(nodeId)
+        if (result?.blocked) continue  // blocked ≠ failed: nothing was attempted
+        if (result && !result.success) {
+          failedNodes.push(`${nodeId}: ${result.error ?? 'unknown error'}`)
+        }
+      }
+      if (failedNodes.length > 0) {
+        executionError.value = `Node execution failed — ${failedNodes.join('; ')}`
       }
 
-      // After execution, propagate schemas to update downstream node settings
-      // This syncs select_input, agg_cols, etc. with actual executed schemas
       await propagateSchemas()
 
-      // Optional: Auto-fetch preview for selected node
-      if (selectedNodeId.value !== null) {
+      if (selectedNodeId.value !== null && showTablePreview.value) {
         const result = nodeResults.value.get(selectedNodeId.value)
         if (result?.success) {
-          // Use more rows for explore_data nodes (Preview Settings)
-          // Limited to 1000 to prevent UI lag with large datasets
           const node = nodes.value.get(selectedNodeId.value)
-          const maxRows = node?.type === 'explore_data' ? 1000 : 100
-          await fetchNodePreview(selectedNodeId.value, { maxRows })
+          if (node?.type !== 'explore_data') {
+            await fetchNodePreview(selectedNodeId.value, { maxRows: 100 })
+          }
         }
       }
 
@@ -1825,6 +2597,29 @@ result
       console.error('Flow execution error:', error)
     } finally {
       isExecuting.value = false
+
+      // Record a per-run summary for the Catalog Run History (client-side only).
+      try {
+        const nodesCompleted = Array.from(nodeResults.value.values()).filter(r => r.success === true).length
+        console.debug(
+          `[flowfile] executeFlow done: ${nodesCompleted}/${nodes.value.size} nodes ok in ${Date.now() - runStartedAt}ms` +
+          (executionError.value ? ` (error: ${executionError.value})` : '')
+        )
+        await fileStorage.putRun({
+          id: (globalThis.crypto?.randomUUID?.() ?? `run-${runStartedAt}`),
+          flowId: currentFlowId.value ?? undefined,
+          flowName: currentFlowName.value,
+          startedAt: runStartedAt,
+          durationMs: Date.now() - runStartedAt,
+          nodesTotal: nodes.value.size,
+          nodesCompleted,
+          success: !executionError.value,
+          error: executionError.value
+        })
+        await fileStorage.pruneRuns(50)
+      } catch (e) {
+        console.warn('[flow-store] failed to record run history:', e)
+      }
     }
   }
 
@@ -1853,6 +2648,7 @@ result
               has_headers: true,
               encoding: 'utf-8',
               starting_from_line: 0,
+              infer_schema: true,
               infer_schema_length: 100,
               truncate_ragged_lines: false,
               ignore_errors: false
@@ -1876,6 +2672,13 @@ result
           dataset_name: '',
           schema_snapshot: []
         } as NodeExternalDataSettings
+
+      case 'read_from_catalog':
+        return {
+          ...base,
+          dataset_name: '',
+          schema_snapshot: []
+        } as NodeReadFromCatalogSettings
 
       case 'filter':
         return {
@@ -1927,13 +2730,58 @@ result
           sort_input: []
         } as any
 
-      case 'formula':
       case 'polars_code':
         return {
           ...base,
           polars_code_input: {
-            polars_code: 'input_df'
+            polars_code: DEFAULT_POLARS_CODE
           }
+        } as any
+
+      case 'formula':
+        return {
+          ...base,
+          function: {
+            field: { name: '', data_type: 'Auto' },
+            function: ''
+          }
+        } as any
+
+      case 'cross_join':
+        return {
+          ...base,
+          depending_on_ids: [],
+          cross_join_input: {
+            right_suffix: '_right'
+          }
+        } as any
+
+      case 'union':
+        return {
+          ...base,
+          depending_on_ids: [],
+          union_input: {
+            mode: 'diagonal'
+          }
+        } as any
+
+      case 'record_id':
+        return {
+          ...base,
+          record_id_input: {
+            name: 'record_id',
+            offset: 1
+          }
+        } as any
+
+      // No settings to configure — mark it set up so it runs straight away.
+      case 'record_count':
+        return { ...base, is_setup: true } as NodeSettings
+
+      case 'dynamic_rename':
+        return {
+          ...base,
+          dynamic_rename_input: defaultDynamicRenameInput()
         } as any
 
       case 'unique':
@@ -1952,7 +2800,10 @@ result
       case 'head':
         return {
           ...base,
+          sample_method: 'first',
           sample_size: 10,
+          fraction: 10,
+          seed: null,
           head_input: {
             n: 10
           }
@@ -1982,8 +2833,13 @@ result
 
       case 'explore_data':
         return {
-          ...base
-        } as NodeSettings
+          ...base,
+          graphic_walker_input: {
+            is_initial: true,
+            dataModel: { fields: [], data: [] },
+            specList: []
+          }
+        } as any
 
       case 'output':
         return {
@@ -2007,6 +2863,12 @@ result
           output_name: 'result'
         } as NodeExternalOutputSettings
 
+      case 'write_to_catalog':
+        return {
+          ...base,
+          dataset_name: ''
+        } as NodeWriteToCatalogSettings
+
       default:
         return base as NodeSettings
     }
@@ -2023,15 +2885,11 @@ result
    * - Uses version '1.0.0' for cross-system compatibility
    */
   function exportToFlowfile(name: string = 'Untitled Flow'): FlowfileData {
-    console.log('[exportToFlowfile] Current edges:', edges.value.map(e => `${e.source}->${e.target}`))
     const flowfileNodes: FlowfileNode[] = []
 
-    // Convert nodes
     nodes.value.forEach((node, id) => {
-      // Determine if this is a start node (no inputs)
       const isStartNode = node.inputIds.length === 0 && !node.leftInputId && !node.rightInputId
 
-      // Get output nodes from edges
       const outputs = edges.value
         .filter(e => e.source === String(id))
         .map(e => parseInt(e.target))
@@ -2098,7 +2956,6 @@ result
   function importFromFlowfile(data: FlowfileData): boolean {
 
     try {
-      // Clear existing state
       nodes.value.clear()
       edges.value = []
       nodeResults.value.clear()
@@ -2106,57 +2963,28 @@ result
       previewCache.value.clear()
       dirtyNodes.value.clear()
       selectedNodeId.value = null
+      showSettings.value = false
+      showTablePreview.value = false
+      currentFlowName.value = (data as any)?.flowfile_name || 'Untitled Flow'
+      // Raw FlowfileData (file/template/snapshot) carries no library identity;
+      // callers that restore a saved flow set currentFlowId afterwards.
+      currentFlowId.value = null
 
-      // Clear IndexedDB file storage
       fileStorage.clearAll().catch(err => {
         console.error('Failed to clear IndexedDB:', err)
       })
 
-      // Find max node id for counter
+      // Reset the Pyodide engine so LazyFrames/schemas keyed by node_id from a
+      // previously loaded flow can't leak into this one (node ids are reused).
+      if (pyodideStore.isReady) {
+        pyodideStore.runPython('clear_all()').catch(err => console.error('clear_all failed on import:', err))
+      }
+
       let maxId = 0
 
-      // Import nodes
       for (const flowfileNode of data.nodes) {
         if (flowfileNode.id > maxId) maxId = flowfileNode.id
-
-        // Migrate old node types to new names (for backward compatibility)
-        let nodeType = flowfileNode.type
-        if (nodeType === 'read_csv') nodeType = 'read'
-        if (nodeType === 'preview') nodeType = 'explore_data'
-
-        // Migrate old settings field names
-        let settings = flowfileNode.setting_input as NodeSettings
-        if (settings && (settings as any).received_table && !(settings as any).received_file) {
-          (settings as any).received_file = (settings as any).received_table
-          delete (settings as any).received_table
-        }
-
-        // Get description and node_reference from FlowfileNode level (this is where flowfile_core stores them)
-        const nodeDescription = flowfileNode.description || ''
-        const nodeReference = flowfileNode.node_reference || undefined
-
-        // Sync description and node_reference to settings for backward compatibility
-        if (settings) {
-          (settings as NodeBase).description = nodeDescription
-          if (nodeReference) {
-            (settings as NodeBase).node_reference = nodeReference
-          }
-        }
-
-        const node: FlowNode = {
-          id: flowfileNode.id,
-          type: nodeType,
-          x: flowfileNode.x_position ?? 0,
-          y: flowfileNode.y_position ?? 0,
-          settings,
-          inputIds: flowfileNode.input_ids || [],
-          leftInputId: flowfileNode.left_input_id,
-          rightInputId: flowfileNode.right_input_id,
-          description: nodeDescription,  // Set node-level description
-          node_reference: nodeReference   // Set node-level reference
-        }
-
-        nodes.value.set(flowfileNode.id, node)
+        nodes.value.set(flowfileNode.id, hydrateFlowfileNode(flowfileNode))
       }
 
       nodeIdCounter.value = maxId
@@ -2179,7 +3007,6 @@ result
         deriveEdgesFromNodes(data.nodes)
       }
 
-      // Trigger schema propagation after import
       // Note: Source nodes will need data loaded before schemas propagate
       setTimeout(() => {
         propagateSchemas().catch(err => console.error('Import schema propagation error:', err))
@@ -2192,14 +3019,104 @@ result
     }
   }
 
+  /** Bundle the in-memory input CSVs that are small enough to persist inline.
+   * Text-only: binary content is restored via re-pick, never inlined into
+   * library entries (and the wrapper would defeat a Blob size check anyway). */
+  function collectSmallFileContents(): Record<number, string> {
+    const smallFiles: Record<number, string> = {}
+    for (const [nid, content] of fileContents.value) {
+      if (content.kind === 'text' && contentByteSize(content) < SIZE_THRESHOLD) {
+        smallFiles[nid] = content.data
+      }
+    }
+    return smallFiles
+  }
+
   /**
-   * Download the current flow as a file
+   * Persist the active flow to the in-browser library (IndexedDB), the WASM
+   * analogue of the full app's catalog registration. Upserts by currentFlowId
+   * (minting one on first save) so re-saving updates the same entry and rename
+   * is non-lossy. Does NOT download a file — see exportFlowfile for that.
+   */
+  async function saveToLibrary(name?: string): Promise<{ id: string; name: string }> {
+    await runBeforeExportHooks()
+    if (!currentFlowId.value) currentFlowId.value = genFlowId()
+    if (name) currentFlowName.value = name
+    const flowName = currentFlowName.value || 'Untitled Flow'
+    // Deep-clone to a plain object: exportToFlowfile carries reactive (Proxy)
+    // arrays/objects that IndexedDB's structured clone rejects (DataCloneError).
+    const data = JSON.parse(JSON.stringify(exportToFlowfile(flowName))) as FlowfileData
+
+    const existing = await fileStorage.getSavedFlow(currentFlowId.value)
+    const now = Date.now()
+    const smallFiles = collectSmallFileContents()
+    await fileStorage.putSavedFlow({
+      id: currentFlowId.value,
+      name: flowName,
+      description: existing?.description ?? '',
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      nodeCount: nodes.value.size,
+      snapshot: data,
+      fileContents: Object.keys(smallFiles).length ? smallFiles : undefined
+    })
+    return { id: currentFlowId.value, name: flowName }
+  }
+
+  /**
+   * Snapshot the active flow for a share link: the flow definition plus inline
+   * small text files (same inlining as library entries). Binary/oversized
+   * inputs can't travel in a URL — they're reported so the share UI can list
+   * what recipients will have to re-pick.
+   */
+  async function exportShareSnapshot(): Promise<{
+    flow: FlowfileData
+    files: Record<number, string>
+    excludedFiles: Array<{ nodeId: number; fileName: string }>
+  }> {
+    await runBeforeExportHooks()
+    const flowName = currentFlowName.value || 'Untitled Flow'
+    const flow = JSON.parse(JSON.stringify(exportToFlowfile(flowName))) as FlowfileData
+    const files = collectSmallFileContents()
+    const excludedFiles: Array<{ nodeId: number; fileName: string }> = []
+    for (const [nid, content] of fileContents.value) {
+      if (content.kind === 'text' && contentByteSize(content) < SIZE_THRESHOLD) continue
+      const settings = nodes.value.get(nid)?.settings as NodeReadSettings | undefined
+      const fileName = settings?.file_name || settings?.received_file?.name || `node ${nid} input`
+      excludedFiles.push({ nodeId: nid, fileName })
+    }
+    return { flow, files, excludedFiles }
+  }
+
+  /**
+   * Export the current flow as a downloaded file (yaml/json). File output only —
+   * persisting to the library is saveToLibrary's job.
    * @param name - Optional name for the flow
    * @param format - 'yaml' or 'json' (default: 'yaml' for flowfile_core compatibility)
    */
-  function downloadFlowfile(name?: string, format: 'yaml' | 'json' = 'yaml') {
-    const flowName = name || `flow_${new Date().toISOString().slice(0, 10)}`
-    const data = exportToFlowfile(flowName)
+  async function exportFlowfile(name?: string, format: 'yaml' | 'json' = 'yaml') {
+    // A placeholder node's stub settings make a file the full app cannot open
+    // (core refuses the whole flow on a missing required field) — warn first.
+    const placeholderCount = Array.from(nodes.value.values())
+      .filter(n => isPlaceholderNodeDef(n.type, n.settings)).length
+    if (placeholderCount > 0) {
+      const proceed = typeof window !== 'undefined' && typeof window.confirm === 'function'
+        ? window.confirm(
+          `This flow contains ${placeholderCount} placeholder node(s) whose settings did not travel in the share link. ` +
+          'The exported file will NOT open in the full Flowfile app. Export anyway?'
+        )
+        : false
+      if (!proceed) return
+    }
+
+    // Flush any pending state from open explore_data panels so saved chart
+    // specs end up in the exported node settings.
+    await runBeforeExportHooks()
+
+    const flowName = name || currentFlowName.value || `flow_${new Date().toISOString().slice(0, 10)}`
+    // Only the download speaks core's dialect; in-browser saves keep this one.
+    const data = toCoreCompatibleFlow(exportToFlowfile(flowName))
+    currentFlowName.value = flowName
 
     let content: string
     let mimeType: string
@@ -2232,6 +3149,9 @@ result
     URL.revokeObjectURL(url)
   }
 
+  // Back-compat alias (older callers / the embeddable Canvas toolbar).
+  const downloadFlowfile = exportFlowfile
+
   /**
    * Validate flowfile data using Pydantic schemas (via Pyodide)
    * Returns validation result with any errors
@@ -2243,10 +3163,9 @@ result
     }
 
     try {
-      const dataJson = JSON.stringify(data)
       const result = await pyodideStore.runPythonWithResult(`
 import json
-data = json.loads('''${dataJson.replace(/'/g, "\\'")}''')
+data = json.loads(${toPythonJson(data)})
 result = validate_flowfile_data(data)
 result
 `)
@@ -2275,12 +3194,9 @@ result
   
       let data: FlowfileData
   
-      // Detect format by extension or content
       if (fileName.endsWith('.yaml') || fileName.endsWith('.yml')) {
-        // Parse as YAML
         data = yaml.load(text) as FlowfileData
       } else if (fileName.endsWith('.json') || fileName.endsWith('.flowfile')) {
-        // Parse as JSON
         data = JSON.parse(text) as FlowfileData
       } else {
         // Try to auto-detect: if it starts with '{', it's probably JSON
@@ -2297,20 +3213,21 @@ result
         throw new Error('Invalid flowfile format')
       }
   
-      // Optional: Validate using Pydantic schemas
       const validation = await validateFlowfileData(data)
       if (!validation.success) {
         console.warn('Flowfile validation warning:', validation.error)
         // Continue anyway - validation is advisory
       }
-  
-      // Clear IndexedDB file storage
+
       fileStorage.clearAll().catch(err => {
         console.error('Failed to clear IndexedDB:', err)
       })
   
       const imported = importFromFlowfile(data)
       if (imported) {
+        // Hydrate URL-sourced read nodes in the background; failures surface
+        // with a clear error if the node is run before its data arrives.
+        void refetchRemoteFiles()
         const missingFiles = getMissingFileNodes()
         return { success: true, missingFiles }
       }
@@ -2323,18 +3240,68 @@ result
 
   function getMissingFileNodes(): Array<{nodeId: number, fileName: string}> {
     const missing: Array<{nodeId: number, fileName: string}> = []
-    
+
     for (const [id, node] of nodes.value) {
       if (node.type === 'read') {
         const settings = node.settings as NodeReadSettings
         const fileName = settings.file_name || settings.received_file?.name
-        
-        if (fileName && !fileContents.value.has(id)) {
+
+        // URL-sourced nodes self-heal: refetchRemoteFiles re-downloads them.
+        if (fileName && !fileContents.value.has(id) && !getRemoteSourceUrl(id)) {
           missing.push({ nodeId: id, fileName })
         }
       }
     }
     return missing
+  }
+
+  /** Remote source URL of a read node, when its content was loaded from one
+   * (the settings panel stores the URL as received_file.path). */
+  function getRemoteSourceUrl(nodeId: number): string | null {
+    const node = nodes.value.get(nodeId)
+    if (!node || node.type !== 'read') return null
+    const path = (node.settings as NodeReadSettings).received_file?.path ?? ''
+    return path.startsWith('http://') || path.startsWith('https://') ? path : null
+  }
+
+  const remoteFetchesInFlight = new Map<number, Promise<void>>()
+
+  /**
+   * Re-download content for URL-sourced read nodes that have none loaded —
+   * a flow opened from a share link, file or library on another machine keeps
+   * its data sources in node settings. Concurrent calls per node are deduped.
+   * Returns the nodes that could not be fetched.
+   */
+  async function refetchRemoteFiles(
+    nodeIds?: number[]
+  ): Promise<Array<{ nodeId: number; fileName: string; error: string }>> {
+    const targets = (nodeIds ?? [...nodes.value.keys()]).filter(
+      (id) => !fileContents.value.has(id) && getRemoteSourceUrl(id) !== null
+    )
+    const failures: Array<{ nodeId: number; fileName: string; error: string }> = []
+    await Promise.all(
+      targets.map(async (id) => {
+        const url = getRemoteSourceUrl(id)!
+        let inFlight = remoteFetchesInFlight.get(id)
+        if (!inFlight) {
+          inFlight = fetchRemoteFile(url)
+            .then((remote) => setFileContent(id, remote.content))
+            .finally(() => remoteFetchesInFlight.delete(id))
+          remoteFetchesInFlight.set(id, inFlight)
+        }
+        try {
+          await inFlight
+        } catch (err) {
+          const settings = nodes.value.get(id)?.settings as NodeReadSettings | undefined
+          failures.push({
+            nodeId: id,
+            fileName: settings?.file_name || settings?.received_file?.name || `node ${id}`,
+            error: err instanceof Error ? err.message : String(err)
+          })
+        }
+      })
+    )
+    return failures
   }
 
 
@@ -2346,18 +3313,64 @@ result
     previewCache.value.clear()
     dirtyNodes.value.clear()
     selectedNodeId.value = null
+    showSettings.value = false
+    showTablePreview.value = false
     nodeIdCounter.value = 0
+    currentFlowName.value = 'Untitled Flow'
+    currentFlowId.value = null
     sessionStorage.removeItem(STORAGE_KEY)
 
-    // Clear IndexedDB file storage
     fileStorage.clearAll().catch(err => {
       console.error('Failed to clear IndexedDB:', err)
     })
+
+    // Reset the Pyodide engine so the next flow's (reused) node ids start clean.
+    if (pyodideStore.isReady) {
+      pyodideStore.runPython('clear_all()').catch(err => console.error('clear_all failed on clear:', err))
+    }
   }
 
-  function updateNodeFile(nodeId: number, fileName: string, content: string) {
-    fileContents.value.set(nodeId, content)
-    
+  /**
+   * Snapshot the full live flow state (graph + in-memory file contents + id
+   * counter + name). Used by the multi-flow tabs store to stash a tab before
+   * switching away. Lossless for in-session round-trips.
+   */
+  function captureSnapshot(): FlowStateSnapshot {
+    const fc: Record<number, FileContent> = {}
+    for (const [nid, content] of fileContents.value) fc[nid] = content
+    return {
+      name: currentFlowName.value,
+      flowId: currentFlowId.value,
+      snapshot: exportToFlowfile(currentFlowName.value),
+      fileContents: fc,
+      nodeIdCounter: nodeIdCounter.value
+    }
+  }
+
+  /**
+   * Restore a previously captured snapshot into the live flow. Replaces the
+   * current flow entirely (importFromFlowfile clears state + resets the Pyodide
+   * engine), then re-applies the snapshot's file contents and id counter. Does
+   * NOT re-execute — the graph + inputs are restored, results are cleared.
+   */
+  function loadFromSnapshot(snap: FlowStateSnapshot): boolean {
+    const ok = importFromFlowfile(snap.snapshot)
+    if (!ok) return false
+    for (const [nid, content] of Object.entries(snap.fileContents)) {
+      setFileContent(Number(nid), content)
+    }
+    nodeIdCounter.value = snap.nodeIdCounter
+    currentFlowName.value = snap.name
+    // importFromFlowfile cleared the id; restore the snapshot's library identity.
+    currentFlowId.value = snap.flowId ?? null
+    return true
+  }
+
+  function updateNodeFile(nodeId: number, fileName: string, content: string | FileContent) {
+    // Route through setFileContent so normalization, IndexedDB routing, and
+    // schema inference all apply (a raw Map.set bypassed them all).
+    setFileContent(nodeId, content)
+
     const node = nodes.value.get(nodeId)
     if (node && node.type === 'read') {
       const settings = node.settings as NodeReadSettings
@@ -2379,8 +3392,12 @@ result
     edges,
     nodeResults,
     selectedNodeId,
+    showSettings,
+    showTablePreview,
     isExecuting,
     executionError,
+    currentFlowName,
+    currentFlowId,
     fileContents,
 
     // Getters
@@ -2391,13 +3408,26 @@ result
     getNodeInputSchema,
     getLeftInputSchema,
     getRightInputSchema,
+    isInputSchemaResolved,
     getMissingFileNodes,
+    getRemoteSourceUrl,
+    refetchRemoteFiles,
+
+    // Placeholder / blocked-node state (share-link degraded flows)
+    isPlaceholderNode,
+    blockedNodes,
+    getBlockedInfo,
 
     // Actions
     generateNodeId,
     addNode,
+    copyNode,
+    pasteNode,
+    hasClipboard,
     updateNode,
     updateNodeSettings,
+    updateNodeSettingsSilent,
+    registerBeforeExportHook,
     updateNodeDescription,
     updateNodeReference,
     validateNodeReference,
@@ -2405,16 +3435,28 @@ result
     addEdge,
     removeEdge,
     setFileContent,
+    hasFileContent,
+    getFileContent,
+    getTextContent,
+    listExcelSheets,
+    getNodeResultArrow,
     externalDatasets,
     setExternalDatasets,
     getExternalDatasetNames,
     getExternalDatasetContent,
+    catalogDatasets,
+    addCatalogDataset,
+    getCatalogDatasetNames,
+    getCatalogDatasetContent,
+    removeCatalogDataset,
+    loadDatasetForVisual,
     selectNode,
     executeNode,
     executeFlow,
     clearFlow,
     cleanupOrphanedData,
     propagateSchemas,
+    executeNodeWithUpstream,
     setSourceNodeSchema,
     updateNodeFile, 
 
@@ -2432,6 +3474,11 @@ result
     // Import/Export (FlowfileData format)
     exportToFlowfile,
     importFromFlowfile,
+    captureSnapshot,
+    loadFromSnapshot,
+    saveToLibrary,
+    exportShareSnapshot,
+    exportFlowfile,
     downloadFlowfile,
     loadFlowfile,
     validateFlowfileData,

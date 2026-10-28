@@ -4,11 +4,13 @@ Covers namespaces (Unity Catalog-style hierarchy), flow registrations,
 run history, favorites and follows.
 """
 
-from datetime import datetime
-from typing import Any, Literal, TypedDict
+from datetime import datetime, timezone
+from typing import Annotated, Any, Literal, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
+from flowfile_core.flowfile.param_types import FlowParameter
+from flowfile_core.schemas.sharing_schema import AccessInfo
 from shared.delta_models import DeltaVersionCommit as DeltaVersionCommit  # noqa: F401
 
 # ==================== Namespace Schemas ====================
@@ -18,11 +20,16 @@ class NamespaceCreate(BaseModel):
     name: str
     parent_id: int | None = None
     description: str | None = None
+    # Per-catalog object storage (level-0 only).
+    storage_uri: str | None = None
+    storage_connection_name: str | None = None
 
 
 class NamespaceUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
+    storage_uri: str | None = None
+    storage_connection_name: str | None = None
 
 
 class NamespaceOut(BaseModel):
@@ -34,8 +41,21 @@ class NamespaceOut(BaseModel):
     owner_id: int
     created_at: datetime
     updated_at: datetime
+    # Per-catalog object storage (level-0 only; schemas inherit); None ⇒ local filesystem.
+    storage_uri: str | None = None
+    storage_connection_name: str | None = None
+    # How the requesting user accesses this resource (multi-user mode); None when
+    # unrestricted (admin / electron / internal) — the frontend shows no badge then.
+    access: AccessInfo | None = None
 
     model_config = {"from_attributes": True}
+
+
+class ScratchCleanupOut(BaseModel):
+    """Result of a bulk cleanup of a scratch schema's flow registrations."""
+
+    deleted: int
+    kept: int
 
 
 class NamespaceTree(NamespaceOut):
@@ -46,6 +66,7 @@ class NamespaceTree(NamespaceOut):
     artifacts: list["GlobalArtifactOut"] = Field(default_factory=list)
     tables: list["CatalogTableOut"] = Field(default_factory=list)
     visualizations: list["VisualizationOut"] = Field(default_factory=list)
+    notebooks: list["NotebookSummaryOut"] = Field(default_factory=list)
 
 
 # ==================== Flow Registration Schemas ====================
@@ -79,11 +100,48 @@ class FlowRegistrationOut(BaseModel):
     last_run_at: datetime | None = None
     last_run_success: bool | None = None
     file_exists: bool = True
+    is_api_compatible: bool = False
     artifact_count: int = 0
     tables_produced: list["CatalogTableSummary"] = Field(default_factory=list)
     tables_read: list["CatalogTableSummary"] = Field(default_factory=list)
+    access: AccessInfo | None = None
 
     model_config = {"from_attributes": True}
+
+
+class FlowInterfacePort(BaseModel):
+    """One flow_input or flow_output port of a registered flow."""
+
+    name: str
+    node_id: int
+
+
+class FlowInterfaceOut(BaseModel):
+    """The callable surface of a registered flow, consumed by the run_flow node UI."""
+
+    registration_id: int
+    inputs: list[FlowInterfacePort] = Field(default_factory=list)
+    outputs: list[FlowInterfacePort] = Field(default_factory=list)
+    parameters: list[FlowParameter] = Field(default_factory=list)
+    file_exists: bool = True
+
+
+FlowCodeFormat = Literal["yaml", "notebook", "flowframe", "polars"]
+
+
+class FlowCodeOut(BaseModel):
+    """A registered flow as text, read from its file without opening it in the editor.
+
+    ``format``: the flow file itself (``yaml``), the canvas notebook's cells as a ``# %%`` script
+    (``notebook``), or the Code pane's FlowFrame / Polars export. ``content`` is ``None`` with
+    ``file_exists=False`` when the file is gone, or with ``error`` set when the flow cannot be expressed.
+    """
+
+    registration_id: int
+    format: FlowCodeFormat
+    content: str | None = None
+    file_exists: bool = True
+    error: str | None = None
 
 
 class CatalogTableSummary(BaseModel):
@@ -182,6 +240,9 @@ class GlobalArtifactOut(BaseModel):
     owner_id: int | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    blob_exists: bool = True  # False when the backing blob is missing (filesystem backend only)
+    version_count: int = 1  # Active versions of this artifact (the tree lists only the latest)
+    access: AccessInfo | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -197,9 +258,53 @@ class CatalogTableCreate(BaseModel):
 
 
 class CatalogTableUpdate(BaseModel):
+    """Patch a catalog table's metadata.
+
+    ``prediction_table_id`` is tri-state: an explicitly-sent ``null`` clears the association,
+    an absent field keeps whatever is stored (the route distinguishes via ``model_fields_set``).
+    """
+
     name: str | None = None
     description: str | None = None
     namespace_id: int | None = None
+    prediction_table_id: int | None = None
+
+
+class CatalogTableFromDataCreate(BaseModel):
+    """Register a new catalog table from already-materialized data.
+
+    Used by the kernel runtime's ``flowfile_ctx.write_catalog_table`` to record
+    a table whose Delta directory the kernel has just written. Unlike
+    ``CatalogTableCreate``, no worker-side materialization is performed —
+    Core only persists the metadata record.
+    """
+
+    name: str
+    table_path: str
+    namespace_id: int | None = None
+    description: str | None = None
+    storage_format: str = "delta"
+    schema_columns: list[dict[str, str]] | None = None
+    row_count: int | None = None
+    column_count: int | None = None
+    size_bytes: int | None = None
+
+
+class CatalogTableRefreshRequest(BaseModel):
+    """Refresh the metadata of an existing catalog table after an in-place data write.
+
+    Used by the kernel runtime after append / upsert / update / delete writes
+    that mutate an existing Delta directory: the kernel sends back the new
+    row_count / size_bytes / schema so Core's record stays consistent.
+    """
+
+    table_path: str | None = None
+    storage_format: str | None = None
+    schema_columns: list[dict[str, str]] | None = None
+    row_count: int | None = None
+    column_count: int | None = None
+    size_bytes: int | None = None
+    description: str | None = None
 
 
 class VirtualFlowTableCreate(BaseModel):
@@ -240,6 +345,87 @@ class TableWriteMetadata(TypedDict, total=False):
     row_count: int
     column_count: int
     size_bytes: int
+    # Transport-only: popped by ``_handle_physical_table_write`` before ``**meta_kwargs`` reaches
+    # the (explicit-kwarg) catalog service methods, which would raise on an unexpected key.
+    scd2_metrics: dict[str, int]
+
+
+class Scd2TableConfig(BaseModel):
+    """SCD2 shape of a catalog table, persisted as JSON on ``CatalogTable.scd2_config``.
+
+    Written by the SCD2 writer, consumed by the catalog reader, the code generator and the UI.
+    This is the single source of truth for a table's SCD2 column names; no reader may take them
+    from a writer node's settings.
+    """
+
+    business_keys: list[str]
+    surrogate_key_column: str
+    valid_from_column: str
+    valid_to_column: str
+    is_current_column: str
+    # Resolved at write time: the columns actually compared for change detection.
+    compare_columns: list[str] = Field(default_factory=list)
+    full_snapshot: bool = False
+
+
+def scd2_system_columns_missing(cfg: dict, schema_columns: list[dict]) -> bool:
+    """True when *cfg* names a generated column that *schema_columns* no longer has.
+
+    Enforced at two points that own opposite halves of the decoding, so the predicate lives here
+    rather than in either caller.
+
+    Args:
+        cfg: A decoded ``Scd2TableConfig`` payload.
+        schema_columns: Decoded schema entries, each a ``{"name": ..., "dtype": ...}`` dict.
+    """
+    present = {c.get("name") for c in schema_columns if isinstance(c, dict)}
+    return any(
+        name and name not in present
+        for name in (
+            cfg.get("surrogate_key_column"),
+            cfg.get("valid_from_column"),
+            cfg.get("valid_to_column"),
+            cfg.get("is_current_column"),
+        )
+    )
+
+
+class CdcCursorOut(BaseModel):
+    """One consumer's position in a table's change feed.
+
+    ``pending_commits`` is ``current_version - last_version``, filled in by the route that knows
+    the live head; it is ``None`` when the head could not be read.
+    """
+
+    consumer_key: str
+    consumer_label: str | None = None
+    owner_id: int | None = None
+    last_version: int
+    last_commit_timestamp: datetime | None = None
+    table_path: str | None = None
+    pending_commits: int | None = None
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CdcStatusOut(BaseModel):
+    """A table's change-tracking state plus every consumer's position in its feed.
+
+    ``current_version`` is the live Delta head, or ``None`` when it could not be read.
+    """
+
+    cdc_enabled: bool = False
+    cdc_enabled_version: int | None = None
+    current_version: int | None = None
+    cursors: list[CdcCursorOut] = Field(default_factory=list)
+
+
+class CdcCursorResetRequest(BaseModel):
+    """Move one cursor to the live head, below the enablement floor, or an explicit version."""
+
+    consumer_key: str
+    to: int | Literal["now", "beginning"] = "now"
 
 
 class CatalogTableOut(BaseModel):
@@ -248,14 +434,23 @@ class CatalogTableOut(BaseModel):
     namespace_id: int | None = None
     namespace_name: str | None = None
     full_table_name: str | None = None
+    # Fully-qualified ``catalog.schema.table`` (full_table_name is only 2-part ``schema.table``).
+    qualified_name: str | None = None
     description: str | None = None
     owner_id: int
     file_exists: bool = True
+    # True when the table's data lives in object storage (the UI gates preview/history behind an explicit action).
+    is_remote_storage: bool = False
     is_favorite: bool = False
     schema_columns: list[ColumnSchema] = Field(default_factory=list)
     row_count: int | None = None
     column_count: int | None = None
     size_bytes: int | None = None
+    # Absolute path of the table's storage (Delta directory or parquet file).
+    # Needed by the kernel runtime so ``flowfile_ctx.read_catalog_table`` can
+    # open the Delta directory locally; tolerated as ``None`` for legacy rows
+    # or virtual tables that don't materialise to disk.
+    file_path: str | None = None
     source_registration_id: int | None = None
     source_registration_name: str | None = None
     source_run_id: int | None = None
@@ -268,8 +463,19 @@ class CatalogTableOut(BaseModel):
     sql_query: str | None = None
     polars_plan: str | None = None
     source_table_versions: str | None = None
+    partition_columns: list[str] | None = None
+    # Set only for tables maintained by an SCD2 write; NULL for every other table.
+    scd2: Scd2TableConfig | None = None
+    # Delta change data feed: whether the table is tracked, and the commit version tracking
+    # started at (the floor every change cursor is clamped to).
+    cdc_enabled: bool = False
+    cdc_enabled_version: int | None = None
+    # Sibling catalog table holding model predictions; the name is None when the target row is gone.
+    prediction_table_id: int | None = None
+    prediction_table_name: str | None = None
     created_at: datetime
     updated_at: datetime
+    access: AccessInfo | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -309,11 +515,109 @@ class CatalogTablePreview(BaseModel):
     total_rows: int = 0
 
 
+class CatalogTableMaterializeResult(BaseModel):
+    """Result of materialising a virtual table to a kernel-readable file."""
+
+    path: str
+    format: Literal["ipc"] = "ipc"
+    row_count: int
+    mtime: float
+
+
 class DeltaTableHistory(BaseModel):
     """Version history of a Delta table."""
 
     current_version: int
     history: list[DeltaVersionCommit] = Field(default_factory=list)
+
+
+# ==================== Delta Maintenance Schemas ====================
+
+
+class OptimizeTableRequest(BaseModel):
+    """Request to compact (and optionally Z-order) a Delta catalog table."""
+
+    z_order_columns: list[str] | None = None
+
+
+class OptimizeTableResponse(BaseModel):
+    """Result of an optimize operation: raw deltalake metrics + table size after."""
+
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    size_bytes: int | None = None
+
+
+class VacuumTableRequest(BaseModel):
+    """Request to vacuum tombstoned files from a Delta catalog table.
+
+    ``dry_run`` (default) only lists what would be removed. Retention below the
+    Delta 168h minimum is permitted (the retention guard is relaxed server-side).
+    """
+
+    retention_hours: int = Field(default=168, ge=0)
+    dry_run: bool = True
+    # Vacuuming past a change cursor's window breaks its next read; ``force`` acknowledges that.
+    force: bool = False
+
+
+class VacuumTableResponse(BaseModel):
+    """Result of a vacuum operation."""
+
+    dry_run: bool
+    files_removed: list[str] = Field(default_factory=list)
+    file_count: int = 0
+    size_bytes: int | None = None
+
+
+# ==================== Table Edit Schemas ====================
+
+
+class NewColumnSpec(BaseModel):
+    """A column added through the edit surface (e.g. a fresh label column)."""
+
+    # Delta rejects column names containing whitespace or ,;{}()= characters.
+    name: str = Field(min_length=1, max_length=255, pattern=r"^[^\s,;{}()=]+$")
+    dtype: Literal["String", "Int64", "Float64", "Boolean", "Date", "Datetime"]
+
+
+class CatalogTableEditsRequest(BaseModel):
+    """Row-level edits from the catalog edit grid, applied as keyed Delta merges.
+
+    ``upsert_rows`` carry full values for edited/added rows in ``upsert_columns``
+    order (key columns plus whichever columns actually changed — unsent columns
+    are preserved on matched rows). ``expected_version`` is the Delta version the
+    grid was loaded at; a moved table raises a 409 stale-write instead of
+    silently clobbering another writer.
+    """
+
+    key_columns: list[str] = Field(min_length=1, max_length=8)
+    expected_version: int | None = None
+    upsert_columns: list[str] | None = None
+    upsert_rows: list[list] | None = Field(default=None, max_length=10000)
+    new_columns: list[NewColumnSpec] = Field(default_factory=list, max_length=25)
+    delete_keys: list[list] | None = Field(default=None, max_length=10000)
+
+
+class CatalogTableEditsResponse(BaseModel):
+    """Result of applying table edits: refreshed table DTO plus write metrics."""
+
+    table: CatalogTableOut
+    rows_upserted: int = 0
+    rows_deleted: int = 0
+    new_version: int | None = None
+
+
+class CatalogTableKeyColumnRequest(BaseModel):
+    """Request to mint a sequential row-id column on a table with no natural key."""
+
+    column_name: str = Field(default="record_id", min_length=1, max_length=255, pattern=r"^[^\s,;{}()=]+$")
+    expected_version: int | None = None
+
+
+class CatalogTableKeyColumnResponse(BaseModel):
+    table: CatalogTableOut
+    column_name: str
+    new_version: int | None = None
 
 
 # ==================== SQL Query Schemas ====================
@@ -383,6 +687,16 @@ class VisualizationUpdate(BaseModel):
     sql_query: str | None = None
     catalog_table_id: int | None = None
     thumbnail_data_url: str | None = None
+    # Optimistic-concurrency token: echo the ``updated_at`` from the last GET/PUT.
+    expected_updated_at: datetime | None = None
+
+    @field_validator("expected_updated_at")
+    @classmethod
+    def _normalize_expected_updated_at(cls, v: datetime | None) -> datetime | None:
+        """Normalize tz-aware tokens to naive UTC — the DB returns naive UTC."""
+        if v is not None and v.tzinfo is not None:
+            return v.astimezone(timezone.utc).replace(tzinfo=None)
+        return v
 
 
 class VisualizationOut(BaseModel):
@@ -407,6 +721,7 @@ class VisualizationOut(BaseModel):
     table_full_name: str | None = None
     table_type: str | None = None
     namespace_name: str | None = None
+    access: AccessInfo | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -490,6 +805,31 @@ class ColumnStatsResponse(BaseModel):
 # ==================== Dashboard Schemas ====================
 
 
+class DashboardKpi(BaseModel):
+    """Headline-number config for a ``type == "kpi"`` tile.
+
+    The value is one aggregate of ``field`` over the tile's visualization
+    source (``DashboardTile.viz_id``) with the dashboard filters applied; the
+    chart's own Graphic Walker filters are not applied. ``field`` None with
+    ``agg == "count"`` counts rows. ``comparison`` "target" compares against
+    ``target``; "previous_period" compares against the same aggregate over
+    the targeting dashboard date_range filter shifted back by its own length.
+    ``value_size`` fixes the number's font size ("auto" fits it to the tile).
+    """
+
+    field: str | None = None
+    agg: Literal["sum", "mean", "median", "min", "max", "count", "distinctCount"] = "sum"
+    label: str | None = Field(default=None, max_length=120)
+    prefix: str | None = Field(default=None, max_length=8)
+    suffix: str | None = Field(default=None, max_length=16)
+    decimals: int | None = Field(default=None, ge=0, le=6)
+    compact: bool = True
+    comparison: Literal["none", "target", "previous_period"] = "none"
+    target: float | None = None
+    higher_is_better: bool = True
+    value_size: Literal["auto", "sm", "md", "lg", "xl"] = "auto"
+
+
 class DashboardTile(BaseModel):
     """One tile on a dashboard canvas.
 
@@ -497,14 +837,25 @@ class DashboardTile(BaseModel):
     can preserve component state on layout updates. ``type`` discriminates
     tile kinds: ``"viz"`` renders a saved visualization (uses ``viz_id`` /
     ``chart_index``); ``"text"`` renders user-authored Markdown from
-    ``text_md``. Type-irrelevant fields are simply ignored.
+    ``text_md``; ``"separator"`` draws a rule to break the page into
+    sections (``orientation``, ``thickness`` in px and ``line_color`` style
+    it); ``"kpi"`` shows one headline aggregate of the ``viz_id``
+    visualization's source configured by ``kpi`` (``chart_index`` is ignored;
+    ``kpi`` None is an unconfigured placeholder). Type-irrelevant fields are
+    simply ignored.
     """
 
     id: str
-    type: Literal["viz", "text"] = "viz"
+    type: Literal["viz", "text", "separator", "kpi"] = "viz"
     viz_id: int | None = None
     chart_index: int = 0
     text_md: str | None = None
+    bg_color: str | None = None
+    text_color: str | None = None
+    orientation: Literal["horizontal", "vertical"] = "horizontal"
+    thickness: int | None = Field(default=None, ge=1, le=24)
+    line_color: str | None = None
+    kpi: DashboardKpi | None = None
     x: int
     y: int
     w: int
@@ -512,9 +863,15 @@ class DashboardTile(BaseModel):
 
 
 class DashboardGrid(BaseModel):
-    cols: int = 12
+    """Grid resolution a layout was placed on.
+
+    Version 1 layouts used 12 columns; the frontend scales them onto the
+    current 48-column grid on load and saves them back as version 2.
+    """
+
+    cols: int = 48
     row_height: int = 40
-    version: int = 1
+    version: int = 2
 
 
 class DashboardFilter(BaseModel):
@@ -525,6 +882,12 @@ class DashboardFilter(BaseModel):
     targets, and the field picker is populated from that table's
     ``schema_columns``. Filters without ``datasource_id`` are legacy /
     "untied" — they apply on field-name match alone.
+
+    ``scope`` widens a bound filter beyond its own table: ``"datasource"``
+    (default) applies only to tiles reading from ``datasource_id``, while
+    ``"all"`` applies to every targeted tile whose data has a column named
+    ``field_name`` of a compatible type — the datasource then only supplies
+    the value list.
 
     ``state`` carries widget-specific values (selected categorical values,
     a date range, a numeric range). The frontend injects these as a
@@ -540,6 +903,7 @@ class DashboardFilter(BaseModel):
     target: Literal["all", "tiles"] = "all"
     target_tile_ids: list[str] = Field(default_factory=list)
     datasource_id: int | None = None
+    scope: Literal["datasource", "all"] = "datasource"
 
 
 class DashboardLayout(BaseModel):
@@ -560,6 +924,8 @@ class DashboardUpdate(BaseModel):
     description: str | None = None
     namespace_id: int | None = None
     layout: DashboardLayout | None = None
+    # Optimistic-concurrency token: echo the ``layout_version`` from the last GET/PUT.
+    expected_layout_version: int | None = None
 
 
 class DashboardOut(BaseModel):
@@ -573,6 +939,7 @@ class DashboardOut(BaseModel):
     created_by: int | None = None
     created_at: datetime
     updated_at: datetime
+    access: AccessInfo | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -594,8 +961,10 @@ class TableFavoriteOut(BaseModel):
 
 class FlowScheduleCreate(BaseModel):
     registration_id: int
-    schedule_type: Literal["interval", "table_trigger", "table_set_trigger"]
+    schedule_type: Literal["interval", "cron", "table_trigger", "table_set_trigger"]
     interval_seconds: int | None = None
+    cron_expression: str | None = None
+    cron_timezone: str | None = None
     trigger_table_id: int | None = None
     trigger_table_ids: list[int] | None = None
     enabled: bool = True
@@ -606,6 +975,8 @@ class FlowScheduleCreate(BaseModel):
 class FlowScheduleUpdate(BaseModel):
     enabled: bool | None = None
     interval_seconds: int | None = None
+    cron_expression: str | None = None
+    cron_timezone: str | None = None
     name: str | None = None
     description: str | None = None
 
@@ -617,8 +988,10 @@ class FlowScheduleOut(BaseModel):
     enabled: bool
     name: str | None = None
     description: str | None = None
-    schedule_type: Literal["interval", "table_trigger", "table_set_trigger"]
+    schedule_type: Literal["interval", "cron", "table_trigger", "table_set_trigger"]
     interval_seconds: int | None = None
+    cron_expression: str | None = None
+    cron_timezone: str | None = None
     trigger_table_id: int | None = None
     trigger_table_name: str | None = None
     trigger_namespace_id: int | None = None
@@ -635,6 +1008,20 @@ class FlowScheduleOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class CronValidationRequest(BaseModel):
+    cron_expression: str | None = None
+    cron_timezone: str | None = None
+
+
+class CronValidationResult(BaseModel):
+    """Result of validating a cron expression (+ optional timezone) against the
+    same croniter rules the create/update path enforces. ``valid`` drives the
+    builder's submit gate; ``error`` is the backend's message when invalid."""
+
+    valid: bool
+    error: str | None = None
+
+
 # ==================== Active Run Schemas ====================
 
 
@@ -648,6 +1035,7 @@ class ActiveFlowRun(BaseModel):
     nodes_completed: int = 0
     number_of_nodes: int = 0
     run_type: Literal["in_designer_run", "scheduled", "manual", "on_demand"] = "in_designer_run"
+    schedule_id: int | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -680,6 +1068,201 @@ class SchedulerStatusOut(BaseModel):
     started_at: datetime | None = None
     heartbeat_at: datetime | None = None
     is_embedded: bool | None = None
+
+
+class CatalogOverview(BaseModel):
+    """Everything the catalog screen loads on mount, served from one DB session."""
+
+    stats: CatalogStats
+    tree: list[NamespaceTree] = Field(default_factory=list)
+    flows: list[FlowRegistrationOut] = Field(default_factory=list)
+    tables: list[CatalogTableOut] = Field(default_factory=list)
+    favorites: list[FlowRegistrationOut] = Field(default_factory=list)
+    schedules: list[FlowScheduleOut] = Field(default_factory=list)
+    active_runs: list[ActiveFlowRun] = Field(default_factory=list)
+    runs: PaginatedFlowRuns
+    scheduler: SchedulerStatusOut
+    default_namespace_id: int | None = None
+
+
+NotebookCellType = Literal["python", "sql", "markdown"]
+
+
+class NotebookCellModel(BaseModel):
+    """A single notebook cell. ``source`` holds code / SQL / markdown text;
+    ``metadata`` carries per-cell extras (e.g. SQL ``max_rows``, collapsed flag).
+    Transient execution output is never persisted here — it lives client-side."""
+
+    id: str
+    type: NotebookCellType
+    source: str = ""
+    metadata: dict = Field(default_factory=dict)
+
+
+class NotebookCreate(BaseModel):
+    name: str
+    namespace_id: int | None = None
+    description: str | None = None
+    cells: list[NotebookCellModel] = Field(default_factory=list)
+    default_kernel_id: str | None = None
+
+
+class NotebookUpdate(BaseModel):
+    """Full-document PUT. Only provided fields are applied (``model_fields_set``)."""
+
+    name: str | None = None
+    namespace_id: int | None = None
+    description: str | None = None
+    cells: list[NotebookCellModel] | None = None
+    default_kernel_id: str | None = None
+
+
+class NotebookOut(BaseModel):
+    id: int
+    name: str
+    description: str | None = None
+    namespace_id: int | None = None
+    cells: list[NotebookCellModel] = Field(default_factory=list)
+    default_kernel_id: str | None = None
+    owner_id: int
+    created_at: datetime
+    updated_at: datetime
+    namespace_name: str | None = None
+    access: AccessInfo | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NotebookSummaryOut(BaseModel):
+    """Lightweight listing DTO — omits ``cells`` for the notebook selector."""
+
+    id: int
+    name: str
+    description: str | None = None
+    namespace_id: int | None = None
+    default_kernel_id: str | None = None
+    owner_id: int
+    created_at: datetime
+    updated_at: datetime
+    namespace_name: str | None = None
+    access: AccessInfo | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ==================== Notification Schemas ====================
+
+NotificationChannelType = Literal["slack", "discord", "teams", "generic"]
+
+# Free-form name, trimmed so a whitespace-only name is rejected rather than stored.
+NotificationName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+
+
+class NotificationChannelCreate(BaseModel):
+    name: NotificationName
+    channel_type: NotificationChannelType
+    webhook_url: str
+    enabled: bool = True
+
+
+class NotificationChannelUpdate(BaseModel):
+    """Partial update — ``None`` means "leave unchanged" for every field."""
+
+    name: NotificationName | None = None
+    channel_type: NotificationChannelType | None = None
+    webhook_url: str | None = None
+    enabled: bool | None = None
+
+
+class NotificationChannelOut(BaseModel):
+    """A channel as the API returns it.
+
+    The webhook URL is a credential (anyone holding it can post to the workspace),
+    so it is *never* returned — only ``webhook_url_preview``, a masked form that is
+    enough for a human to tell two channels apart.
+    """
+
+    id: int
+    owner_id: int
+    name: str
+    channel_type: str
+    webhook_url_preview: str
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class NotificationRuleCreate(BaseModel):
+    """Scope narrows in order: ``schedule_id`` ⇒ that schedule; else ``registration_id``
+    ⇒ that flow; else every run the owner triggers. The two scope keys are mutually
+    exclusive — setting both is rejected."""
+
+    channel_id: int
+    registration_id: int | None = None
+    schedule_id: int | None = None
+    on_failure: bool = True
+    on_success: bool = False
+    on_recovery: bool = True
+    enabled: bool = True
+
+
+class NotificationRuleUpdate(BaseModel):
+    """Partial update. The rule's scope (registration/schedule) is immutable — a rule
+    for a different flow is a different rule."""
+
+    channel_id: int | None = None
+    on_failure: bool | None = None
+    on_success: bool | None = None
+    on_recovery: bool | None = None
+    enabled: bool | None = None
+
+
+class NotificationRuleOut(BaseModel):
+    id: int
+    owner_id: int
+    channel_id: int
+    # Resolved for display; None when the referent no longer exists.
+    channel_name: str | None = None
+    channel_type: str | None = None
+    registration_id: int | None = None
+    flow_name: str | None = None
+    schedule_id: int | None = None
+    schedule_name: str | None = None
+    on_failure: bool
+    on_success: bool
+    on_recovery: bool
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class NotificationTestResult(BaseModel):
+    """Outcome of a webhook test. A delivery failure is a result, not an HTTP error."""
+
+    ok: bool
+    error: str | None = None
+
+
+class NotificationChannelTestRequest(BaseModel):
+    """Pre-save test: the URL is still plaintext in the request, nothing is stored."""
+
+    channel_type: NotificationChannelType
+    webhook_url: str
+
+
+class NotificationHistoryItem(BaseModel):
+    """One outbox row, flattened for the history table."""
+
+    id: int
+    event_type: str
+    run_id: int | None = None
+    flow_name: str | None = None
+    channel_name: str | None = None
+    status: str
+    attempts: int
+    last_error: str | None = None
+    created_at: datetime
+    sent_at: datetime | None = None
 
 
 # Rebuild forward-referenced models

@@ -45,11 +45,22 @@
         v-for="d in filtered"
         :key="d.id"
         :dashboard="d"
+        :thumbnails="thumbnails"
         @view="onView(d)"
         @edit="onEdit(d)"
         @delete="onDelete(d)"
+        @share="onShare(d)"
       />
     </div>
+
+    <ShareDialog
+      v-if="shareDashboard"
+      v-model="showShareDialog"
+      resource-type="dashboard"
+      :resource-id="shareDashboard.id"
+      :resource-name="shareDashboard.name"
+      :can-manage-grants="canManageGrants(shareDashboard)"
+    />
   </div>
 </template>
 
@@ -59,12 +70,32 @@ import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Plus, Search } from "@element-plus/icons-vue";
 import { useDashboardsStore } from "../../stores/dashboards-store";
+import { useCatalogStore } from "../../stores/catalog-store";
 import DashboardCard from "./DashboardCard.vue";
+import ShareDialog from "../../components/sharing/ShareDialog.vue";
+import { useResourceSharing } from "../../composables/useResourceSharing";
 import type { Dashboard } from "../../types";
 
 const router = useRouter();
 const store = useDashboardsStore();
+const catalogStore = useCatalogStore();
 const search = ref("");
+
+const thumbnails = computed<Record<number, string>>(() => {
+  const out: Record<number, string> = {};
+  for (const v of catalogStore.visualizationLibrary) {
+    if (v.thumbnail_data_url) out[v.id] = v.thumbnail_data_url;
+  }
+  return out;
+});
+
+const { canManageGrants } = useResourceSharing();
+const shareDashboard = ref<Dashboard | null>(null);
+const showShareDialog = ref(false);
+const onShare = (d: Dashboard) => {
+  shareDashboard.value = d;
+  showShareDialog.value = true;
+};
 
 const filtered = computed(() => {
   const q = search.value.trim().toLowerCase();
@@ -81,6 +112,10 @@ onMounted(() => {
   store.loadLibrary().catch(() => {
     ElMessage.error(store.error ?? "Failed to load dashboards");
   });
+  // Thumbnails are a nicety: a failed library load just leaves the tinted fallback.
+  if (!catalogStore.visualizationLibrary.length) {
+    catalogStore.loadVisualizationLibrary().catch(() => undefined);
+  }
 });
 
 const onNew = () => {

@@ -2,6 +2,9 @@
 
 Automate flow execution with schedules — run flows on a timer or trigger them when catalog tables are refreshed.
 
+!!! info "Not in Flowfile Lite"
+    The scheduler requires the full desktop/server build. The browser-only [Flowfile Lite](../../deployment/lite.md) edition cannot schedule or automate flows.
+
 ![Schedules overview](../../../assets/images/guides/schedules/schedules-overview.png)
 
 *The Schedules tab with scheduler status, summary cards, and schedule list*
@@ -12,13 +15,15 @@ Automate flow execution with schedules — run flows on a timer or trigger them 
 
 The scheduling system allows you to automate registered flows without manual intervention. Schedules are managed from the **Schedules** tab in the Catalog, or from individual flow detail panels.
 
-Three schedule types are supported:
+The create-schedule dialog offers three kinds:
 
-| Type | Description |
+| Kind | Description |
 |------|-------------|
-| **Interval** | Run a flow every N minutes (minimum 1 minute) |
-| **Table Trigger** | Run a flow when a specific catalog table is refreshed |
-| **Table Set Trigger** | Run a flow when **all** tables in a set have been refreshed |
+| **On a schedule** | Run a flow on a cron expression — the builder covers everything from "every minute" (the minimum) to complex calendars |
+| **When a table updates** | Run a flow when a specific catalog table is refreshed |
+| **When several tables update** | Run a flow when **all** tables in a set have been refreshed |
+
+(Legacy interval-based schedules created by older versions still run and show read-only in the detail panel.)
 
 !!! info "Scheduler must be running"
     Schedules are only active while the scheduler process is running. See [Scheduler Status](#scheduler-status) for details on how the scheduler operates.
@@ -91,6 +96,9 @@ Each schedule in the list provides inline actions:
 !!! warning "One active run per flow"
     A flow can only have one active run at a time. If a flow is already running, new triggers (both scheduled and manual) are skipped until the current run completes.
 
+!!! tip "Get notified when a scheduled run fails"
+    The create-schedule dialog has a **Notify on failure** option, and every schedule's detail panel has a **Notifications** section. See [Alerts & Notifications](alerts.md).
+
 ---
 
 ## Flow Detail Panel
@@ -111,7 +119,9 @@ The flow detail panel includes:
 
 ### Run Logs
 
-Scheduled and manual runs write their output to log files. When viewing a run's detail panel, click **View log** to see the full execution log. Logs are stored at `~/.flowfile/logs/scheduled_run_{run_id}.log`.
+Scheduled, manual, and on-demand ("Run now" from a schedule) runs write their output to log files. When viewing a run's detail panel, click **View log** to see the full execution log. Logs are stored under the internal storage directory at `logs/scheduled_run_{run_id}.log` — `~/.flowfile/logs/…` on desktop/local installs, and `/app/internal_storage/logs/…` in the shipped Docker image.
+
+Logs are kept for 30 days by default. Set `FLOWFILE_RUN_LOG_RETENTION_DAYS` to change the window, or to `0` to keep logs indefinitely.
 
 ---
 
@@ -135,12 +145,14 @@ When running Flowfile as a desktop app or via `pip install flowfile`, the schedu
 
 ### Standalone Mode
 
-Run the scheduler as an independent background service:
+Run the scheduler as an independent background service using its own console script (installed by `pip install flowfile`):
 
 ```bash
 pip install flowfile
-flowfile run flowfile_scheduler
+flowfile_scheduler
 ```
+
+Pass `--once` to run a single poll cycle and exit instead of running continuously. `flowfile_scheduler` is a separate console script — it is not a `flowfile run` subcommand.
 
 In standalone mode:
 
@@ -164,6 +176,7 @@ See [Docker Reference](../../deployment/docker.md) for full configuration.
 
 ## Related Documentation
 
+- [Alerts & Notifications](alerts.md) — Get a Slack/Teams/webhook message when a scheduled run fails or recovers
 - [Catalog](index.md) — Managing flows, tables, and run history
 - [Virtual Tables](virtual-tables.md) — Non-materialized tables that can trigger schedules
 - [Output Nodes](../nodes/output.md#catalog-writer) — Writing data to catalog tables (triggers table-based schedules)

@@ -5,15 +5,101 @@ This module defines the Pydantic models for tracking flow graph history,
 enabling users to undo and redo changes to their flow graphs.
 """
 
+import hashlib
+import json
 import pickle
 import zlib
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretBytes, SecretStr
 
-if TYPE_CHECKING:
-    pass
+# Undo/redo covers the graph only; flow-level settings and identity are never part of a step.
+IN_SCOPE_KEYS = ("nodes", "groups", "comments")
+_PERSISTED_SETTINGS_EXCLUDE = ("source_registration_id",)
+
+
+def _canonical(value: Any) -> Any:
+    """Normalize a snapshot value into JSON-safe, order-stable primitives for hashing."""
+    if isinstance(value, dict):
+        return {str(key): _canonical(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_canonical(item) for item in value]
+    if value is None or (isinstance(value, str | int | float | bool) and not isinstance(value, Enum)):
+        return value
+    return _canonical(_json_default(value))
+
+
+def _json_default(value: Any) -> Any:
+    """Encode what ``json`` cannot natively (the C encoder calls this only for such leaves)."""
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    if isinstance(value, SecretStr):
+        return value.get_secret_value()
+    if isinstance(value, SecretBytes):
+        return value.get_secret_value().hex()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, set | frozenset):
+        return sorted(value, key=repr)
+    if isinstance(value, bytes):
+        return value.hex()
+    return str(value)
+
+
+def _digest(value: Any) -> int:
+    try:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=_json_default)
+    except TypeError:
+        # Non-string (or mixed-type) dict keys: normalize in Python first.
+        encoded = json.dumps(_canonical(value), sort_keys=True, separators=(",", ":"), default=str)
+    return int.from_bytes(hashlib.blake2b(encoded.encode("ascii"), digest_size=16).digest(), "big")
+
+
+def _in_scope(snapshot_dict: dict) -> dict:
+    return {
+        key: sorted(snapshot_dict.get(key) or [], key=lambda item: (item.get("id") is None, item.get("id") or 0))
+        for key in IN_SCOPE_KEYS
+    }
+
+
+def in_scope_hash(snapshot_dict: dict) -> int:
+    """Hash of everything undo/redo restores: every field of every node, group and comment."""
+    return _digest(_in_scope(snapshot_dict))
+
+
+def persisted_hash(snapshot_dict: dict, graph_hash: int | None = None) -> int:
+    """Hash of what a save writes, minus machine-local fields; the dirty flag compares these.
+
+    ``graph_hash`` (the snapshot's :func:`in_scope_hash`) is reused when the caller already has it.
+    """
+    settings = {
+        key: value
+        for key, value in (snapshot_dict.get("flowfile_settings") or {}).items()
+        if key not in _PERSISTED_SETTINGS_EXCLUDE
+    }
+    if graph_hash is None:
+        graph_hash = in_scope_hash(snapshot_dict)
+    return _digest([graph_hash, settings])
+
+
+class HistorySnapshot:
+    """One capture of a flow, hashed once.
+
+    ``pickled`` is a detached copy (later in-place edits of live settings cannot leak into
+    it) that doubles as the undo-entry payload; it is None when only the hashes are needed.
+    """
+
+    __slots__ = ("graph_hash", "persisted_hash", "pickled")
+
+    def __init__(self, snapshot_dict: dict, keep_payload: bool = True):
+        self.pickled = pickle.dumps(snapshot_dict, protocol=pickle.HIGHEST_PROTOCOL) if keep_payload else None
+        self.graph_hash = in_scope_hash(snapshot_dict)
+        self.persisted_hash = persisted_hash(snapshot_dict, self.graph_hash)
+
+    def load(self) -> dict:
+        """A fresh copy of the captured snapshot dict."""
+        return pickle.loads(self.pickled)
 
 
 class HistoryActionType(str, Enum):
@@ -22,12 +108,20 @@ class HistoryActionType(str, Enum):
     ADD_NODE = "add_node"
     DELETE_NODE = "delete_node"
     MOVE_NODE = "move_node"
+    MOVE_NODES = "move_nodes"
     ADD_CONNECTION = "add_connection"
     DELETE_CONNECTION = "delete_connection"
     UPDATE_SETTINGS = "update_settings"
     COPY_NODE = "copy_node"
     PASTE_NODES = "paste_nodes"
     APPLY_LAYOUT = "apply_layout"
+    CREATE_GROUP = "create_group"
+    UPDATE_GROUP = "update_group"
+    DELETE_GROUP = "delete_group"
+    UPDATE_GROUP_MEMBERSHIP = "update_group_membership"
+    CREATE_COMMENT = "create_comment"
+    UPDATE_COMMENT = "update_comment"
+    DELETE_COMMENT = "delete_comment"
     BATCH = "batch"
 
 
@@ -56,57 +150,23 @@ class CompressedSnapshot:
             snapshot_dict: The flow state dictionary to compress.
             compression_level: Compression level 1-9 (higher = smaller but slower).
         """
-        # Pickle and compress the snapshot
         pickled = pickle.dumps(snapshot_dict, protocol=pickle.HIGHEST_PROTOCOL)
         self._compressed_data = zlib.compress(pickled, level=compression_level)
 
-        # Pre-compute hash for fast comparison
         self._hash = self._compute_hash(snapshot_dict)
 
     @classmethod
-    def compute_hash(cls, snapshot_dict: dict) -> int:
-        """Public wrapper around :meth:`_compute_hash`.
-
-        Allows callers outside this class to compute a snapshot hash without
-        reaching into a private method.
-        """
-        return cls._compute_hash(snapshot_dict)
+    def from_pickled(cls, pickled: bytes, snapshot_hash: int, compression_level: int = 6) -> "CompressedSnapshot":
+        """Build from an already pickled snapshot and its known hash (no second pickle or hash pass)."""
+        snapshot = cls.__new__(cls)
+        snapshot._compressed_data = zlib.compress(pickled, level=compression_level)
+        snapshot._hash = snapshot_hash
+        return snapshot
 
     @staticmethod
     def _compute_hash(snapshot_dict: dict) -> int:
-        """Compute a fast structural hash of the snapshot."""
-        nodes = snapshot_dict.get("nodes", [])
-
-        # Build tuple of node signatures for hashing
-        node_signatures = []
-        for n in sorted(nodes, key=lambda x: x.get("id", 0)):
-            sig = (
-                n.get("id"),
-                n.get("type"),
-                tuple(n.get("input_ids") or []),
-                n.get("left_input_id"),
-                n.get("right_input_id"),
-                tuple(n.get("outputs") or []),
-                n.get("x_position"),
-                n.get("y_position"),
-                # Include a hash of setting_input for change detection
-                hash(str(n.get("setting_input"))) if n.get("setting_input") else None,
-            )
-            node_signatures.append(sig)
-
-        settings = snapshot_dict.get("flowfile_settings", {})
-        # Convert to a stable string so lists/dicts inside settings (e.g. parameters) are hashable
-        settings_tuple = (
-            str(sorted(((k, str(v)) for k, v in settings.items()))) if isinstance(settings, dict) else str(settings)
-        )
-
-        return hash(
-            (
-                snapshot_dict.get("flowfile_id"),
-                settings_tuple,
-                tuple(node_signatures),
-            )
-        )
+        """Hash of the in-scope snapshot (see :func:`in_scope_hash`)."""
+        return in_scope_hash(snapshot_dict)
 
     def decompress(self) -> dict:
         """Decompress and return the original snapshot dictionary."""
@@ -156,26 +216,17 @@ class HistoryEntry:
         self.node_id = node_id
 
     @classmethod
-    def from_dict(
+    def from_snapshot(
         cls,
-        snapshot_dict: dict,
+        snapshot: HistorySnapshot,
         action_type: HistoryActionType,
         description: str,
         timestamp: float,
         node_id: int | None = None,
         compression_level: int = 6,
     ) -> "HistoryEntry":
-        """Create a HistoryEntry from a snapshot dictionary.
-
-        Args:
-            snapshot_dict: The flow state dictionary.
-            action_type: The type of action.
-            description: Human-readable description.
-            timestamp: Unix timestamp.
-            node_id: Optional affected node ID.
-            compression_level: Compression level 1-9.
-        """
-        compressed = CompressedSnapshot(snapshot_dict, compression_level)
+        """Create a HistoryEntry from a :class:`HistorySnapshot`, reusing its pickle and hash."""
+        compressed = CompressedSnapshot.from_pickled(snapshot.pickled, snapshot.graph_hash, compression_level)
         return cls(compressed, action_type, description, timestamp, node_id)
 
     def get_snapshot(self) -> dict:
@@ -205,6 +256,11 @@ class HistoryState(BaseModel):
     redo_description: str | None = Field(default=None, description="Description of the action that would be redone")
     undo_count: int = Field(default=0, description="Number of available undo steps")
     redo_count: int = Field(default=0, description="Number of available redo steps")
+    flow_id: int | None = Field(default=None, description="The flow this history belongs to")
+    revision: int = Field(
+        default=0,
+        description="Monotonic flow change counter; moves on every mutation, undo/redo, run start/end and save",
+    )
 
 
 class UndoRedoResult(BaseModel):
@@ -213,6 +269,7 @@ class UndoRedoResult(BaseModel):
     success: bool = Field(..., description="Whether the operation succeeded")
     action_description: str | None = Field(default=None, description="Description of the action that was undone/redone")
     error_message: str | None = Field(default=None, description="Error message if the operation failed")
+    history: HistoryState | None = Field(default=None, description="History state after the operation")
 
 
 class OperationResponse(BaseModel):
@@ -224,3 +281,7 @@ class OperationResponse(BaseModel):
     success: bool = Field(default=True, description="Whether the operation succeeded")
     message: str | None = Field(default=None, description="Optional message")
     history: HistoryState = Field(..., description="Current history state after the operation")
+    settings_fingerprint: str | None = Field(
+        default=None,
+        description="After a save of one node's settings: its fingerprint now, the next save's expectation",
+    )

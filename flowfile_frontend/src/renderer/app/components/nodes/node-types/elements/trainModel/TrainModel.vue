@@ -37,7 +37,7 @@
         <el-row class="setting-row">
           <el-col :span="10" class="grid-content">Save to catalog</el-col>
           <el-col :span="14" class="grid-content">
-            <el-switch v-model="nodeTrainModel.train_input.publish_to_catalog" />
+            <el-switch v-model="nodeTrainModel.train_input.publish_to_catalog" size="small" />
           </el-col>
         </el-row>
 
@@ -62,6 +62,7 @@
                 clearable
                 filterable
                 :loading="loadingNamespaces"
+                @change="onNamespaceChange"
               >
                 <el-option label="Default (flow's namespace)" :value="null" />
                 <el-option
@@ -139,8 +140,10 @@ import type {
   NamespaceOption,
 } from "../../../../../types/node.types";
 import type { NodeData } from "../../../baseNode/nodeInterfaces";
+import { SYSTEM_NAMESPACE_NAMES } from "../../../../../types";
 import { useNodeStore } from "../../../../../stores/node-store";
 import { useNodeSettings } from "../../../../../composables/useNodeSettings";
+import { useWritableNamespaces } from "../../../../../composables/useWritableNamespaces";
 import GenericNodeSettings from "../../../baseNode/genericNodeSettings.vue";
 import DynamicParams from "./DynamicParams.vue";
 
@@ -151,6 +154,7 @@ const nodeData = ref<NodeData | null>(null);
 const algorithms = ref<MLAlgorithmSpec[]>([]);
 const namespaceTree = ref<CatalogNamespaceTree[]>([]);
 const loadingNamespaces = ref(false);
+const { isWritableNamespace } = useWritableNamespaces();
 
 // Walk the catalog tree and surface every selectable schema as
 // "Catalog > Schema". We skip the root catalog nodes themselves because
@@ -158,15 +162,30 @@ const loadingNamespaces = ref(false);
 function flattenNamespaceTree(
   tree: CatalogNamespaceTree[],
   parentLabel: string | null,
+  parentAccess: CatalogNamespaceTree["access"] = null,
 ): NamespaceOption[] {
   const out: NamespaceOption[] = [];
   for (const node of tree) {
     const label = parentLabel ? `${parentLabel} > ${node.name}` : node.name;
+    // The backend stamps direct grants only; an unstamped schema inherits its
+    // catalog's grant level.
+    const effectiveAccess = node.access ?? parentAccess;
     if (node.level >= 1) {
-      out.push({ id: node.id, label });
+      // Hide system-managed schemas and read-only ("use" grant) schemas so only
+      // writable namespaces are offered as a publish target.
+      if (
+        !(parentLabel === "General" && SYSTEM_NAMESPACE_NAMES.has(node.name)) &&
+        isWritableNamespace({ access: effectiveAccess })
+      ) {
+        out.push({
+          id: node.id,
+          label,
+          full: parentLabel ? `${parentLabel}.${node.name}` : node.name,
+        });
+      }
     }
     if (node.children && node.children.length) {
-      out.push(...flattenNamespaceTree(node.children, label));
+      out.push(...flattenNamespaceTree(node.children, label, effectiveAccess));
     }
   }
   return out;
@@ -175,6 +194,22 @@ function flattenNamespaceTree(
 const namespaceOptions = computed(() =>
   flattenNamespaceTree(namespaceTree.value, null).sort((a, b) => a.label.localeCompare(b.label)),
 );
+
+// Keep the portable "catalog.schema" name in sync with the numeric selection (id is install-local).
+function onNamespaceChange(id: number | null) {
+  const settings = nodeTrainModel.value?.train_input;
+  if (!settings) return;
+  const match = namespaceOptions.value.find((ns) => ns.id === id);
+  settings.namespace_full_name = match ? match.full : null;
+}
+
+// Restore the numeric selection from the portable name on load (imported flows carry only the name).
+function reconcileNamespaceSelection() {
+  const settings = nodeTrainModel.value?.train_input;
+  if (!settings || settings.namespace_id != null || !settings.namespace_full_name) return;
+  const match = namespaceOptions.value.find((ns) => ns.full === settings.namespace_full_name);
+  if (match) settings.namespace_id = match.id;
+}
 
 const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSettings({
   nodeRef: nodeTrainModel,
@@ -242,12 +277,14 @@ const loadNodeData = async (nodeId: number) => {
         publish_to_catalog: false,
         model_name: "",
         namespace_id: null,
+        namespace_full_name: null,
         catalog_description: null,
         catalog_tags: [],
       };
     } else if (nodeTrainModel.value.train_input.params == null) {
       nodeTrainModel.value.train_input.params = {};
     }
+    reconcileNamespaceSelection();
     dataLoaded.value = true;
   }
 };

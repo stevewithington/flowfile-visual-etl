@@ -1,22 +1,22 @@
-# Building code with flows
+# Export to Python
 
-Flowfile's Code Generator allows you to export your visually designed data pipelines as clean, executable Python code. This feature is designed to empower users who wish to inspect the underlying data transformation logic, integrate Flowfile pipelines into existing Python projects, or extend their workflows with custom scripts.
+The Code Generator exports a visually designed flow as executable Python. Use it to inspect the transformation logic behind a flow, integrate a Flowfile pipeline into an existing Python project, or extend a workflow with custom scripts.
 
-For pure transformation flows (filter, join, group by, etc.), the generated code is standalone Polars — no Flowfile dependency required. Flows that include I/O nodes (database, catalog, cloud storage, Kafka) generate code that uses `import flowfile as ff` for connection-aware operations. The transformation logic remains Polars in both cases.
+Press **Code** in the header (Ctrl/Cmd+G) to open the Code panel, a pane beside the canvas; the canvas narrows to make room, and dragging the pane's left edge resizes it. The panel has four modes: **FlowFrame** and **Polars** show the flow as a single script (**Export Code** downloads it, **Refresh** regenerates it; an edit on the canvas also regenerates it after a moment), **Project** exports a multi-file project (see [Project Export](#project-export)), and **Notebook** opens the [canvas notebook](../notebook.md). The panel remembers its width and the last mode you used. Press **Code** again, the panel's close button or Ctrl/Cmd+G to close it, or double-click an empty spot on the canvas.
+
+For pure transformation flows (filter, join, group by, etc.), the generated code is Polars — usually just `import polars as pl`, and never an `import flowfile`. A few nodes add a small standalone helper package instead of native Polars: formula and advanced-filter expressions that can't be lowered to native Polars pull in `polars_expr_transformer`, fuzzy match pulls in `pl_fuzzy_frame_match`, and the graph solver and explode hierarchy pull in `polars_grouper` — each a lightweight PyPI package, not Flowfile. Flows that include I/O nodes (database, catalog, cloud storage, Kafka) additionally use `import flowfile as ff` for connection-aware operations. The transformation logic is Polars in every case.
+
 ![code_generator](../../../assets/images/guides/code_generator/code_generator.gif)
 
 ## Key Characteristics of the Generated Code
 
-When you generate code from your Flowfile graph, you can expect the output to be:
-
-* **Mostly Standalone**: Transformation logic uses only Polars. I/O operations (database, catalog, cloud storage, Kafka) use `flowfile` for managed connections.
-* **Readable**: The structure mirrors your visual flow, making it easy to understand the sequence of operations.
-* **Direct Translation**: Transformation nodes translate to Polars operations. I/O nodes translate to FlowFrame API calls (`ff.read_database()`, `ff.read_catalog_table()`, etc.).
-* **Ready for Integration**: Pure transformation flows can be embedded anywhere. Flows with I/O nodes require `pip install Flowfile`.
+* Transformation nodes translate to Polars operations; I/O nodes (database, catalog, cloud storage, Kafka) translate to FlowFrame API calls (`ff.read_database()`, `ff.read_catalog_table()`, etc.).
+* The structure mirrors your visual flow. Pure transformation flows depend only on Polars (plus a small `polars_*` helper package for formula, fuzzy-match, graph-solver, or explode-hierarchy nodes); flows with I/O nodes require `pip install flowfile`.
+* The **FlowFrame** export writes the same flow with the FlowFrame API instead (`import flowfile as ff`): every node becomes the frame call that adds that node type back — `write_csv`, `.polars_code(fn)`, `with_row_index`, `text_to_rows`, `ff.sql`, and so on — with a node's description as `description=`, so running the script rebuilds the flow as well as computing it. The [canvas notebook](../notebook.md), the Code panel's **Notebook** mode, shows this export split into cells, one per statement; a cell spans every node its statement chains together.
 
 ## Examples of Generated Code
 
-Here are some simplified examples illustrating what the generated Polars code looks like for common Flowfile operations. These examples highlight how your visual workflow seamlessly translates into Python.
+These simplified examples show what the generated Polars code looks like for common Flowfile operations, and how a visual flow maps to Python.
 
 ### Example 1: Reading a CSV and Selecting Columns
 
@@ -114,11 +114,12 @@ def run_etl_pipeline():
     """
     df_1 = pl.LazyFrame({"value": [1, 2, 3]})
 
-    # Custom Polars code as defined in the Flowfile node
-    def _custom_code_node_name(input_df: pl.LazyFrame):
+    # Custom Polars code as defined in the Flowfile node.
+    # The wrapper name is derived from the node id — e.g. _polars_code_2 for node 2.
+    def _polars_code_2(input_df: pl.LazyFrame):
         return input_df.with_columns((pl.col('value') * 10).alias('scaled_value'))
 
-    df_2 = _custom_code_node_name(df_1)
+    df_2 = _polars_code_2(df_1)
     return df_2
 
 if __name__ == "__main__":
@@ -149,7 +150,7 @@ def run_etl_pipeline():
     ETL Pipeline: Catalog Read and Filter
     Generated from Flowfile
     """
-    df_1 = ff.read_catalog_table("sales_data", namespace_id=3).data
+    df_1 = ff.read_catalog_table("sales_data", namespace_full_name="sales.raw").data
     df_2 = df_1.filter(pl.col("amount") > 100)
     return df_2
 
@@ -162,7 +163,84 @@ if __name__ == "__main__":
 !!! note "`.data` accessor"
     The generated code calls `.data` on FlowFrame results to extract the underlying Polars `LazyFrame`. This keeps the rest of the pipeline as standard Polars operations.
 
-These examples provide a clear overview of the type of high-quality, executable Python code produced by Flowfile's Code Generator.
+### Example 5: A Gated If/Else Branch
 
-!!! info "Future Direction"
-    In a future release, generated code will use the FlowFrame API directly for all operations, enabling round-trip editing between code and canvas.
+In the Polars export a [Gate](../nodes/combine.md#gate) node becomes a real `if` block. Flow parameters become keyword arguments of the generated function, so the exported script takes the same switch the flow does. With the **else output** enabled the two branches are exactly complementary, so the generator emits a genuine `if`/`else` pair — and the Union that re-converges them collapses to a plain conditional assignment: whichever side ran is the result.
+
+**Flowfile Pipeline:**
+
+1.  **Manual Input** (`region`, `amount`)
+2.  One **Gate** on the flow parameter `env` (`equals prod`) with the **else output** enabled
+3.  A **Formula** behind each exit, tagging the rows with a `channel`
+4.  **Union Data** merging both branches
+
+<details markdown="1">
+<summary>Generated Polars Code</summary>
+
+```python
+import polars as pl
+
+
+def run_etl_pipeline(*, env: str = 'dev'):
+    """
+    ETL Pipeline: gated
+    Generated from Flowfile
+    """
+
+    df_1 = pl.LazyFrame([['north', 'south'], [10, 5]], schema=pl.Schema([("region", pl.String), ("amount", pl.Int64)]), strict=False)
+
+    if env == 'prod':
+        df_4 = df_1.with_columns([(pl.lit("prod")).alias("channel").cast(pl.String)])
+    else:
+        df_5 = df_1.with_columns([(pl.lit("dev")).alias("channel").cast(pl.String)])
+
+    if env == 'prod':
+        df_6 = df_4
+    else:
+        df_6 = df_5
+
+    return df_6
+
+
+if __name__ == "__main__":
+    pipeline_output = run_etl_pipeline()
+```
+
+</details>
+
+The `if`/`else` fusion applies only when the two guards are one gate's exactly-complementary then/else pair. A Union behind guards that aren't provably exhaustive — say two **independent** gates — instead collects each surviving branch into a list under its own `if` guard and concatenates the list; when every input is guarded that way the generator also adds an `if not <list>:` fallback appending an empty schema-typed frame, because all branches could be closed at run time and the concat needs at least one frame. That fallback is a deliberate divergence from the visual editor: when every input is gated off, the engine skips the Union and everything downstream, while the exported script continues with the empty frame and produces zero-row output.
+
+A gate that routes on a **formula** instead emits a boolean flag — the formula applied as a row predicate to the control input (or the data input) via a small helper the generator adds to the script; the `if` blocks then read the flag.
+
+!!! note "Gates in the FlowFrame and Project exports"
+    The `if` blocks, union assignment and list-appends above belong to the Polars export only. The FlowFrame and Project exports place a gate as `ff.Gate(...)`, and the nodes behind it read `gate.then` (and `gate.otherwise` when the else output is on), so the rebuilt flow holds a real Gate node that routes when a frame below it is collected, exactly as the canvas does.
+
+## Project Export
+
+For more complex flows — especially flows that contain **notebook (Python script) nodes** or **custom user-defined nodes** — a single generated script becomes hard to read. The third export mode, **Project**, exports the flow as a structured multi-file Python project instead:
+
+```
+my_flow/
+├── pyproject.toml          # project metadata, pinned flowfile/polars dependencies
+├── README.md               # flow description, node overview, how to run
+├── main.py                 # entry point: python main.py
+├── pipeline.py             # the FlowFrame pipeline (run_etl_pipeline())
+├── flowfile_ctx.py         # local stand-in for the kernel flowfile_ctx API
+├── notebooks/
+│   └── node_05_clean_data.py   # one module per notebook node, code kept verbatim
+└── custom_nodes/
+    └── my_custom_node.py       # user-defined node classes, source kept verbatim
+```
+
+Key points:
+
+* **Notebook nodes get their own modules** (the Polars export refuses them; the FlowFrame export inlines them as `ff.PythonScript(cells=...)`). Each one becomes its own module exposing a `run()` function that the pipeline calls with the node's input frames; the notebook code is preserved verbatim inside it (cell structure kept via `# %%` markers), and the bundled `flowfile_ctx.py` shim makes `read_input()` / `publish_output()` / artifacts / logging work standalone — inputs and outputs are exchanged in memory as Polars LazyFrames.
+* **Custom nodes get their own modules** under `custom_nodes/` instead of being inlined into the script.
+* The pipeline itself uses the **FlowFrame API** (`import flowfile as ff`), written like the FlowFrame export.
+* **Gates land in `pipeline.py` as `ff.Gate` nodes** read through `.then` / `.otherwise`, exactly like the FlowFrame export.
+* Server-backed `flowfile_ctx` APIs (global artifacts, catalog access) raise `NotImplementedError` in the exported project; the export panel and the generated README list these limitations per node.
+
+From the Code panel you can either **download the project as a .zip** or **save it directly into a folder** using the built-in file browser.
+
+!!! info "Editing exported code"
+    Exported code runs standalone; it does not round-trip back into the visual canvas. To edit a flow as code and apply the changes to the canvas, use the [canvas notebook](../notebook.md), which pushes edited cells back onto the flow.

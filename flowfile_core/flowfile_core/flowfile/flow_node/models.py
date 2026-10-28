@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -33,6 +34,49 @@ class InvalidationReason(Enum):
     FORCED_REFRESH = auto()  # User requested reset_cache=True
     OUTPUT_NODE = auto()  # Output nodes always execute
     PERFORMANCE_MODE = auto()  # Running in performance mode (no caching)
+
+
+_OPAQUE_ERROR_CLASSES = frozenset({"Exception", "BaseException", "RemoteExecutionError"})
+
+
+class RemoteExecutionError(Exception):
+    """A worker-offloaded node failed.
+
+    The worker ships a message, not an exception type, so wrapping its failure in a
+    bare ``Exception`` used to erase the only class signal core had. This keeps
+    whatever class could be recovered on ``original_class`` (None when none could)
+    while leaving the user-facing message exactly as it was.
+    """
+
+    def __init__(self, message: str, original_class: str | None = None) -> None:
+        super().__init__(message)
+        self.original_class = original_class
+
+
+class InvalidExpressionError(Exception):
+    """A formula/advanced-filter node's expression cannot run against its input schema.
+
+    Raised by the execution gate from a data-free check, so the offending node fails with
+    a readable message before anything downstream collects its lazy plan and steals the blame.
+    """
+
+
+def recover_error_class(cause: BaseException | None = None, description: str | None = None) -> str | None:
+    """Best available original exception class name for a worker-side failure.
+
+    Walks the explicit ``__cause__`` chain first (implicit ``__context__`` is
+    deliberately ignored — it can name an unrelated exception), then falls back to a
+    ``ClassName: message`` prefix on the worker's error description. Returns None
+    when neither is conclusive; callers still map the result through their own
+    allowlist, so an unexpected token can never travel.
+    """
+    while cause is not None:
+        name = type(cause).__name__
+        if name not in _OPAQUE_ERROR_CLASSES:
+            return name
+        cause = cause.__cause__
+    head, separator, _ = (description or "").partition(":")
+    return head if separator and head.isidentifier() else None
 
 
 @dataclass
@@ -177,11 +221,38 @@ class NodeStepInputs:
         left_input: The `FlowNode` connected to the left input port.
         right_input: The `FlowNode` connected to the right input port.
         main_inputs: A list of `FlowNode` objects connected to the main input port(s).
+        keyed_inputs: For dynamic-input nodes only — target handle -> source node.
+        keyed_source_handles: target handle -> source output handle.
+
+    For dynamic-input nodes ``main_inputs`` is always the slot-ordered projection
+    of ``keyed_inputs`` (rebuilt after every keyed mutation), so every consumer
+    of ``get_all_inputs``/``input_ids`` keeps working unchanged.
     """
 
     left_input: "FlowNode" = None
     right_input: "FlowNode" = None
     main_inputs: list["FlowNode"] = None
+    keyed_inputs: dict[str, "FlowNode"] | None = None
+    keyed_source_handles: dict[str, str] | None = None
+
+    def keyed_connection_exists(self, handle: str, from_node_id: int) -> bool:
+        """True when *handle* is connected and fed by node *from_node_id*."""
+        if not self.keyed_inputs:
+            return False
+        node = self.keyed_inputs.get(handle)
+        return node is not None and node.node_id == from_node_id
+
+    def slot_items(self) -> list[tuple[str, "FlowNode"]]:
+        """Keyed connections as (handle, source node), ordered by handle index."""
+        from flowfile_core.flowfile.flow_node.input_handles import input_handle_index
+
+        if not self.keyed_inputs:
+            return []
+        return sorted(self.keyed_inputs.items(), key=lambda kv: input_handle_index(kv[0]))
+
+    def rebuild_keyed_projection(self) -> None:
+        """Recompute ``main_inputs`` as the slot-ordered projection of the keyed map."""
+        self.main_inputs = [node for _, node in self.slot_items()]
 
     @property
     def input_ids(self) -> list[int]:
@@ -225,8 +296,9 @@ class NodeStepInputs:
             return any(node_input.node_information.id == node_input_id for node_input in self.main_inputs)
         if connection_name == "left" and self.left_input:
             return self.left_input.node_information.id == node_input_id
-        if connection_name == "right":
+        if connection_name == "right" and self.right_input:
             return self.right_input.node_information.id == node_input_id
+        return False
 
 
 class NodeSchemaInformation:
@@ -260,7 +332,6 @@ class NodeResults:
     run_time_ms: int = -1
     errors: str | None = None
     warnings: str | None = None
-    analysis_data_generator: Callable[[], pa.Table] | None = None
 
     def __init__(self):
         self._resulting_data = None
@@ -269,7 +340,7 @@ class NodeResults:
         self.errors = None
         self.warnings = None
         self.example_data_generator = None
-        self.analysis_data_generator = None
+        self.example_data_path = None
 
     def get_example_data(self) -> pa.Table | None:
         """
@@ -278,6 +349,17 @@ class NodeResults:
         """
         if self.example_data_generator:
             return self.example_data_generator()
+
+    def artifact_is_missing(self) -> bool:
+        """True when the worker file backing the current result has been removed.
+
+        ``example_data_path`` is the artifact the last run produced: for a REMOTE
+        node it is the very file ``resulting_data`` scans, for LOCAL_WITH_SAMPLING
+        the sibling sample in the same flow cache dir. It is set only by
+        ``store_example_data_generator`` and cleared before every run, so a path
+        that no longer exists means whatever is held here is a dangling scan.
+        """
+        return self.example_data_path is not None and not os.path.exists(self.example_data_path)
 
     @property
     def resulting_data(self) -> FlowDataEngine | None:
@@ -298,4 +380,5 @@ class NodeResults:
     def reset(self):
         """Resets all result attributes to their default, empty state."""
         self._resulting_data = None
+        self.example_data_path = None
         self.run_time_ms = -1

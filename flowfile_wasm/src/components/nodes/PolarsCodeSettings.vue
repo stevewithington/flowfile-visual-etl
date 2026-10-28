@@ -31,10 +31,6 @@
       />
     </div>
 
-    <div v-if="validationError" class="validation-error">
-      {{ validationError }}
-    </div>
-
     <div class="help-section">
       <div class="help-title">Quick Reference</div>
       <div class="help-grid">
@@ -77,7 +73,7 @@ import { EditorState, Extension, Prec } from '@codemirror/state'
 import { autocompletion, CompletionSource, acceptCompletion } from '@codemirror/autocomplete'
 import { indentMore, indentLess } from '@codemirror/commands'
 import { useFlowStore } from '../../stores/flow-store'
-import { polarsCompletionVals } from '../../config/polarsCompletions'
+import { polarsCompletionVals, DEFAULT_POLARS_CODE } from '../../config/polarsCompletions'
 import type { PolarsCodeSettings, ColumnSchema } from '../../types'
 
 const props = defineProps<{
@@ -91,9 +87,7 @@ const emit = defineEmits<{
 
 const flowStore = useFlowStore()
 const view = shallowRef<EditorView | null>(null)
-const validationError = ref<string | null>(null)
 
-// Code snippets for quick reference
 const snippets = {
   passthrough: 'input_df',
   filter: "input_df.filter(pl.col('column') > 0)",
@@ -103,34 +97,26 @@ const snippets = {
   sort: "input_df.sort('column', descending=True)"
 }
 
-const defaultCode = `# Polars transformation
-# The input dataframe is available as 'input_df'
-# Return the transformed dataframe
+const defaultCode = DEFAULT_POLARS_CODE
 
-input_df`
-
-// Initialize directly from props
 const polarsCode = ref(props.settings.polars_code_input?.polars_code || defaultCode)
 
 const columns = computed<ColumnSchema[]>(() => {
   return flowStore.getNodeInputSchema(props.nodeId)
 })
 
-// Polars-specific autocompletions
 const polarsCompletions: CompletionSource = (context) => {
   const word = context.matchBefore(/[\w.]*/)
   if (word?.from === word?.to && !context.explicit) {
     return null
   }
 
-  // Convert polarsCompletionVals to CodeMirror format
   const completionOptions = polarsCompletionVals.map(item => ({
     label: item.label,
     type: item.type,
     detail: item.info
   }))
 
-  // Add column completions from input schema
   columns.value.forEach(col => {
     completionOptions.push({
       label: `pl.col("${col.name}")`,
@@ -145,7 +131,6 @@ const polarsCompletions: CompletionSource = (context) => {
   }
 }
 
-// Custom keymap for tab handling
 const tabKeymap = keymap.of([
   {
     key: 'Tab',
@@ -164,7 +149,6 @@ const tabKeymap = keymap.of([
   },
 ])
 
-// Extensions configuration
 const extensions: Extension[] = [
   python(),
   oneDark,
@@ -183,7 +167,6 @@ const handleReady = (payload: { view: EditorView }) => {
 
 function handleCodeChange(newCode: string) {
   polarsCode.value = newCode
-  validationError.value = null
   emitUpdate()
 }
 
@@ -197,7 +180,6 @@ function insertColumn(name: string) {
         insert: text,
       },
     })
-    // Update the model
     polarsCode.value = view.value.state.doc.toString()
     emitUpdate()
   }
@@ -212,7 +194,6 @@ function insertSnippet(snippet: string) {
         insert: snippet,
       },
     })
-    // Update the model
     polarsCode.value = view.value.state.doc.toString()
     emitUpdate()
   }
@@ -296,14 +277,6 @@ function emitUpdate() {
   color: #6272a4;
 }
 
-.validation-error {
-  padding: 8px 12px;
-  color: #ff5555;
-  background: rgba(255, 85, 85, 0.1);
-  border-top: 1px solid rgba(255, 85, 85, 0.3);
-  font-size: 12px;
-  font-family: monospace;
-}
 
 .help-section {
   padding: 10px 12px;

@@ -1,55 +1,65 @@
 <!-- CustomNode.vue -->
 <template>
   <div v-bind="$attrs">
-    <div
-      class="custom-node-header"
-      data="description_display"
-      @contextmenu="onTitleClick"
-      @click.stop
-    >
-      <div>
-        <div v-if="!editMode" class="description-display" :style="descriptionTextStyle" @click.stop>
-          <div class="edit-icon" title="Edit description" @click.stop="toggleEditMode(true)">
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            >
-              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
-              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
-            </svg>
-          </div>
-          <pre class="description-text">{{ descriptionSummary }}</pre>
-          <span v-if="isTruncated" class="truncated-indicator" title="Click to see full description"
-            >...</span
-          >
-        </div>
-        <div
-          v-else
-          :id="props.data.id.toLocaleString()"
-          class="custom-node-header"
-          :style="overlayStyle"
-          data="description_input"
-          @click.stop
+    <div class="custom-node-header" data="description_display" @dblclick="onTitleClick" @click.stop>
+      <div
+        v-if="!editMode"
+        class="description-display"
+        :class="{ 'description-display--placeholder': !description }"
+        @click.stop
+      >
+        <pre
+          ref="descriptionTextEl"
+          class="description-text"
+        ><template v-for="(segment, index) in displaySegments" :key="index">{{ segment }}<wbr v-if="index < displaySegments.length - 1" /></template></pre>
+        <button
+          type="button"
+          class="edit-icon"
+          aria-label="Edit description"
+          title="Edit description"
+          @click.stop="toggleEditMode(true)"
         >
-          <textarea
-            :id="props.data.id.toLocaleString()"
-            v-model="description"
-            class="description-input"
-            data="description_input"
-            @blur="toggleEditMode(false)"
-            @click.stop
-          ></textarea>
-        </div>
+          <svg
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+          </svg>
+        </button>
+        <div v-if="isTruncated" class="description-tooltip" role="tooltip">{{ description }}</div>
+      </div>
+      <div
+        v-else
+        :id="props.data.id.toLocaleString()"
+        class="description-editor"
+        data="description_input"
+        @click.stop
+      >
+        <textarea
+          :id="props.data.id.toLocaleString()"
+          ref="descriptionInputEl"
+          v-model="description"
+          class="description-input"
+          data="description_input"
+          rows="3"
+          placeholder="Describe what this node does"
+          @blur="toggleEditMode(false)"
+          @keydown.esc.prevent="cancelEdit"
+          @click.stop
+        ></textarea>
       </div>
     </div>
-    <div ref="nodeEl" class="custom-node" @contextmenu.prevent="showContextMenu">
-      <!-- Use GenericNode if nodeTemplate exists, otherwise use the component directly -->
+    <!-- Right-click bubbles to VueFlow's node handler → the canvas ContextMenu
+         (Canvas.vue @node-context-menu). This component no longer owns a menu. -->
+    <div ref="nodeEl" class="custom-node">
       <generic-node
         v-if="data.nodeTemplate"
         :node-id="data.id"
@@ -62,15 +72,32 @@
 
       <!-- Handles are always rendered -->
       <div
-        v-for="(input, index) in data.inputs"
+        v-for="(input, index) in sideInputs"
         :key="input.id"
         class="handle-input"
-        :style="getHandleStyle(index, data.inputs.length)"
+        :style="getHandleStyle(index, sideInputs.length)"
       >
-        <span v-if="input.label && data.inputs.length > 1" class="handle-label handle-label--input">
+        <span v-if="input.label && sideInputs.length > 1" class="handle-label handle-label--input">
           {{ input.label }}
         </span>
-        <Handle :id="input.id" type="target" :position="input.position" />
+        <!-- The title lives on the handle, not the label: .handle-label is
+             pointer-events:none, so a title there would never surface. Handle
+             drops fallthrough attrs, hence the directive. -->
+        <Handle
+          :id="input.id"
+          v-native-title="input.title"
+          type="target"
+          :position="input.position"
+        />
+      </div>
+      <!-- Fixed parameter-data handle (run_flow): bottom-center, subdued until hovered -->
+      <div
+        v-if="parameterInput"
+        :key="parameterInput.id"
+        class="handle-input--parameter"
+        :title="parameterInput.title"
+      >
+        <Handle :id="parameterInput.id" type="target" :position="parameterInput.position" />
       </div>
       <div
         v-for="(output, index) in data.outputs"
@@ -78,139 +105,44 @@
         class="handle-output"
         :style="getHandleStyle(index, data.outputs.length)"
       >
-        <Handle :id="output.id" type="source" :position="output.position" />
+        <Handle
+          :id="output.id"
+          v-native-title="output.title"
+          type="source"
+          :position="output.position"
+        />
         <span
           v-if="output.label && data.outputs.length > 1"
           class="handle-label handle-label--output"
-          :title="output.title"
         >
           {{ output.label }}
         </span>
       </div>
-
-      <!-- Teleport Context Menu to body -->
-      <Teleport v-if="showMenu" to="body">
-        <div ref="menuEl" class="context-menu" :style="contextMenuStyle">
-          <div class="context-menu-item" @click="runNode">
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            >
-              <polygon points="5 3 19 12 5 21 5 3"></polygon>
-            </svg>
-            <span>{{ isRunning ? "Running..." : "Run Now" }}</span>
-          </div>
-          <div class="context-menu-item" @click="toggleCache">
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            >
-              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
-              <path d="M3 3v5h5"></path>
-              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"></path>
-              <path d="M16 21h5v-5"></path>
-            </svg>
-            <span>{{ isCached ? "Disable Cache" : "Enable Cache" }}</span>
-          </div>
-          <div class="context-menu-divider"></div>
-          <div class="context-menu-item" @click="copyNode">
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            >
-              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-            </svg>
-            <span>Copy</span>
-          </div>
-          <div class="context-menu-item context-menu-item-danger" @click="deleteNode">
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            >
-              <path d="M3 6h18"></path>
-              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"></path>
-              <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-            </svg>
-            <span>Delete</span>
-          </div>
-        </div>
-      </Teleport>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-// TODO(refactor): ~709 LOC. Plan to extract:
-//   - NodeContextMenu.vue (~lines 92-161, with positioning at ~263-283)
+// TODO(refactor): Plan to extract:
 //   - NodeDescriptionEditor.vue (~lines 11-48)
 //   - NodeHandles.vue: handle rendering loops (~lines 64-89)
+// (The per-node context menu moved to the canvas ContextMenu —
+//  Canvas.vue @node-context-menu + composables/useContextMenu.)
 import { Handle } from "@vue-flow/core";
 import { computed, ref, onMounted, nextTick, watch, onUnmounted } from "vue";
 import { useNodeStore } from "../../stores/column-store";
-import { useFlowStore } from "../../stores/flow-store";
-import { VueFlowStore } from "@vue-flow/core";
-import { NodeCopyValue } from "../../views/DesignerView/types";
-import { toSnakeCase } from "../../views/DesignerView/utils";
-import { snapshotClipboard } from "../../utils/clipboardUtils";
-import { useFlowExecution } from "../../composables/useFlowExecution";
+import { recoverFromFailedMutation } from "../../services/mutationFailure";
 import GenericNode from "./GenericNode.vue";
 import ArtifactBadge from "./ArtifactBadge.vue";
 import type { NodeTemplate, NodeHandle } from "../../types";
 
 const nodeStore = useNodeStore();
-const flowStore = useFlowStore();
 const nodeEl = ref<HTMLElement | null>(null);
-const menuEl = ref<HTMLElement | null>(null);
 
-// Use the flow execution composable with persistent polling.
-// Getter form (not a snapshot number) so Save As doesn't leave the node
-// polling against the old flow id.
-const { triggerNodeFetch, isPollingActive } = useFlowExecution(
-  () => flowStore.flowId,
-  { interval: 2000, enabled: true },
-  {
-    persistPolling: true,
-    pollingKey: `node_wrapper_${flowStore.flowId}`,
-  },
-);
-
-const mouseX = ref<number>(0);
-const mouseY = ref<number>(0);
 const editMode = ref<boolean>(false);
-const showMenu = ref<boolean>(false);
-const contextMenuX = ref<number>(0);
-const contextMenuY = ref<number>(0);
-const isCached = ref<boolean>(false);
-const isRunning = ref<boolean>(false);
+const descriptionTextEl = ref<HTMLElement | null>(null);
+const descriptionInputEl = ref<HTMLTextAreaElement | null>(null);
 
-const CHAR_LIMIT = 100;
-
-// Define the data structure for VueFlow node data
 interface NodeData {
   id: number;
   label: string;
@@ -229,195 +161,27 @@ const props = defineProps({
   },
 });
 
-const onTitleClick = (event: MouseEvent) => {
+// VueFlow's <Handle> does not inherit fallthrough attributes, so the native
+// tooltip has to be written onto its root element directly.
+function applyNativeTitle(el: HTMLElement, value?: string) {
+  if (value) el.setAttribute("title", value);
+  else el.removeAttribute("title");
+}
+
+const vNativeTitle = {
+  mounted: (el: HTMLElement, binding: { value?: string }) => applyNativeTitle(el, binding.value),
+  updated: (el: HTMLElement, binding: { value?: string }) => applyNativeTitle(el, binding.value),
+};
+
+// The parameter-data handle (run_flow) renders bottom-center; only real data
+// inputs share the left edge spacing.
+const sideInputs = computed(() => props.data.inputs.filter((input) => input.kind !== "parameter"));
+const parameterInput = computed(() =>
+  props.data.inputs.find((input) => input.kind === "parameter"),
+);
+
+const onTitleClick = () => {
   toggleEditMode(true);
-  mouseX.value = event.clientX;
-  mouseY.value = event.clientY;
-};
-
-const showContextMenu = async (event: MouseEvent) => {
-  event.preventDefault();
-  event.stopPropagation();
-
-  if (editMode.value) {
-    toggleEditMode(false);
-  }
-
-  contextMenuX.value = event.clientX;
-  contextMenuY.value = event.clientY;
-  showMenu.value = true;
-
-  // Load the current cache state
-  try {
-    const nodeData = await nodeStore.getNodeData(props.data.id, true);
-    if (nodeData && nodeData.setting_input) {
-      isCached.value = nodeData.setting_input.cache_results || false;
-    }
-  } catch (error) {
-    console.error("Error loading node data:", error);
-  }
-
-  setTimeout(() => {
-    window.addEventListener("click", handleClickOutsideMenu);
-  }, 0);
-
-  nextTick(() => {
-    updateMenuPosition();
-  });
-};
-
-const updateMenuPosition = () => {
-  if (!menuEl.value) return;
-
-  const menuRect = menuEl.value.getBoundingClientRect();
-  const viewportWidth = window.innerWidth;
-  const viewportHeight = window.innerHeight;
-
-  let left = contextMenuX.value;
-  let top = contextMenuY.value;
-
-  if (left + menuRect.width > viewportWidth - 10) {
-    left = viewportWidth - menuRect.width - 10;
-  }
-
-  if (top + menuRect.height > viewportHeight - 10) {
-    top = viewportHeight - menuRect.height - 10;
-  }
-
-  contextMenuX.value = left;
-  contextMenuY.value = top;
-};
-
-const handleClickOutsideMenu = (event: MouseEvent) => {
-  if (menuEl.value && !menuEl.value.contains(event.target as Node)) {
-    closeContextMenu();
-  }
-};
-
-const closeContextMenu = () => {
-  showMenu.value = false;
-  window.removeEventListener("click", handleClickOutsideMenu);
-};
-
-const copyNode = () => {
-  const nodeCopyValue: NodeCopyValue = {
-    nodeIdToCopyFrom: props.data.id,
-    type: props.data.nodeTemplate?.item || props.data.component?.__name || "unknown",
-    label: props.data.label,
-    description: description.value,
-    numberOfInputs: props.data.inputs.length,
-    numberOfOutputs: props.data.outputs.length,
-    typeSnakeCase:
-      props.data.nodeTemplate?.item || toSnakeCase(props.data.component?.__name || "unknown"),
-    flowIdToCopyFrom: nodeStore.flow_id,
-    multi: props.data.nodeTemplate?.multi,
-    nodeTemplate: props.data.nodeTemplate,
-  };
-  localStorage.setItem("copiedNode", JSON.stringify(nodeCopyValue));
-  localStorage.removeItem("copiedMultiNodes");
-  snapshotClipboard();
-  closeContextMenu();
-};
-
-const deleteNode = () => {
-  if (nodeStore.vueFlowInstance) {
-    const vueFlow: VueFlowStore = nodeStore.vueFlowInstance;
-    vueFlow.removeNodes(props.data.id.toLocaleString(), true);
-  }
-  closeContextMenu();
-};
-
-const runNode = async () => {
-  closeContextMenu();
-
-  if (isPollingActive(`node_${props.data.id}`)) {
-    return;
-  }
-
-  isRunning.value = true;
-  try {
-    await triggerNodeFetch(props.data.id);
-
-    const checkInterval = setInterval(() => {
-      if (!isPollingActive(`node_${props.data.id}`)) {
-        clearInterval(checkInterval);
-        isRunning.value = false;
-      }
-    }, 1000);
-
-    setTimeout(() => {
-      clearInterval(checkInterval);
-      isRunning.value = false;
-    }, 60000);
-  } catch (error) {
-    console.error("Error running node:", error);
-    isRunning.value = false;
-  }
-};
-
-const toggleCache = async () => {
-  try {
-    const nodeData = await nodeStore.getNodeData(props.data.id, false);
-    if (nodeData && nodeData.setting_input) {
-      const newCacheValue = !nodeData.setting_input.cache_results;
-      nodeData.setting_input.cache_results = newCacheValue;
-      isCached.value = newCacheValue;
-      await nodeStore.updateSettingsDirectly(nodeData.setting_input);
-    }
-  } catch (error) {
-    console.error("Error toggling cache:", error);
-  }
-  closeContextMenu();
-};
-
-onUnmounted(() => {
-  window.removeEventListener("click", handleClickOutsideMenu);
-  window.removeEventListener("resize", updateMenuPosition);
-  window.removeEventListener("keydown", handleKeyDown);
-});
-
-const contextMenuStyle = computed(() => {
-  return {
-    position: "fixed" as const,
-    zIndex: 10000,
-    top: `${contextMenuY.value}px`,
-    left: `${contextMenuX.value}px`,
-  };
-});
-
-const descriptionTextStyle = computed(() => {
-  const textLength = description.value.length;
-  let minWidth = "200px";
-
-  if (textLength < 20) {
-    minWidth = "100px";
-  } else if (textLength < 30) {
-    minWidth = "150px";
-  }
-  return {
-    minWidth: minWidth,
-  };
-});
-
-const handleKeyDown = (event: KeyboardEvent) => {
-  // Normalize key to lowercase to handle Caps Lock being on
-  const key = event.key.toLowerCase();
-  if ((event.metaKey || event.ctrlKey) && key === "c") {
-    // Check if text is selected - if so, let browser handle copy natively
-    const selection = window.getSelection();
-    const hasTextSelected = selection && selection.toString().trim().length > 0;
-    if (hasTextSelected) {
-      return; // Let browser handle text copying
-    }
-
-    const isNodeSelected = nodeStore.node_id === props.data.id;
-    const target = event.target as HTMLElement;
-    const isTargetNodeButton = target.classList.contains("node-button");
-    if (isNodeSelected && isTargetNodeButton) {
-      copyNode();
-      event.preventDefault();
-    }
-  }
 };
 
 const handleClickOutside = (event: MouseEvent) => {
@@ -434,15 +198,31 @@ const handleClickOutside = (event: MouseEvent) => {
   }
 };
 
+// Baseline captured on entering edit mode: leaving without a change must not
+// POST — an untouched auto-generated description would otherwise be pinned as
+// a user description and stop regenerating.
+let descriptionAtEditStart = "";
+
 const toggleEditMode = (state: boolean) => {
+  if (state === editMode.value) return;
   editMode.value = state;
   if (state) {
+    descriptionAtEditStart = description.value;
     window.addEventListener("click", handleClickOutside);
-  }
-  if (!state) {
+    nextTick(() => descriptionInputEl.value?.focus());
+  } else {
     window.removeEventListener("click", handleClickOutside);
-    nodeStore.setNodeDescription(props.data.id, description.value);
+    if (description.value !== descriptionAtEditStart) {
+      nodeStore
+        .setNodeDescription(props.data.id, description.value)
+        .catch((error) => recoverFromFailedMutation(error, "Could not save the description"));
+    }
   }
+};
+
+const cancelEdit = () => {
+  description.value = descriptionAtEditStart;
+  toggleEditMode(false);
 };
 
 const description = ref<string>("");
@@ -451,52 +231,25 @@ const getNodeDescription = async () => {
   description.value = await nodeStore.getNodeDescription(props.data.id);
 };
 
-const overlayStyle = computed(() => {
-  const overlayWidth = 400;
-  const overlayHeight = 200;
-  const buffer = 100;
+const displayText = computed(() => description.value || `${props.data.id}: ${props.data.label}`);
 
-  let left = mouseX.value + buffer;
-  let top = mouseY.value + buffer;
-
-  if (left + overlayWidth > window.innerWidth) {
-    left -= overlayWidth + 2 * buffer;
-  }
-
-  if (top + overlayHeight > window.innerHeight) {
-    top -= overlayHeight + 2 * buffer;
-  }
-
-  left = Math.max(left, buffer);
-  top = Math.max(top, buffer);
-
-  return {
-    top: `${top}px`,
-    left: `${left}px`,
-  };
+// A <wbr> follows every dot so dotted identifiers (schema.table) wrap at the
+// dot instead of overflowing the bubble or breaking mid-token.
+const displaySegments = computed(() => {
+  const parts = displayText.value.split(".");
+  return parts.map((part, index) => (index < parts.length - 1 ? `${part}.` : part));
 });
 
-const isTruncated = computed(() => {
-  try {
-    return description.value.length > CHAR_LIMIT;
-  } catch (error) {
-    return false;
-  }
-});
+// The text is CSS line-clamped; measure whether the clamp actually cut
+// anything so the full-text tooltip only appears when there is more to see.
+const isTruncated = ref(false);
+const measureTruncation = async () => {
+  await nextTick();
+  const el = descriptionTextEl.value;
+  isTruncated.value = el !== null && el.scrollHeight > el.clientHeight + 1;
+};
 
-const descriptionSummary = computed(() => {
-  if (!description.value) {
-    return `${props.data.id}: ${props.data.label}`;
-  }
-
-  if (isTruncated.value) {
-    const truncatePoint = description.value.lastIndexOf(" ", CHAR_LIMIT);
-    const endPoint = truncatePoint > 0 ? truncatePoint : CHAR_LIMIT;
-    return description.value.substring(0, endPoint);
-  }
-
-  return description.value;
-});
+watch([displayText, editMode], measureTruncation);
 
 function getHandleStyle(index: number, total: number) {
   const topMargin = 30;
@@ -514,30 +267,29 @@ function getHandleStyle(index: number, total: number) {
   }
 }
 
+// Registered at setup level (not inside onMounted's async body) so Vue ties it
+// to the component's effect scope and stops it on unmount.
+watch(
+  () => {
+    const flowId = nodeStore.flow_id;
+    const nodeId = props.data.id;
+    return nodeStore.nodeDescriptions[flowId]?.[nodeId];
+  },
+  (newEntry) => {
+    if (newEntry !== undefined) {
+      description.value = newEntry.description;
+    }
+  },
+);
+
 onMounted(async () => {
   await nextTick();
   await getNodeDescription();
+  await measureTruncation();
+});
 
-  window.addEventListener("resize", () => {
-    if (showMenu.value) {
-      updateMenuPosition();
-    }
-  });
-
-  window.addEventListener("keydown", handleKeyDown);
-
-  watch(
-    () => {
-      const flowId = nodeStore.flow_id;
-      const nodeId = props.data.id;
-      return nodeStore.nodeDescriptions[flowId]?.[nodeId];
-    },
-    (newEntry) => {
-      if (newEntry !== undefined) {
-        description.value = newEntry.description;
-      }
-    },
-  );
+onUnmounted(() => {
+  window.removeEventListener("click", handleClickOutside);
 });
 </script>
 
@@ -556,78 +308,131 @@ onMounted(async () => {
   border: 2px solid #409eff;
 }
 
+/* Kept narrow so the bubble never widens the node box VueFlow measures;
+   the bubble overflows the header on purpose. */
 .custom-node-header {
-  font-weight: 100;
-  font-size: small;
   width: 20px;
-  white-space: nowrap;
   overflow: visible;
-  text-overflow: ellipsis;
   font-family: var(--font-family-base);
 }
 
 .description-display {
   position: relative;
-  white-space: normal;
-  min-width: 100px;
-  max-width: 300px;
-  width: auto;
-  padding: 2px 4px;
-  cursor: pointer;
-  background-color: var(--color-background-secondary);
-  font-family: var(--font-family-base);
   display: flex;
   align-items: flex-start;
-  gap: 4px;
-  border-radius: 4px;
+  gap: 2px;
+  width: max-content;
+  min-width: 0;
+  max-width: 240px;
+  padding: 2px 2px 2px 6px;
+  border-radius: var(--border-radius-md);
+  background-color: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.description-display:hover {
+  background-color: var(--color-background-tertiary);
   color: var(--color-text-primary);
 }
 
-.edit-icon {
-  opacity: 0;
-  transition: opacity 0.2s;
-  color: var(--color-accent);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  padding: 2px;
+.description-display--placeholder .description-text {
+  color: var(--color-text-tertiary);
 }
 
-.description-display:hover .edit-icon {
+.description-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-family: var(--font-family-base);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.edit-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--border-radius-sm);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  opacity: 0;
+  cursor: pointer;
+  transition:
+    opacity 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.description-display:hover .edit-icon,
+.edit-icon:focus-visible {
   opacity: 1;
 }
 
 .edit-icon:hover {
-  color: var(--color-accent-hover);
+  color: var(--color-accent);
 }
 
-.description-text {
-  margin: 0;
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  font-family: var(--font-family-base);
+.description-tooltip {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px);
+  z-index: 10;
+  width: max-content;
+  max-width: 320px;
+  padding: 6px 10px;
+  border-radius: var(--border-radius-md);
+  background-color: var(--color-background-primary);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-md);
   font-size: var(--font-size-xs);
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.15s ease;
 }
 
-.edit-overlay {
-  position: fixed;
-  z-index: 1000;
-  background: var(--color-background-primary);
-  border-radius: 4px;
-  box-shadow: var(--shadow-lg);
+.description-display:hover .description-tooltip {
+  visibility: visible;
+  opacity: 1;
 }
 
 .description-input {
-  width: 200px;
-  height: 75px;
+  display: block;
+  width: 240px;
+  min-height: 64px;
+  padding: 6px 8px;
   resize: both;
-  padding: 4px;
   border: 1px solid var(--color-accent);
-  border-radius: 4px;
-  font-size: small;
-  font-family: var(--font-family-base);
+  border-radius: var(--border-radius-md);
   background-color: var(--color-background-primary);
   color: var(--color-text-primary);
+  box-shadow: var(--shadow-sm);
+  font-family: var(--font-family-base);
+  font-size: var(--font-size-xs);
+  line-height: 1.4;
+  outline: none;
+}
+
+.description-input:focus {
+  box-shadow: 0 0 0 3px var(--color-focus-ring-accent);
 }
 
 .handle-input {
@@ -640,76 +445,56 @@ onMounted(async () => {
   right: -8px;
 }
 
+/* The letters sit over the node icon, so they carry their own chip — the icons
+   are saturated gradient circles and bare grey text on one is unreadable.
+   Both colours are literals because the card underneath (.node-button) is a
+   theme-independent #dedede; a themed chip would invert against it in dark mode. */
 .handle-label {
   position: absolute;
-  font-size: 0.55rem;
-  color: var(--el-text-color-secondary);
+  font-size: 0.6rem;
+  font-weight: 600;
+  line-height: 1;
+  color: #4a4a4a;
+  background-color: #dedede;
+  border-radius: 3px;
+  padding: 1px 2px;
   white-space: nowrap;
   pointer-events: none;
   top: 50%;
   transform: translateY(-50%);
-  opacity: 0.8;
 }
 
 .handle-label--input {
-  left: 14px;
+  left: 13px;
+}
+
+/* Parameter handles (input-0 on dynamic-input nodes): square amber marker. */
+.handle-input--parameter {
+  position: absolute;
+  bottom: -8px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.handle-input--parameter :deep(.vue-flow__handle) {
+  background-color: var(--color-info, #909399);
+  border-color: var(--color-info, #909399);
+  border-radius: 2px;
+  opacity: 0.55;
+  transition:
+    opacity 0.15s ease,
+    transform 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.handle-input--parameter:hover :deep(.vue-flow__handle) {
+  opacity: 1;
+  transform: scale(1.3);
+  background-color: var(--color-primary, #409eff);
+  border-color: var(--color-primary, #409eff);
 }
 
 .handle-label--output {
-  right: 14px;
-}
-
-.context-menu {
-  position: fixed;
-  z-index: var(--z-index-canvas-context-menu, 100002);
-  background-color: var(--color-background-primary);
-  border: 1px solid var(--color-border-primary);
-  border-radius: 4px;
-  box-shadow: var(--shadow-lg);
-  padding: 4px 0;
-  min-width: 120px;
-  font-family: var(--font-family-base);
-}
-
-.context-menu-item {
-  padding: 8px 12px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  font-size: 13px;
-  transition: background-color 0.2s;
-  font-family: var(--font-family-base);
-  color: var(--color-text-primary);
-}
-
-.context-menu-item:hover {
-  background-color: var(--color-background-hover);
-}
-
-.context-menu-item svg {
-  color: var(--color-text-secondary);
-}
-
-.context-menu-item span {
-  font-family: var(--font-family-base);
-}
-
-.context-menu-divider {
-  height: 1px;
-  background-color: var(--color-border-primary);
-  margin: 4px 0;
-}
-
-.context-menu-item-danger {
-  color: #dc3545;
-}
-
-.context-menu-item-danger:hover {
-  background-color: rgba(220, 53, 69, 0.1);
-}
-
-.context-menu-item-danger svg {
-  color: #dc3545;
+  right: 13px;
 }
 </style>

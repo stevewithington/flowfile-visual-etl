@@ -11,21 +11,74 @@
           :placeholder="parentId ? 'Schema name' : 'Catalog name'"
           @keyup.enter="submit"
         />
+        <p v-if="nameError" class="field-error">{{ nameError }}</p>
         <input v-model="description" class="input-field" placeholder="Description (optional)" />
+
+        <div v-if="!parentId" class="storage-section">
+          <label class="storage-label">Object storage (optional)</label>
+          <div class="storage-uri-row">
+            <input
+              v-model="storageUri"
+              class="input-field"
+              placeholder="s3://bucket/catalog (leave blank for local storage)"
+            />
+            <el-button
+              size="small"
+              :disabled="!!browseDisabledReason"
+              :title="browseDisabledReason ?? 'Browse cloud storage'"
+              @click="showBrowser = true"
+            >
+              Browse
+            </el-button>
+          </div>
+          <CloudConnectionPicker
+            v-model="selectedConnection"
+            :connections="connections"
+            :loading="connectionsLoading"
+            label="Storage connection"
+            no-connection-label="No connection (local storage)"
+            helper-text="Leave unset to store this catalog's tables on local storage."
+          />
+          <p v-if="storageError" class="field-error">{{ storageError }}</p>
+          <CloudPathPicker
+            v-model="showBrowser"
+            :connection="selectedConnection"
+            :initial-file-path="storageUri"
+            context="cloudWrite"
+            allow-directory-selection
+            title="Select a folder for this catalog's tables"
+            @select="onStoragePathSelected"
+          />
+        </div>
       </div>
       <div class="modal-actions">
         <button class="btn btn-secondary" @click="$emit('close')">Cancel</button>
-        <button class="btn btn-primary" :disabled="!name.trim()" @click="submit">Create</button>
+        <button
+          class="btn btn-primary"
+          :disabled="!name.trim() || !!nameError || !!storageError"
+          @click="submit"
+        >
+          Create
+        </button>
       </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { ref, watch, computed } from "vue";
 import { ElMessage } from "element-plus";
 import { CatalogApi } from "../../api/catalog.api";
+import type { NamespaceCreate } from "../../types/catalog.types";
 import { useCatalogStore } from "../../stores/catalog-store";
+import { validateCatalogName } from "../../composables/catalogNameValidation";
+import { CloudConnectionPicker } from "../../components/common";
+import { fetchCloudStorageConnectionsInterfaces } from "../CloudConnectionView/api";
+import type { FullCloudStorageConnectionInterface } from "../CloudConnectionView/CloudConnectionTypes";
+
+import CloudPathPicker from "../../components/common/FileBrowser/CloudPathPicker.vue";
+import { browseUnsupportedReason } from "../../components/common/FileBrowser/browseSupport";
+import { CLOUD_URI_SCHEMES } from "../../utils/storagePath";
 
 const props = defineProps<{
   visible: boolean;
@@ -38,24 +91,79 @@ const catalogStore = useCatalogStore();
 const name = ref("");
 const description = ref("");
 
+const storageUri = ref("");
+const selectedConnection = ref<FullCloudStorageConnectionInterface | null>(null);
+const connections = ref<FullCloudStorageConnectionInterface[]>([]);
+const connectionsLoading = ref(false);
+const showBrowser = ref(false);
+
+const browseDisabledReason = computed<string | null>(() => {
+  if (connectionsLoading.value) return "Loading connections…";
+  if (!selectedConnection.value) return "Select a storage connection to browse.";
+  return browseUnsupportedReason(
+    selectedConnection.value.storageType,
+    selectedConnection.value.authMethod,
+  );
+});
+
+const onStoragePathSelected = (selectedPath: string) => {
+  storageUri.value = selectedPath;
+};
+
+const nameError = computed(() =>
+  validateCatalogName(name.value, props.parentId ? "Schema" : "Catalog"),
+);
+
+const storageError = computed(() => {
+  if (props.parentId) return null;
+  const uri = storageUri.value.trim();
+  const connectionName = selectedConnection.value?.connectionName ?? null;
+  if (uri && !CLOUD_URI_SCHEMES.some((s) => uri.startsWith(s))) {
+    return "Storage URI must start with s3://, gs://, abfss://, …";
+  }
+  if (uri && !connectionName) return "Select a storage connection for this URI";
+  if (connectionName && !uri)
+    return "Enter a storage URI (e.g. s3://bucket/path) for this connection";
+  return null;
+});
+
+async function loadConnections() {
+  connectionsLoading.value = true;
+  try {
+    connections.value = await fetchCloudStorageConnectionsInterfaces();
+  } catch {
+    connections.value = [];
+  } finally {
+    connectionsLoading.value = false;
+  }
+}
+
 watch(
   () => props.visible,
   (val) => {
     if (val) {
       name.value = "";
       description.value = "";
+      storageUri.value = "";
+      selectedConnection.value = null;
+      if (!props.parentId) loadConnections();
     }
   },
 );
 
 async function submit() {
-  if (!name.value.trim()) return;
+  if (!name.value.trim() || nameError.value || storageError.value) return;
   try {
-    await CatalogApi.createNamespace({
+    const payload: NamespaceCreate = {
       name: name.value.trim(),
       parent_id: props.parentId,
       description: description.value.trim() || null,
-    });
+    };
+    if (!props.parentId && storageUri.value.trim()) {
+      payload.storage_uri = storageUri.value.trim();
+      payload.storage_connection_name = selectedConnection.value?.connectionName ?? null;
+    }
+    await CatalogApi.createNamespace(payload);
     emit("close");
     await Promise.all([catalogStore.loadTree(), catalogStore.loadStats()]);
   } catch (e: any) {
@@ -81,5 +189,36 @@ async function submit() {
   outline: none;
   border-color: var(--color-primary);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-info) 15%, transparent);
+}
+
+.field-error {
+  margin: calc(-1 * var(--spacing-2)) 0 var(--spacing-3);
+  font-size: var(--font-size-xs);
+  color: var(--el-color-danger);
+}
+
+.storage-section {
+  margin-top: var(--spacing-2);
+  padding-top: var(--spacing-3);
+  border-top: 1px solid var(--color-border-primary);
+}
+
+.storage-uri-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+}
+
+.storage-uri-row .input-field {
+  flex: 1;
+  min-width: 0;
+}
+
+.storage-label {
+  display: block;
+  margin-bottom: var(--spacing-2);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
 }
 </style>

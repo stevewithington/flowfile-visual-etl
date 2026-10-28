@@ -24,7 +24,6 @@
         :show-old-columns="true"
         :show-headers="true"
         :show-title="false"
-        :show-data="true"
         title="Select data"
         original-column-header="Column"
         @update-select-inputs="calculateSelects"
@@ -71,25 +70,6 @@ const strategyOptions: { value: UniqueSorttrategy; label: string }[] = [
   { value: "none", label: "None" },
 ];
 
-const getMissingColumns = (availableColumns: string[], usedColumns: string[]): string[] => {
-  const availableSet = new Set(availableColumns);
-  return Array.from(new Set(usedColumns.filter((usedColumn) => !availableSet.has(usedColumn))));
-};
-
-const missingColumns = computed(() => {
-  if (nodeData.value && nodeData.value.main_input?.columns) {
-    return getMissingColumns(nodeData.value.main_input?.columns, uniqueInput.value.columns);
-  }
-  return [];
-});
-
-const calculateMissingColumns = (): string[] => {
-  if (nodeData.value && nodeData.value.main_input?.columns) {
-    return getMissingColumns(nodeData.value.main_input?.columns, uniqueInput.value.columns);
-  }
-  return [];
-};
-
 const loadData = async (nodeId: number) => {
   nodeData.value = await nodeStore.getNodeData(nodeId, false);
   nodeUnique.value = nodeData.value?.setting_input;
@@ -107,41 +87,16 @@ const loadData = async (nodeId: number) => {
   }
 };
 
-const validateNode = async () => {
-  if (nodeUnique.value?.unique_input) {
-    await loadData(Number(nodeUnique.value.node_id));
-  }
-  const missingColumnsLocal = calculateMissingColumns();
-  if (missingColumnsLocal.length > 0 && nodeUnique.value) {
-    nodeStore.setNodeValidation(nodeUnique.value.node_id, {
-      isValid: false,
-      error: `The fields ${missingColumns.value.join(", ")} are missing in the available columns.`,
-    });
-  } else if (nodeUnique.value?.unique_input.columns.length == 0) {
+// Missing-column warnings come from the backend settings validation; this only
+// covers configuration completeness the backend does not check.
+const validateConfig = () => {
+  if (!nodeUnique.value) return;
+  if (nodeUnique.value.unique_input.columns.length == 0) {
     nodeStore.setNodeValidation(nodeUnique.value.node_id, {
       isValid: false,
       error: "Please select at least one field.",
     });
-  } else if (nodeUnique.value) {
-    nodeStore.setNodeValidation(nodeUnique.value.node_id, {
-      isValid: true,
-      error: "",
-    });
-  }
-};
-
-const instantValidate = async () => {
-  if (missingColumns.value.length > 0 && nodeUnique.value) {
-    nodeStore.setNodeValidation(nodeUnique.value.node_id, {
-      isValid: false,
-      error: `The fields ${missingColumns.value.join(", ")} are missing in the available columns.`,
-    });
-  } else if (nodeUnique.value?.unique_input.columns.length == 0) {
-    nodeStore.setNodeValidation(nodeUnique.value.node_id, {
-      isValid: false,
-      error: "Please select at least one field.",
-    });
-  } else if (nodeUnique.value) {
+  } else {
     nodeStore.setNodeValidation(nodeUnique.value.node_id, {
       isValid: true,
       error: "",
@@ -155,7 +110,6 @@ const setUniqueColumns = () => {
     .map((input) => input.old_name);
 };
 
-// Use the standardized node settings composable
 const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSettings({
   nodeRef: nodeUnique,
   onBeforeSave: () => {
@@ -163,13 +117,7 @@ const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSetti
     return true;
   },
   onAfterSave: async () => {
-    await instantValidate();
-  },
-  getValidationFunc: () => {
-    if (nodeUnique.value?.unique_input) {
-      return validateNode;
-    }
-    return undefined;
+    validateConfig();
   },
 });
 
@@ -190,7 +138,7 @@ const calculateSelects = (updatedInputs: SelectInput[]) => {
 };
 
 const loadNodeData = async (nodeId: number) => {
-  loadData(nodeId);
+  await loadData(nodeId);
   dataLoaded.value = true;
 };
 

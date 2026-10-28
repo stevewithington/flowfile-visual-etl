@@ -1,5 +1,7 @@
 import os
 import re
+import string
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -9,6 +11,10 @@ from pydantic import BaseModel
 
 from flowfile_core.configs import settings
 from shared.storage_config import storage
+
+
+class DirectoryScanCancelledError(Exception):
+    """Raised when a directory walk is abandoned because ``cancel_check`` fired."""
 
 
 class FileInfo(BaseModel):
@@ -36,7 +42,6 @@ class FileInfo(BaseModel):
         try:
             stats = path.stat()
 
-            # Decide whether to use relative or absolute path
             if use_relative_paths and sandbox_root:
                 try:
                     display_path = str(path.relative_to(sandbox_root))
@@ -57,7 +62,6 @@ class FileInfo(BaseModel):
                 exists=True,
             )
         except (PermissionError, OSError):
-            # Handle error case
             if use_relative_paths and sandbox_root:
                 try:
                     display_path = str(path.relative_to(sandbox_root))
@@ -96,7 +100,6 @@ class SecureFileExplorer:
         """
         self.use_relative_paths = use_relative_paths
 
-        # Set up the sandbox root
         if sandbox_root is not None:
             self.sandbox_root = Path(sandbox_root).expanduser().resolve()
         else:
@@ -126,7 +129,6 @@ class SecureFileExplorer:
         try:
             resolved_path = path.resolve()
             resolved_sandbox = self.sandbox_root.resolve()
-            # Check if the resolved path is within sandbox
             resolved_path.relative_to(resolved_sandbox)
             return True
         except (ValueError, RuntimeError):
@@ -138,22 +140,16 @@ class SecureFileExplorer:
         Returns None if path would escape sandbox.
         """
         try:
-            # Handle relative paths from current directoryb
             if isinstance(path, str):
-                # Remove any suspicious patterns
                 if path.startswith("/"):
-                    # For absolute paths or parent references, resolve from sandbox root
                     test_path = Path(path).expanduser()
                 else:
-                    # For simple relative paths, resolve from current directory
                     test_path = self.current_path / path
             else:
                 test_path = path
 
-            # Resolve to absolute path
             resolved = test_path.resolve()
 
-            # Check if within sandbox
             if self._is_path_safe(resolved):
                 return resolved
             else:
@@ -197,10 +193,19 @@ class SecureFileExplorer:
         reverse: bool = False,
         exclude_patterns: list[str] | None = None,
         max_depth: int = 5,  # Add depth limit for recursive operations
+        cancel_check: Callable[[], bool] | None = None,
     ) -> list[FileInfo]:
-        """List contents with security-conscious filtering."""
+        """List contents with security-conscious filtering.
+
+        ``cancel_check`` is polled once per entry so a long walk over a big or slow
+        tree can be abandoned; it raises ``DirectoryScanCancelledError`` when it fires.
+        """
         contents: list[FileInfo] = []
         excluded_paths: set[str] = set()
+
+        def check_cancelled() -> None:
+            if cancel_check is not None and cancel_check():
+                raise DirectoryScanCancelledError("Directory scan cancelled")
 
         if exclude_patterns:
             for pattern in exclude_patterns:
@@ -230,17 +235,25 @@ class SecureFileExplorer:
                 processed = set()
 
                 while dirs_to_process:
+                    check_cancelled()
                     current_dir, depth = dirs_to_process.pop(0)
 
-                    # Skip if already processed or exceeds depth
-                    if current_dir in processed or depth > max_depth:
+                    # Key the visited set on the REAL path: a symlink pointing at an
+                    # ancestor yields a fresh Path every level, so an unresolved key
+                    # never repeats and the cycle is walked once per depth level.
+                    try:
+                        dir_key = Path(os.path.realpath(current_dir))
+                    except OSError:
                         continue
 
-                    processed.add(current_dir)
+                    if dir_key in processed or depth > max_depth:
+                        continue
+
+                    processed.add(dir_key)
 
                     try:
                         for item in current_dir.iterdir():
-                            # Security check for each item
+                            check_cancelled()
                             if not self._is_path_safe(item):
                                 continue
 
@@ -256,9 +269,8 @@ class SecureFileExplorer:
                     except (PermissionError, OSError):
                         continue
             else:
-                # Non-recursive listing
                 for item in self.current_path.iterdir():
-                    # Security check
+                    check_cancelled()
                     if not self._is_path_safe(item):
                         continue
 
@@ -272,7 +284,6 @@ class SecureFileExplorer:
         except PermissionError:
             raise PermissionError(f"Permission denied to access directory: {self.current_directory}") from None
 
-        # Sort results
         sort_key = {
             "name": lambda x: (not x.is_directory, x.name.lower()),
             "date": lambda x: (not x.is_directory, x.last_modified),
@@ -293,7 +304,6 @@ class SecureFileExplorer:
             return False
 
         try:
-            # Test if we can actually read the directory
             next(sanitized.iterdir(), None)
             self.current_path = sanitized
             return True
@@ -306,11 +316,9 @@ class SecureFileExplorer:
         """Navigate up to the parent directory, respecting sandbox."""
         parent = self.current_path.parent
 
-        # Check if parent is within sandbox
         if not self._is_path_safe(parent):
             return False
 
-        # Don't navigate if we're already at sandbox root
         if parent == self.current_path:
             return False
 
@@ -319,7 +327,6 @@ class SecureFileExplorer:
 
     def navigate_into(self, directory_name: str) -> bool:
         """Navigate into a subdirectory, with path sanitization."""
-        # Sanitize directory name
         if "/" in directory_name or "\\" in directory_name or ".." in directory_name:
             return False
 
@@ -357,17 +364,14 @@ def get_files_from_directory(
         List of FileInfo objects or None if directory doesn't exist or is outside sandbox
     """
     try:
-        # Create a secure explorer with sandbox
         if sandbox_root:
             explorer = SecureFileExplorer(start_path=dir_name, sandbox_root=sandbox_root)
         else:
             explorer = SecureFileExplorer(start_path=dir_name)
 
-        # Use the explorer's list_contents method
         return explorer.list_contents(show_hidden=include_hidden, file_types=types, recursive=recursive)
 
     except (ValueError, PermissionError):
-        # Return None for invalid/inaccessible directories
         return None
     except Exception as e:
         raise type(e)(f"Error scanning directory {dir_name}: {str(e)}") from e
@@ -390,10 +394,8 @@ def validate_file_path(user_path: str, allowed_base: Path) -> Path | None:
         if ".." in user_path:
             return None
 
-        # Get the base path as a normalized, real path string
         base_path = os.path.realpath(str(allowed_base.resolve()))
 
-        # Always resolve the user path relative to the allowed base directory
         candidate_path = os.path.join(base_path, user_path)
         fullpath = os.path.realpath(candidate_path)
 
@@ -407,6 +409,38 @@ def validate_file_path(user_path: str, allowed_base: Path) -> Path | None:
         return None
 
 
+def _is_contained(base: str, candidate: str) -> bool:
+    """True when ``candidate`` resolves to ``base`` or a path under it.
+
+    Realpaths both sides *before* the containment test, so a symlink whose target escapes the base is
+    rejected here rather than followed later (M-P2), and uses ``commonpath`` rather than a bare prefix
+    so a sibling dir sharing a name prefix (``/data/userX`` vs ``/data/user2``) cannot pass (M-P1).
+    """
+    base = os.path.realpath(base)
+    candidate = os.path.realpath(candidate)
+    if candidate == base:
+        return True
+    try:
+        return os.path.commonpath([base, candidate]) == base
+    except ValueError:  # different drives / mixed abs+rel
+        return False
+
+
+def _local_filesystem_roots() -> list[str]:
+    """Return the filesystem roots a desktop (electron) user may access.
+
+    POSIX: the single root ``/``. Windows: every present drive root
+    (``C:\\``, ``D:\\`` …). These are non-user-derived base paths, so using them
+    in the ``normpath + join + startswith`` check keeps the CodeQL-recognized
+    py/path-injection barrier while still permitting any local file in desktop
+    mode.
+    """
+    if os.name == "nt":
+        roots = [f"{letter}:\\" for letter in string.ascii_uppercase if os.path.exists(f"{letter}:\\")]
+        return roots or ["C:\\"]
+    return ["/"]
+
+
 def validate_path_under_cwd(user_path: str) -> str:
     """Validate that a user-provided path resolves to within allowed directories.
 
@@ -415,11 +449,6 @@ def validate_path_under_cwd(user_path: str) -> str:
     - Current working directory (for development/testing)
     - Flowfile storage directory (~/.flowfile)
     - User data directory (home directory in local mode, /data/user in Docker)
-
-    Uses the exact pattern from CodeQL documentation for py/path-injection:
-    - os.path.normpath for path normalization
-    - os.path.join to combine base with user input
-    - startswith check to ensure path stays within base
 
     Args:
         user_path: The user-provided path string
@@ -430,35 +459,27 @@ def validate_path_under_cwd(user_path: str) -> str:
     Raises:
         HTTPException: 403 if path escapes the allowed directories
     """
-    # In Electron mode, allow access to any local file path
-    # This is safe because Electron runs locally on the user's machine
+    if ".." in user_path:
+        raise HTTPException(403, "Access denied: path traversal not allowed")
+
+    expanded = os.path.expanduser(user_path)
+
     if settings.is_electron_mode():
-        # Normalize and resolve the path
-        normalized_path = os.path.normpath(os.path.expanduser(user_path))
-        # Block path traversal patterns even in Electron mode
-        if ".." in user_path:
-            raise HTTPException(403, "Access denied: path traversal not allowed")
-        return normalized_path
+        candidate = expanded if os.path.isabs(expanded) else os.path.join(os.getcwd(), expanded)
+        candidate_real = os.path.realpath(candidate)
+        for root in _local_filesystem_roots():
+            base_real = os.path.realpath(root)
+            if _is_contained(base_real, candidate_real):
+                return candidate_real
+        raise HTTPException(403, "Access denied")
 
-    # In Docker/package mode, enforce strict sandboxing
-    # Try current working directory first
-    base_path = os.path.normpath(os.getcwd())
-    fullpath = os.path.normpath(os.path.join(base_path, user_path))
-    if fullpath.startswith(base_path):
-        return fullpath
-
-    # Try flowfile storage directory (~/.flowfile)
-    base_path = os.path.normpath(str(storage.base_directory))
-    fullpath = os.path.normpath(os.path.join(base_path, user_path))
-    if fullpath.startswith(base_path):
-        return fullpath
-
-    # Try user data directory (consistent with SecureFileExplorer sandbox)
-    # In local mode this is the home directory, in Docker it's /data/user
-    base_path = os.path.normpath(str(storage.user_data_directory))
-    fullpath = os.path.normpath(os.path.join(base_path, user_path))
-    if fullpath.startswith(base_path):
-        return fullpath
+    # In Docker/package mode, enforce strict sandboxing to trusted roots.
+    for base in (os.getcwd(), str(storage.base_directory), str(storage.user_data_directory)):
+        base_real = os.path.realpath(base)
+        candidate = expanded if os.path.isabs(expanded) else os.path.join(base_real, expanded)
+        candidate_real = os.path.realpath(candidate)
+        if _is_contained(base_real, candidate_real):
+            return candidate_real
 
     raise HTTPException(403, "Access denied")
 

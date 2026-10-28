@@ -1,95 +1,62 @@
-# Visual Editor Guide
+# Visual Editor
 
-Build powerful data pipelines without writing code using Flowfile's intuitive drag-and-drop interface.
+Build data pipelines by dragging nodes onto a canvas and connecting them — no code required. Each node is one operation (read a file, filter rows, join two tables), and you can inspect the data after every step.
 
-## What You'll Learn
+!!! tip "Try it in your browser first"
+    [**Flowfile Lite**](../deployment/lite.md) runs this same canvas entirely in your browser at [demo.flowfile.org](https://demo.flowfile.org) — a lightweight subset with no backend, databases, scheduler, or AI.
 
-- **Build flows visually** - Drag, drop, and connect nodes
-- **Transform data** - Filter, aggregate, join, and more
-- **Connect to data sources** - Databases, files, and cloud storage
-- **Preview results** - See data at each step
-- **Export to code** - Generate Python code from your visual flows
+## Three concepts
 
-## Getting Started
+- **Nodes** — one data action each, grouped into the six palette categories: [Input Sources](nodes/input.md), [Transformations](nodes/transform.md), [Combine Operations](nodes/combine.md), [Aggregations](nodes/aggregate.md), [Machine Learning](nodes/ml.md) and [Output Operations](nodes/output.md). [Data Actions](nodes/index.md) lists all 49 in one table.
+- **Connections** — drag between node handles to define how data flows, left to right.
+- **Execution modes** — **Development** materializes every node so you can preview all intermediate data; **Performance** executes only what outputs need, with query optimization across nodes.
 
-### Your First Flow
+If you haven't built a flow yet, the [Quickstart](../../quickstart.md#your-first-flow-visually) walks through a complete one in five steps.
 
-1. **Create a new flow** - Click "Create" in the toolbar
-2. **Add an input node** - Drag a "Read Data" node from the left panel
-3. **Configure the node** - Click it and set file path in the right panel
-4. **Add transformations** - Connect filter, sort, or other nodes
-5. **Run the flow** - Click "Run" and see your results
+## In this section
 
-### Interface Overview
+<div class="grid cards" markdown>
 
-![Flowfile Interface](../../assets/images/ui/full_ui.png)
+-   :material-vector-polyline: **[Building Flows](building-flows.md)**
 
-- **Left Panel**: Node library organized by category
-- **Center Canvas**: Build your flow here
-- **Right Panel**: Configure selected nodes
-- **Bottom Panel**: Preview data and logs
+    ---
 
-## Core Concepts
+    Canvas mechanics: create, connect, configure, run, save.
 
-### Nodes
+-   :material-function-variant: **[Formulas](../formulas/index.md)**
 
-Each node represents a data operation:
+    ---
 
-- **[Input nodes](nodes/input.md)** - Load data from files, databases, APIs
-- **[Transform nodes](nodes/transform.md)** - Modify and clean your data
-- **[Combine nodes](nodes/combine.md)** - Join and merge datasets
-- **[Aggregate nodes](nodes/aggregate.md)** - Summarize and group data
-- **[Output nodes](nodes/output.md)** - Save or export results
+    The Excel-like expression language used in Formula and Filter nodes.
 
-### Connections
-Draw lines between nodes to define data flow. Data moves from top to bottom, left to right.
+-   :material-graph-outline: **[Data Actions](nodes/index.md)**
 
-### Execution
+    ---
 
-- **Development mode** - See data at every step (great for debugging)
-- **Performance mode** - Optimized execution for large datasets
+    Every action Flowfile can perform on your data, A to Z, with a lookup by what you want to do.
 
-## Learn More
+-   :material-language-python: **[Sandboxed Python](kernels.md)**
 
-### More Resources
-- [Building Flows](building-flows.md) - Detailed workflow guide
-- [Node Reference](nodes/index.md) - Complete documentation of all nodes
+    ---
 
-### Tutorials
-- [Connect to Databases](tutorials/database-connectivity.md) - PostgreSQL, MySQL, and more
-- [Cloud Storage Setup](tutorials/cloud-connections.md) - Work with S3 data
-- [Export to Python](tutorials/code-generator.md) - Convert visual flows to code
+    Run arbitrary Python in Docker-isolated kernels as a node.
 
-## Tips for Success
+-   :material-toy-brick-outline: **[Node Designer](node-designer.md)**
 
-1. **Start simple** - Build basic flows before adding complexity
-2. **Use descriptions** - Document nodes for your future self
-3. **Preview often** - Check data at each transformation
-4. **Save regularly** - Flows are saved as `.flowfile` files
-5. **Try both modes** - Development for testing, Performance for production
+    ---
 
-## Visual vs Code
+    Missing a node you need? Build your own — visually, no Python file to write by hand — and it joins the palette with its own settings form.
 
-Wondering when to use visual vs Python? Here's a quick guide:
+-   :material-school-outline: **[Worked Examples](tutorials/index.md)**
 
-**Use Visual Editor when:**
+    ---
 
-- Exploring new datasets
-- Building one-off analyses
-- Collaborating with non-technical users
-- Creating documented workflows
-- Learning data transformations
+    Complete flows with data, expected results, and downloads.
 
-**Consider [Python API](../python-api/index.md) when:**
+</div>
 
-- Integrating with existing code
-- Building programmatic pipelines
-- Need version control
-- Require advanced custom logic
-- Automating workflows
+[Settings](settings.md) covers theme and user management.
 
-Remember, you can always switch between them!
+## Visual or Python?
 
----
-
-*Ready to build? Start with [Building Flows](building-flows.md) or explore the [Node Reference](nodes/index.md).*
+Both build the same flow graph, so this is a preference, not a commitment: any visual flow [exports to Python](tutorials/code-generator.md), and any [Python pipeline](../python-api/index.md) opens on the canvas. The canvas shines for exploring unfamiliar data and for handing work to colleagues who don't code; the Python API fits automation, version control, and logic that outgrows node settings.

@@ -28,6 +28,50 @@
           </el-button>
         </div>
       </div>
+      <div
+        v-if="receivedTable && isDirectoryCapable(receivedTable.file_type)"
+        class="listbox-wrapper"
+      >
+        <div class="listbox-subtitle">Source</div>
+        <div class="scan-row">
+          <label class="scan-label">Read</label>
+          <el-select
+            :model-value="scanMode"
+            size="small"
+            class="scan-control"
+            @change="handleScanModeChange"
+          >
+            <el-option label="Single file" value="single_file" />
+            <el-option label="Directory" value="directory" />
+          </el-select>
+        </div>
+        <template v-if="scanMode === 'directory'">
+          <div class="scan-row">
+            <label class="scan-label">File format</label>
+            <el-select
+              :model-value="receivedTable.file_type"
+              size="small"
+              class="scan-control"
+              @change="handleDirectoryFileTypeChange"
+            >
+              <el-option label="CSV" value="csv" />
+              <el-option label="Parquet" value="parquet" />
+              <el-option label="Arrow (IPC)" value="ipc" />
+            </el-select>
+          </div>
+          <div class="scan-row">
+            <label class="scan-label">File path column</label>
+            <el-input
+              v-model="includeFilePathsInput"
+              size="small"
+              class="scan-control"
+              clearable
+              placeholder="Optional: column name for the source file path"
+              @change="handleIncludeFilePathsChange"
+            />
+          </div>
+        </template>
+      </div>
       <div v-if="receivedTable">
         <div class="listbox-wrapper">
           <div class="listbox-subtitle">File Specs</div>
@@ -39,9 +83,26 @@
           <CsvTableConfig
             v-if="isInputCsvTable(receivedTable.table_settings)"
             v-model="receivedTable.table_settings"
+            :directory-mode="scanMode === 'directory'"
           />
           <ParquetTableConfig
             v-if="isInputParquetTable(receivedTable.table_settings)"
+            v-model="receivedTable.table_settings"
+          />
+          <IpcTableConfig
+            v-if="isInputIpcTable(receivedTable.table_settings)"
+            v-model="receivedTable.table_settings"
+          />
+          <NdjsonTableConfig
+            v-if="isInputNdjsonTable(receivedTable.table_settings)"
+            v-model="receivedTable.table_settings"
+          />
+          <AvroTableConfig
+            v-if="isInputAvroTable(receivedTable.table_settings)"
+            v-model="receivedTable.table_settings"
+          />
+          <IpcStreamTableConfig
+            v-if="isInputIpcStreamTable(receivedTable.table_settings)"
             v-model="receivedTable.table_settings"
           />
         </div>
@@ -49,16 +110,19 @@
 
       <el-dialog
         v-model="modalVisibleForOpen"
-        title="Select a file to Read"
+        title="Select a file or folder to read"
         width="70%"
+        append-to-body
         :close-on-click-modal="false"
       >
         <file-browser
-          :allowed-file-types="['csv', 'txt', 'parquet', 'xlsx']"
+          :allowed-file-types="[...READ_EXTENSIONS]"
           mode="open"
           context="dataFiles"
           :is-visible="modalVisibleForOpen"
+          :allow-directory-selection="allowDirectorySelection"
           @file-selected="handleFileChange"
+          @directory-selected="handleDirectorySelected"
         />
       </el-dialog>
     </generic-node-settings>
@@ -68,20 +132,39 @@
 
 <script lang="ts" setup>
 import { CodeLoader } from "vue-content-loader";
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
+import { ElMessage } from "element-plus";
 import ExcelTableConfig from "./readExcel.vue";
 import CsvTableConfig from "./readCsv.vue";
 import ParquetTableConfig from "./readParquet.vue";
+import IpcTableConfig from "./readIpc.vue";
+import NdjsonTableConfig from "./readNdjson.vue";
+import AvroTableConfig from "./readAvro.vue";
+import IpcStreamTableConfig from "./readIpcStream.vue";
 import {
   ReceivedTable,
   NodeRead,
+  ScanMode,
   isInputCsvTable,
   isInputExcelTable,
   isInputParquetTable,
-  InputCsvTable,
-  InputExcelTable,
-  InputParquetTable,
+  isInputIpcTable,
+  isInputNdjsonTable,
+  isInputAvroTable,
+  isInputIpcStreamTable,
 } from "../../../baseNode/nodeInput";
+import {
+  baseNameOf,
+  createDefaultSettings,
+  detectFileType,
+  extensionOf,
+  inferScanModeFromPath,
+  isDirectoryCapable,
+  isUtf8Encoding,
+  READ_EXTENSIONS,
+  type ReadFileType,
+} from "../../../../../utils/readFileTypes";
+import { scanModeForSelection } from "../../../../common/FileBrowser/cloudPathMapping";
 import { useNodeStore } from "../../../../../stores/node-store";
 import { useNodeSettings } from "../../../../../composables/useNodeSettings";
 import FileBrowser from "../../../../common/FileBrowser/fileBrowser.vue";
@@ -94,22 +177,22 @@ const receivedTable = ref<ReceivedTable | null>(null);
 const dataLoaded = ref(false);
 const modalVisibleForOpen = ref(false);
 
-// Use the standardized node settings composable
 const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSettings({
   nodeRef: nodeRead,
   onBeforeSave: () => {
     if (!nodeRead.value || !receivedTable.value) {
       console.warn("No node read value available");
+      if (pathInput.value.trim()) {
+        ElMessage.warning(
+          `'${pathInput.value.trim()}' has no recognised file type. Pick a file, or type a path with its extension.`,
+        );
+      }
       return false;
     }
     nodeRead.value.received_file = receivedTable.value;
     return true;
   },
 });
-
-// ---------------------------------------------------------------------------
-// Manual path input
-// ---------------------------------------------------------------------------
 
 // Use a plain ref so the input is always editable (writable computed resets
 // on every keystroke when receivedTable is null, making the field unusable)
@@ -125,22 +208,46 @@ watch(
   },
 );
 
-function detectFileType(path: string): "csv" | "excel" | "parquet" | null {
-  // Strip ${...} references so we can read the real extension
-  const cleaned = path.replace(/\$\{[^}]*\}/g, "");
-  const ext = cleaned.split(".").pop()?.toLowerCase();
-  if (ext === "xlsx") return "excel";
-  if (ext === "csv" || ext === "txt") return "csv";
-  if (ext === "parquet") return "parquet";
-  return null;
+const scanMode = computed<ScanMode>(() => receivedTable.value?.scan_mode ?? "single_file");
+
+// Picking a directory rewrites the node to a directory-capable type, discarding the current settings.
+const allowDirectorySelection = computed(
+  () => !receivedTable.value || isDirectoryCapable(receivedTable.value.file_type),
+);
+
+const includeFilePathsInput = ref<string>("");
+
+watch(
+  () => receivedTable.value?.include_file_paths,
+  (value) => {
+    includeFilePathsInput.value = value ?? "";
+  },
+);
+
+// The backend refuses a non-UTF-8 directory csv read, so a stale encoding would block every save.
+// Call from every path that can promote a table to directory mode.
+function normalizeEncodingForScanMode(table: ReceivedTable) {
+  if (table.scan_mode !== "directory") return;
+  const settings = table.table_settings;
+  if (isInputCsvTable(settings) && !isUtf8Encoding(settings.encoding)) {
+    settings.encoding = "utf-8";
+  }
 }
 
-function createDefaultSettings(
-  fileType: "csv" | "excel" | "parquet",
-): InputCsvTable | InputExcelTable | InputParquetTable {
-  if (fileType === "excel") return createDefaultExcelSettings();
-  if (fileType === "parquet") return createDefaultParquetSettings();
-  return createDefaultCsvSettings();
+// Seed only: the scan-mode select below stays the authoritative override, so a
+// path edit may promote to directory but never silently demotes an explicit pick.
+function applyScanModeForPath(table: ReceivedTable, path: string) {
+  if (!isDirectoryCapable(table.file_type)) {
+    table.scan_mode = "single_file";
+  } else if (inferScanModeFromPath(path) === "directory") {
+    table.scan_mode = "directory";
+  } else {
+    table.scan_mode = table.scan_mode ?? "single_file";
+  }
+  if (table.scan_mode === "single_file") {
+    table.include_file_paths = null;
+  }
+  normalizeEncodingForScanMode(table);
 }
 
 function handleManualPathChange(path: string) {
@@ -153,54 +260,77 @@ function handleManualPathChange(path: string) {
     // Swap settings when file type changes (e.g. user edits .csv → .parquet)
     if (detectedType && detectedType !== receivedTable.value.file_type) {
       receivedTable.value.file_type = detectedType;
-      receivedTable.value.table_settings = createDefaultSettings(detectedType);
+      receivedTable.value.table_settings = createDefaultSettings(detectedType, extensionOf(path));
     }
+    applyScanModeForPath(receivedTable.value, path);
   } else if (detectedType) {
     // Bootstrap a new receivedTable from a typed path
-    receivedTable.value = {
+    const table: ReceivedTable = {
       name: fileName,
       path,
       file_type: detectedType,
-      table_settings: createDefaultSettings(detectedType),
+      table_settings: createDefaultSettings(detectedType, extensionOf(path)),
+      scan_mode: "single_file",
+      include_file_paths: null,
     };
+    applyScanModeForPath(table, path);
+    receivedTable.value = table;
   }
 }
 
-// Default table settings factories
-function createDefaultCsvSettings(): InputCsvTable {
-  return {
-    file_type: "csv",
-    reference: "",
-    starting_from_line: 0,
-    delimiter: ",",
-    has_headers: true,
-    encoding: "utf-8",
-    row_delimiter: "\n",
-    quote_char: '"',
-    infer_schema_length: 1000,
-    truncate_ragged_lines: false,
-    ignore_errors: false,
-  };
+function handleScanModeChange(value: string) {
+  if (!receivedTable.value) return;
+  receivedTable.value.scan_mode = value === "directory" ? "directory" : "single_file";
+  if (receivedTable.value.scan_mode === "single_file") {
+    receivedTable.value.include_file_paths = null;
+  }
+  normalizeEncodingForScanMode(receivedTable.value);
+  // The schema differs per mode, so the cached one can never be reused.
+  receivedTable.value.fields = [];
+  saveSettings();
 }
 
-function createDefaultExcelSettings(): InputExcelTable {
-  return {
-    file_type: "excel",
-    sheet_name: "",
-    start_row: 0,
-    start_column: 0,
-    end_row: 0,
-    end_column: 0,
-    has_headers: true,
-    type_inference: false,
-  };
+// A bare directory has no extension to sniff, so the format is picked explicitly.
+function handleDirectoryFileTypeChange(value: string) {
+  if (!receivedTable.value || !isDirectoryCapable(value)) return;
+  receivedTable.value.file_type = value;
+  receivedTable.value.table_settings = createDefaultSettings(value);
+  receivedTable.value.fields = [];
+  saveSettings();
 }
 
-function createDefaultParquetSettings(): InputParquetTable {
-  return {
-    file_type: "parquet",
-  };
+function handleIncludeFilePathsChange(value: string) {
+  if (!receivedTable.value) return;
+  const columnName = value.trim();
+  includeFilePathsInput.value = columnName;
+  receivedTable.value.include_file_paths = columnName === "" ? null : columnName;
+  receivedTable.value.fields = [];
+  saveSettings();
 }
+
+const handleDirectorySelected = (directoryPath: string) => {
+  const currentType = receivedTable.value?.file_type;
+  const fileType: ReadFileType = isDirectoryCapable(currentType) ? currentType : "csv";
+  const tableSettings =
+    receivedTable.value && receivedTable.value.file_type === fileType
+      ? receivedTable.value.table_settings
+      : createDefaultSettings(fileType);
+
+  const table: ReceivedTable = {
+    name: baseNameOf(directoryPath) || directoryPath,
+    path: directoryPath,
+    file_type: fileType,
+    table_settings: tableSettings,
+    // Only an explicit pick is authoritative about file-vs-directory; the select stays the override.
+    scan_mode: scanModeForSelection(true),
+    include_file_paths: receivedTable.value?.include_file_paths ?? null,
+    fields: [],
+  };
+  normalizeEncodingForScanMode(table);
+  receivedTable.value = table;
+
+  modalVisibleForOpen.value = false;
+};
 
 const handleFileChange = (fileInfo: FileInfo) => {
   try {
@@ -209,39 +339,27 @@ const handleFileChange = (fileInfo: FileInfo) => {
       return;
     }
 
-    const ext = fileInfo.name.split(".").pop()?.toLowerCase();
-    if (!ext) {
-      console.warn("No file type detected");
+    const fileType = detectFileType(fileInfo.name);
+    if (!fileType) {
+      console.warn("Unsupported file type:", fileInfo.name);
       return;
     }
 
-    let fileType: "csv" | "excel" | "parquet";
-    let tableSettings: InputCsvTable | InputExcelTable | InputParquetTable;
-
-    switch (ext) {
-      case "xlsx":
-        fileType = "excel";
-        tableSettings = createDefaultExcelSettings();
-        break;
-      case "csv":
-      case "txt":
-        fileType = "csv";
-        tableSettings = createDefaultCsvSettings();
-        break;
-      case "parquet":
-        fileType = "parquet";
-        tableSettings = createDefaultParquetSettings();
-        break;
-      default:
-        console.warn("Unsupported file type:", ext);
-        return;
-    }
+    // Preserve the user's table_settings when re-selecting a file of the same type;
+    // only rebuild defaults when the type actually changes (mirrors handleManualPathChange).
+    const tableSettings =
+      receivedTable.value && receivedTable.value.file_type === fileType
+        ? receivedTable.value.table_settings
+        : createDefaultSettings(fileType, extensionOf(fileInfo.name));
 
     receivedTable.value = {
       name: fileInfo.name,
       path: fileInfo.path,
       file_type: fileType,
       table_settings: tableSettings,
+      // A file pick is authoritative about file-vs-directory; the select stays the override.
+      scan_mode: scanModeForSelection(false),
+      include_file_paths: null,
     };
 
     modalVisibleForOpen.value = false;
@@ -290,6 +408,23 @@ defineExpose({
 }
 
 .file-path-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.scan-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.scan-label {
+  flex: 0 0 120px;
+  font-size: 12px;
+}
+
+.scan-control {
   flex: 1;
   min-width: 0;
 }

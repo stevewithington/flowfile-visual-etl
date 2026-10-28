@@ -1,5 +1,3 @@
-# flowfile_core/tests/utils.py
-
 import platform
 import subprocess
 from contextlib import contextmanager
@@ -8,6 +6,7 @@ from flowfile_core.auth.models import SecretInput
 from flowfile_core.database.connection import get_db_context
 from flowfile_core.schemas import input_schema
 from flowfile_core.secret_manager.secret_manager import get_encrypted_secret, store_secret
+from test_utils.exec_script import exec_script  # noqa: F401  (re-exported for the suites that import it here)
 
 
 def is_docker_available():
@@ -61,6 +60,5 @@ def run_generator():
         from time import sleep
         print(os.environ["TESTING"])
         sleep(1)
-        # Do something with the value
 
     print(os.environ["TESTING"])

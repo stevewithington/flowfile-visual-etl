@@ -433,6 +433,89 @@ def generate_customer_churn():
     )
 
 
+def generate_supermarket_sales():
+    """~1000 supermarket sales rows for the flagship docs example.
+
+    Uses a dedicated RNG (seed 43) so it doesn't perturb the global-seed
+    outputs above; must run LAST in __main__.
+    """
+    rng = random.Random(43)
+    cities = ["Yangon", "Naypyitaw", "Mandalay", "Bago", "Taunggyi"]
+    customer_types = ["Member", "Normal"]
+    product_lines = [
+        "Health and beauty",
+        "Electronic accessories",
+        "Home and lifestyle",
+        "Sports and travel",
+        "Food and beverages",
+        "Fashion accessories",
+    ]
+    start = datetime(2024, 1, 1)
+    end = datetime(2024, 12, 31)
+    delta_days = (end - start).days
+
+    rows = []
+    for i in range(1, 1001):
+        unit_price = round(rng.uniform(10.0, 100.0), 2)
+        quantity = rng.randint(1, 10)
+        gross_income = round(unit_price * quantity * 0.05, 2)
+        date = (start + timedelta(days=rng.randint(0, delta_days))).strftime("%Y-%m-%d")
+        rows.append([
+            f"INV-{i:05d}",
+            rng.choice(cities),
+            rng.choice(customer_types),
+            rng.choice(product_lines),
+            unit_price,
+            quantity,
+            gross_income,
+            date,
+        ])
+
+    for _ in range(30):
+        rows.append(list(rng.choice(rows)))
+    rng.shuffle(rows)
+    write_csv(
+        "supermarket_sales.csv",
+        ["invoice_id", "city", "customer_type", "product_line", "unit_price", "quantity", "gross_income", "date"],
+        rows,
+    )
+
+
+def generate_customer_segments():
+    """45 rows in three well-separated clusters for the K-Means custom-node demo.
+
+    Three customer segments (budget / premium / saver) sit at distinct centers in
+    (age, annual_income_k, spending_score) space, so K-Means with k=3 recovers them
+    cleanly. ``segment`` is the ground-truth label — a string, so the numeric feature
+    picker ignores it and it's left in for eyeballing the result. Dedicated RNG
+    (seed 44) so it doesn't perturb the global-seed outputs above.
+    """
+    rng = random.Random(44)
+    # segment -> (age, annual_income_k, spending_score) cluster center
+    centers = {
+        "budget": (25, 28, 35),
+        "premium": (45, 95, 82),
+        "saver": (58, 70, 22),
+    }
+    age_sd, income_sd, spend_sd = 3.0, 5.0, 6.0
+
+    rows = []
+    for segment, (age_c, income_c, spend_c) in centers.items():
+        for _ in range(15):
+            age = round(rng.gauss(age_c, age_sd))
+            income = round(rng.gauss(income_c, income_sd), 1)
+            spending = min(100, max(0, round(rng.gauss(spend_c, spend_sd))))
+            rows.append([age, income, spending, segment])
+
+    rng.shuffle(rows)
+    rows = [[f"C{i:03d}", *row] for i, row in enumerate(rows, start=1)]
+    write_csv(
+        "customer_segments.csv",
+        ["customer_id", "age", "annual_income_k", "spending_score", "segment"],
+        rows,
+    )
+
+
 if __name__ == "__main__":
     print("Generating template data files...")
     generate_sales_data()
@@ -446,4 +529,6 @@ if __name__ == "__main__":
     generate_fuzzy_match_data()
     generate_house_prices()
     generate_customer_churn()
+    generate_supermarket_sales()
+    generate_customer_segments()
     print("Done!")

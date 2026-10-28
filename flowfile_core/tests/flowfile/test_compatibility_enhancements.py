@@ -1,5 +1,6 @@
 """Tests for flowfile/manage/compatibility_enhancements module."""
 
+import pickle
 from dataclasses import dataclass, fields
 from unittest.mock import MagicMock
 
@@ -13,6 +14,9 @@ from flowfile_core.flowfile.manage.compatibility_enhancements import (
     ensure_description,
     ensure_compatibility_node_read,
     ensure_compatibility_node_output,
+    ensure_compatibility_node_catalog_reader,
+    ensure_compatibility_node_catalog_writer,
+    ensure_compatibility_node_cloud_storage_writer,
     ensure_flow_settings,
 )
 from flowfile_core.schemas import input_schema, schemas
@@ -231,6 +235,106 @@ class TestEnsureDescription:
         assert node.description == "existing"
 
 
+class TestEnsureCompatibilityNodeCloudStorageWriter:
+    """Test ensure_compatibility_node_cloud_storage_writer function."""
+
+    @staticmethod
+    def _make_node():
+        from flowfile_core.schemas.cloud_storage_schemas import CloudStorageWriteSettings
+
+        settings = CloudStorageWriteSettings(resource_path="s3://bucket/table", file_format="delta")
+        return input_schema.NodeCloudStorageWriter(
+            flow_id=1, node_id=1, user_id=1, cloud_storage_settings=settings
+        )
+
+    def test_adds_missing_partition_by(self):
+        node = self._make_node()
+        # Simulate a pickle written before partition_by existed: the field is absent from __dict__
+        del node.cloud_storage_settings.__dict__["partition_by"]
+        with pytest.raises(AttributeError):
+            _ = node.cloud_storage_settings.partition_by
+
+        ensure_compatibility_node_cloud_storage_writer(node)
+        assert node.cloud_storage_settings.partition_by is None
+
+    def test_preserves_existing_partition_by(self):
+        node = self._make_node()
+        node.cloud_storage_settings.partition_by = ["region"]
+        ensure_compatibility_node_cloud_storage_writer(node)
+        assert node.cloud_storage_settings.partition_by == ["region"]
+
+    def test_handles_missing_settings(self):
+        node = MagicMock()
+        node.cloud_storage_settings = None
+        ensure_compatibility_node_cloud_storage_writer(node)
+
+
+class TestEnsureCompatibilityNodeCatalogWriter:
+    """Test ensure_compatibility_node_catalog_writer function."""
+
+    @staticmethod
+    def _make_node():
+        settings = input_schema.CatalogWriteSettings(table_name="dim_customer", write_mode="overwrite")
+        return input_schema.NodeCatalogWriter(flow_id=1, node_id=1, user_id=1, catalog_write_settings=settings)
+
+    def test_adds_missing_scd2(self):
+        node = self._make_node()
+        # Simulate a pickle written before the scd2 block existed: the field is absent from __dict__
+        del node.catalog_write_settings.__dict__["scd2"]
+        with pytest.raises(AttributeError):
+            _ = node.catalog_write_settings.scd2
+
+        ensure_compatibility_node_catalog_writer(node)
+        assert node.catalog_write_settings.scd2 is None
+
+    def test_preserves_existing_scd2(self):
+        node = self._make_node()
+        node.catalog_write_settings.scd2 = input_schema.Scd2Settings(compare_columns=["city"])
+        ensure_compatibility_node_catalog_writer(node)
+        assert node.catalog_write_settings.scd2.compare_columns == ["city"]
+
+    def test_handles_missing_settings(self):
+        node = MagicMock()
+        node.catalog_write_settings = None
+        ensure_compatibility_node_catalog_writer(node)
+
+
+class TestEnsureCompatibilityNodeCatalogReader:
+    """Test ensure_compatibility_node_catalog_reader function."""
+
+    @staticmethod
+    def _make_node():
+        return input_schema.NodeCatalogReader(flow_id=1, node_id=1, user_id=1, catalog_table_name="dim_customer")
+
+    def test_adds_missing_scd2_view_fields(self):
+        node = self._make_node()
+        # Simulate a pickle written before the SCD2 history view existed.
+        del node.__dict__["scd2_view"]
+        del node.__dict__["scd2_as_of"]
+        with pytest.raises(AttributeError):
+            _ = node.scd2_view
+
+        ensure_compatibility_node_catalog_reader(node)
+        assert node.scd2_view is None
+        assert node.scd2_as_of is None
+
+    def test_survives_a_pickle_round_trip(self):
+        node = self._make_node()
+        del node.__dict__["scd2_view"]
+        del node.__dict__["scd2_as_of"]
+        revived = pickle.loads(pickle.dumps(node))
+
+        ensure_compatibility_node_catalog_reader(revived)
+        assert (revived.scd2_view, revived.scd2_as_of) == (None, None)
+
+    def test_preserves_existing_values(self):
+        node = self._make_node()
+        node.scd2_view = "active_at"
+        node.scd2_as_of = "2026-01-01T00:00:00+00:00"
+        ensure_compatibility_node_catalog_reader(node)
+        assert (node.scd2_view, node.scd2_as_of) == ("active_at", "2026-01-01T00:00:00+00:00")
+
+
 class TestEnsureFlowSettings:
     """Test ensure_flow_settings function."""
 
@@ -239,7 +343,6 @@ class TestEnsureFlowSettings:
         flow_obj.flow_id = 1
         flow_obj.flow_name = "test_flow"
         flow_obj.flow_settings = None
-        # Mock model_validate to return the flow_obj itself
         schemas.FlowInformation.model_validate = MagicMock(return_value=flow_obj)
 
         result = ensure_flow_settings(flow_obj, "/path/to/flow")
@@ -260,3 +363,19 @@ class TestEnsureFlowSettings:
         flow_obj = FakeFlowObj()
         result = ensure_flow_settings(flow_obj, "/path")
         assert flow_obj.flow_settings.execution_location == "remote"
+
+    def test_backfills_fields_added_after_the_pickle_format(self):
+        """A FlowSettings unpickled from an older release has no __dict__ entry for new fields."""
+        fs = schemas.FlowSettings(flow_id=1, name="legacy", path=".")
+        legacy_dict = {k: v for k, v in fs.__dict__.items()
+                       if k not in ("validate_settings", "track_history", "parameters")}
+        object.__setattr__(fs, "__dict__", legacy_dict)
+
+        class FakeFlowObj:
+            flow_settings = fs
+
+        flow_obj = FakeFlowObj()
+        ensure_flow_settings(flow_obj, "/path")
+        assert flow_obj.flow_settings.validate_settings is True
+        assert flow_obj.flow_settings.track_history is True
+        assert flow_obj.flow_settings.parameters == []

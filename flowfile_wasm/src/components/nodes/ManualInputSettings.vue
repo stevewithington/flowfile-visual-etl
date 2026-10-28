@@ -95,6 +95,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import { useFlowStore } from '../../stores/flow-store'
+import { inferColumnDataType } from '../../utils/manualInputLogic'
 import type { NodeSettings, NodeManualInputSettings, RawData, MinimalFieldInfo } from '../../types'
 
 interface Column {
@@ -119,7 +120,6 @@ const emit = defineEmits<{
 
 const flowStore = useFlowStore()
 
-// State
 const columns = ref<Column[]>([])
 const rows = ref<Row[]>([])
 const showJsonEditor = ref(false)
@@ -129,7 +129,6 @@ const errorMessage = ref('')
 let nextColumnId = 1
 let nextRowId = 1
 
-// Initialize with empty table if no data
 function initializeEmptyTable() {
   columns.value = [{ id: 1, name: 'Column 1', dataType: 'String' }]
   rows.value = [{ id: 1, values: { 1: '' } }]
@@ -137,7 +136,6 @@ function initializeEmptyTable() {
   nextRowId = 2
 }
 
-// Convert table to JSON for display
 const tableAsJson = computed(() => {
   return rows.value.map(row => {
     const obj: Record<string, string> = {}
@@ -148,15 +146,11 @@ const tableAsJson = computed(() => {
   })
 })
 
-// Load data from settings
 function loadData() {
   const settings = props.settings as any
-  console.log('[ManualInputSettings] loadData called with:', settings)
 
-  // Try raw_data_format (flowfile_core schema)
   if (settings?.raw_data_format?.columns?.length > 0) {
     const rd = settings.raw_data_format as RawData
-    console.log('[ManualInputSettings] Loading from raw_data_format:', rd)
 
     columns.value = rd.columns.map((f: MinimalFieldInfo, idx: number) => ({
       id: idx + 1,
@@ -164,11 +158,13 @@ function loadData() {
       dataType: f.data_type || 'String'
     }))
 
-    if (rd.data && rd.data.length > 0) {
-      rows.value = rd.data.map((rowData, rowIdx) => {
+    // rd.data is columnar: rd.data[colIdx][rowIdx] (matches flowfile_core RawData)
+    if (rd.data && rd.data.length > 0 && rd.data[0]?.length > 0) {
+      const numRows = rd.data[0].length
+      rows.value = Array.from({ length: numRows }, (_, rowIdx) => {
         const values: Record<number, string> = {}
         columns.value.forEach((col, colIdx) => {
-          values[col.id] = String(rowData[colIdx] ?? '')
+          values[col.id] = String(rd.data[colIdx]?.[rowIdx] ?? '')
         })
         return { id: rowIdx + 1, values }
       })
@@ -186,9 +182,7 @@ function loadData() {
     return
   }
 
-  // Try manual_input format (legacy schema)
   if (settings?.manual_input?.data) {
-    console.log('[ManualInputSettings] Loading from manual_input')
     const mi = settings.manual_input
     try {
       loadFromCsv(mi.data, mi.has_headers ?? true, mi.delimiter || ',')
@@ -199,10 +193,8 @@ function loadData() {
     }
   }
 
-  // Try file contents
-  const storedContent = flowStore.fileContents.get(props.nodeId)
+  const storedContent = flowStore.getTextContent(props.nodeId)
   if (storedContent) {
-    console.log('[ManualInputSettings] Loading from fileContents')
     try {
       loadFromCsv(storedContent, true, ',')
       jsonInput.value = JSON.stringify(tableAsJson.value, null, 2)
@@ -212,8 +204,6 @@ function loadData() {
     }
   }
 
-  // Initialize empty table
-  console.log('[ManualInputSettings] No data found, initializing empty table')
   initializeEmptyTable()
   jsonInput.value = '[]'
 }
@@ -265,34 +255,18 @@ function loadFromCsv(csvData: string, hasHeaders: boolean, delimiter: string) {
   nextColumnId = columns.value.length + 1
   nextRowId = rows.value.length + 1
 
-  // Infer data types
   columns.value.forEach(col => {
     col.dataType = inferDataType(col.id)
   })
 }
 
 function inferDataType(colId: number): string {
-  const values = rows.value.map(r => r.values[colId]).filter(v => v !== '' && v !== null && v !== undefined)
-  if (values.length === 0) return 'String'
-
-  const allBooleans = values.every(v => v === 'true' || v === 'false')
-  if (allBooleans) return 'Boolean'
-
-  const allIntegers = values.every(v => /^-?\d+$/.test(v))
-  if (allIntegers) return 'Int64'
-
-  const allNumbers = values.every(v => !isNaN(parseFloat(v)))
-  if (allNumbers) return 'Float64'
-
-  return 'String'
+  return inferColumnDataType(rows.value.map(r => r.values[colId]))
 }
 
-// Save data to settings
 function saveData() {
-  console.log('[ManualInputSettings] saveData called')
   errorMessage.value = ''
 
-  // Build RawData structure matching flowfile_core format
   const columnsData: MinimalFieldInfo[] = columns.value.map(col => ({
     name: col.name,
     data_type: col.dataType
@@ -326,16 +300,12 @@ function saveData() {
     }
   } as any
 
-  console.log('[ManualInputSettings] Emitting settings:', newSettings)
   emit('update:settings', newSettings)
 
-  // Store CSV for execution
   flowStore.setFileContent(props.nodeId, csvData)
 
-  // Update source node schema for reactive schema propagation
   flowStore.setSourceNodeSchema(props.nodeId, columnsData)
 
-  // Update JSON display
   jsonInput.value = JSON.stringify(tableAsJson.value, null, 2)
 }
 
@@ -354,7 +324,6 @@ function escapeCSV(value: string): string {
   return value
 }
 
-// Table manipulation
 function addColumn() {
   const newCol: Column = {
     id: nextColumnId,
@@ -411,7 +380,6 @@ function deleteRow(id: number) {
 
 function handleTab(event: KeyboardEvent, rowIndex: number, colId: number) {
   const colIndex = columns.value.findIndex(c => c.id === colId)
-  // If last cell, add new row
   if (colIndex === columns.value.length - 1 && rowIndex === rows.value.length - 1) {
     event.preventDefault()
     addRow()
@@ -439,7 +407,6 @@ function applyJson() {
       return
     }
 
-    // Get column names from first object
     const colNames = Object.keys(data[0])
     columns.value = colNames.map((name, idx) => ({
       id: idx + 1,
@@ -458,7 +425,6 @@ function applyJson() {
     nextColumnId = columns.value.length + 1
     nextRowId = rows.value.length + 1
 
-    // Infer types
     columns.value.forEach(col => {
       col.dataType = inferDataType(col.id)
     })
@@ -470,7 +436,6 @@ function applyJson() {
   }
 }
 
-// Lifecycle
 onMounted(() => {
   loadData()
 })

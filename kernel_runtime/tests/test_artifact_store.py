@@ -62,6 +62,17 @@ class TestListAll:
         listing = store.list_all()
         assert set(listing.keys()) == {"a", "b"}
 
+    def test_list_all_flow_scoped_exposes_publish_diff_fields(self, store: ArtifactStore):
+        """The publish diff in main._run_user_code reads type_name/module/size_bytes/node_id
+        off list_all(flow_id=...) — pin that those fields are present."""
+        store.publish("model", {"a": 1}, node_id=7, flow_id=99)
+        meta = store.list_all(flow_id=99)["model"]
+        assert meta["type_name"] == "dict"
+        assert meta["module"] == "builtins"
+        assert meta["node_id"] == 7
+        assert isinstance(meta["size_bytes"], int)
+        assert meta["size_bytes"] > 0
+
 
 class TestClear:
     def test_clear_empties_store(self, store: ArtifactStore):
@@ -175,7 +186,6 @@ class TestFlowIsolation:
         store.publish("model", "v1", node_id=1, flow_id=1)
         store.publish("model", "v2", node_id=2, flow_id=2)
         store.delete("model", flow_id=1)
-        # flow 2's artifact is untouched
         assert store.get("model", flow_id=2) == "v2"
         with pytest.raises(KeyError):
             store.get("model", flow_id=1)
@@ -212,7 +222,6 @@ class TestFlowIsolation:
         store.publish("model", "f2", node_id=5, flow_id=2)
         removed = store.clear_by_node_ids({5}, flow_id=1)
         assert removed == ["model"]
-        # flow 2's artifact survives
         assert store.get("model", flow_id=2) == "f2"
         with pytest.raises(KeyError):
             store.get("model", flow_id=1)
@@ -222,7 +231,6 @@ class TestFlowIsolation:
         store.publish("b", 2, node_id=5, flow_id=2)
         assert set(store.list_by_node_id(5, flow_id=1).keys()) == {"a"}
         assert set(store.list_by_node_id(5, flow_id=2).keys()) == {"b"}
-        # Unfiltered returns both
         assert set(store.list_by_node_id(5).keys()) == {"a", "b"}
 
     def test_metadata_includes_flow_id(self, store: ArtifactStore):

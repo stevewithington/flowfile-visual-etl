@@ -1,22 +1,18 @@
 <template>
-  <div class="container">
-    <div v-if="showSideBar" class="options-container" :style="{ width: treeNodeWidth }">
-      <sidebar v-model="optionSelection" :options="radioOptions" />
-      <div class="divider" />
-      <div class="selector">
-        <column-selector v-if="optionSelection === 'fields'" @value-selected="handleNodeSelected" />
-        <func-selector v-else ref="func-selector" @value-selected="handleNodeSelected" />
-      </div>
-    </div>
-    <div class="resizer" @mousedown="initResize"></div>
+  <div class="expression-editor-layout">
+    <editor-side-rail
+      :table-schema="activeInput?.table_schema"
+      :parameters="parameters"
+      @value-selected="handleNodeSelected"
+    />
     <div ref="editorWrapper" class="editor-wrapper">
       <function-editor
         ref="functionEditor"
         class="prism-editor-ref"
         :editor-string="code"
-        :columns="nodeStore.nodeData?.main_input?.columns"
-        :flow-id="nodeStore.flow_id"
-        :node-id="nodeStore.node_id"
+        :columns="activeInput?.columns"
+        :column-types="columnTypes"
+        :parameters="parameters"
         @update-editor-string="handleCodeChange"
       />
     </div>
@@ -25,30 +21,29 @@
 </template>
 
 <script lang="ts" setup>
-import { ref, Ref, watch, onMounted, nextTick, computed } from "vue";
-import ColumnSelector from "./ColumnSelector/columnsSelector.vue";
-import Sidebar from "./Sidebar/Sidebar.vue";
+import { ref, Ref, watch, onMounted, nextTick, computed, type PropType } from "vue";
+import EditorSideRail from "./EditorSideRail.vue";
 import FunctionEditor from "./FunctionEditor.vue";
 import { useNodeStore } from "../../../stores/column-store";
+import { useFlowStore } from "../../../stores/flow-store";
+import type { FlowParameter } from "../../../types/flow.types";
 import InstantFuncResults from "./instantFuncResults.vue";
 import debounce from "lodash/debounce";
-import FuncSelector from "./FuncSelector/FuncSelector.vue";
 
-const optionSelection = ref("");
 const nodeStore = useNodeStore();
-
-const radioOptions = [
-  { value: "fields", text: "Fields", icon: "fa fa-columns" },
-  { value: "functions", text: "Functions", icon: "fas fa-atom" },
-];
+const flowStore = useFlowStore();
+const parameters = computed<FlowParameter[]>(() => flowStore.parameters);
 
 const props = defineProps({
   editorString: { type: String, required: true },
+  // Which connected input feeds columns/autocomplete/field list: the gate's
+  // formula editor points this at the control input (right_input).
+  inputSource: { type: String as PropType<"main" | "right">, default: "main" },
 });
 
-const startX = ref(0);
-const startWidth = ref(0);
-const treeNodeWidth = ref("200px");
+const activeInput = computed(() =>
+  props.inputSource === "right" ? nodeStore.nodeData?.right_input : nodeStore.nodeData?.main_input,
+);
 
 const instantFuncResultsRef = ref<Ref<typeof InstantFuncResults> | null>(null);
 const code = ref(props.editorString);
@@ -60,17 +55,18 @@ const showHideOptions = () => {
   showTools.value = !showTools.value;
 };
 
-const showSideBar = computed(() => parseInt(treeNodeWidth.value.replace("px", "")) > 50);
+const columnTypes = computed<Record<string, string>>(() => {
+  const schema = activeInput.value?.table_schema ?? [];
+  const map: Record<string, string> = {};
+  for (const col of schema) {
+    map[col.name] = col.data_type;
+  }
+  return map;
+});
 
 const handleCodeChange = (newCode: string) => {
   code.value = newCode;
   nodeStore.setInputCode(newCode);
-};
-
-const resizeWidth = (event: MouseEvent) => {
-  const deltaX = event.clientX - startX.value;
-  const newWidth = startWidth.value + deltaX;
-  treeNodeWidth.value = Math.min(newWidth, 300) + "px";
 };
 
 watch(
@@ -87,60 +83,32 @@ const handleNodeSelected = (nodeLabel: string) => {
   functionEditor.value?.insertTextAtCursor(nodeLabel);
 };
 
+// Make sure the editor has the flow's parameters for highlight/autocomplete/hover.
+// Fetch on open (and if the flow id changes) so we never depend on the header
+// having populated the store first.
+const ensureParameters = () => {
+  if (flowStore.flowId > 0) flowStore.loadParameters(flowStore.flowId);
+};
+watch(() => flowStore.flowId, ensureParameters);
+
 onMounted(async () => {
   await nextTick();
+  ensureParameters();
   if (instantFuncResultsRef.value) {
     instantFuncResultsRef.value.getInstantFuncResults(props.editorString, nodeStore.flow_id);
   }
 });
-
-const initResize = (event: MouseEvent) => {
-  startX.value = event.clientX;
-  startWidth.value = parseInt(treeNodeWidth.value.replace("px", ""));
-  document.addEventListener("mousemove", resizeWidth);
-  document.addEventListener("mouseup", stopResize);
-};
-
-const stopResize = () => {
-  document.removeEventListener("mousemove", resizeWidth);
-  document.removeEventListener("mouseup", stopResize);
-};
 </script>
 
 <style scoped>
-.selector {
-  overflow-y: scroll;
-  max-height: 300px;
-}
-
-.container {
+.expression-editor-layout {
   display: flex;
   border: 1px solid var(--color-border-primary);
   border-radius: 5px;
   overflow: hidden;
-  height: 100%;
+  height: 252px;
   cursor: auto;
   background-color: var(--color-background-primary);
-}
-
-.options-container {
-  flex-shrink: 0;
-  min-width: 50px;
-  max-height: 300px;
-  padding-left: 5px;
-  padding-right: 5px;
-  z-index: 1;
-  overflow-y: auto;
-  background-color: var(--color-background-primary);
-  color: var(--color-text-primary);
-}
-
-.resizer {
-  width: 5px;
-  cursor: ew-resize;
-  background-color: var(--color-border-primary);
-  border-right: 0.5px solid var(--color-border-secondary);
-  flex-shrink: 0;
 }
 
 .editor-wrapper {
@@ -152,17 +120,12 @@ const stopResize = () => {
 
 .prism-editor-ref {
   flex: 1;
-  padding: 1px;
+  padding: 0;
   min-height: 0px;
 }
 
 .error-box-wrapper {
   overflow-y: auto;
   border-top: 1px solid var(--color-border-primary);
-}
-
-.divider {
-  border-top: 1px solid var(--color-border-primary);
-  padding-bottom: 10px;
 }
 </style>

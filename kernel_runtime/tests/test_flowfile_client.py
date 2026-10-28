@@ -1,6 +1,9 @@
 """Tests for kernel_runtime.flowfile_client."""
 
+import datetime
+import json
 import os
+from decimal import Decimal
 from pathlib import Path
 
 import polars as pl
@@ -27,7 +30,6 @@ def ctx(tmp_dir: Path) -> dict:
     input_dir.mkdir()
     output_dir.mkdir()
 
-    # Write a default input parquet
     df = pl.DataFrame({"x": [1, 2, 3], "y": [10, 20, 30]})
     main_path = input_dir / "main.parquet"
     df.write_parquet(str(main_path))
@@ -59,7 +61,6 @@ class TestContextManagement:
             output_dir=str(tmp_dir),
             artifact_store=store,
         )
-        # Should not raise
         flowfile_client._get_context_value("node_id")
 
         flowfile_client._clear_context()
@@ -404,7 +405,7 @@ class TestDisplayTypeDetection:
 
 
 class TestSharedLocation:
-    """Tests for flowfile.shared_location()."""
+    """Tests for flowfile_ctx.get_shared_location()."""
 
     def test_returns_path_under_user_files(self, tmp_dir: Path, monkeypatch: pytest.MonkeyPatch):
         shared_dir = str(tmp_dir / "shared")
@@ -495,3 +496,323 @@ class TestSharedLocation:
 
         assert pl.read_csv(csv_path).shape == (2, 2)
         assert pl.read_parquet(parquet_path)["x"].to_list() == [1, 2]
+
+
+class TestPathTranslation:
+    """Host<->container path translation, including Windows host prefixes.
+
+    The kernel always runs on Linux, but the Docker host may be Windows —
+    Core then hands over backslash-separated host paths that must rebase to
+    pure-POSIX container paths (and back, with host-native separators).
+    """
+
+    WIN_SHARED = r"C:\Users\u\.flowfile\temp\kernel_shared"
+    WIN_CATALOG = r"C:\Users\u\.flowfile\catalog_tables"
+
+    def test_host_to_container_windows_shared(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("FLOWFILE_HOST_CATALOG_TABLES_DIR", raising=False)
+        monkeypatch.setenv("FLOWFILE_HOST_SHARED_DIR", self.WIN_SHARED)
+        result = flowfile_client._translate_host_path_to_container(
+            self.WIN_SHARED + r"\artifact_staging\5_model.joblib"
+        )
+        assert result == "/shared/artifact_staging/5_model.joblib"
+
+    def test_host_to_container_windows_catalog(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("FLOWFILE_HOST_CATALOG_TABLES_DIR", self.WIN_CATALOG)
+        monkeypatch.delenv("FLOWFILE_HOST_SHARED_DIR", raising=False)
+        result = flowfile_client._translate_host_path_to_container(self.WIN_CATALOG + r"\orders_ab12cd34")
+        assert result == "/catalog_tables/orders_ab12cd34"
+
+    def test_host_to_container_catalog_priority(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("FLOWFILE_HOST_CATALOG_TABLES_DIR", self.WIN_CATALOG)
+        monkeypatch.setenv("FLOWFILE_HOST_SHARED_DIR", self.WIN_SHARED)
+        assert flowfile_client._translate_host_path_to_container(self.WIN_CATALOG) == "/catalog_tables"
+        assert flowfile_client._translate_host_path_to_container(self.WIN_SHARED) == "/shared"
+
+    def test_host_to_container_posix_unchanged(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("FLOWFILE_HOST_CATALOG_TABLES_DIR", raising=False)
+        monkeypatch.setenv("FLOWFILE_HOST_SHARED_DIR", "/home/u/.flowfile/temp/kernel_shared")
+        result = flowfile_client._translate_host_path_to_container(
+            "/home/u/.flowfile/temp/kernel_shared/1/5/outputs"
+        )
+        assert result == "/shared/1/5/outputs"
+
+    def test_host_to_container_no_env_passthrough(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("FLOWFILE_HOST_CATALOG_TABLES_DIR", raising=False)
+        monkeypatch.delenv("FLOWFILE_HOST_SHARED_DIR", raising=False)
+        path = "/app/internal_storage/temp/kernel_shared/1/5/outputs"
+        assert flowfile_client._translate_host_path_to_container(path) == path
+
+    def test_host_to_container_unrelated_passthrough(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("FLOWFILE_HOST_SHARED_DIR", self.WIN_SHARED)
+        other = r"D:\elsewhere\data.parquet"
+        assert flowfile_client._translate_host_path_to_container(other) == other
+
+    def test_host_to_container_sibling_prefix_not_matched(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("FLOWFILE_HOST_CATALOG_TABLES_DIR", raising=False)
+        monkeypatch.setenv("FLOWFILE_HOST_SHARED_DIR", "/home/u/shared")
+        path = "/home/u/shared_other/x.parquet"
+        assert flowfile_client._translate_host_path_to_container(path) == path
+
+    def test_container_to_host_windows(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("FLOWFILE_HOST_CATALOG_TABLES_DIR", self.WIN_CATALOG)
+        monkeypatch.setenv("FLOWFILE_KERNEL_CATALOG_TABLES_DIR", "/catalog_tables")
+        result = flowfile_client._translate_container_path_to_host("/catalog_tables/orders_ab12")
+        assert result == self.WIN_CATALOG + "\\orders_ab12"
+        assert "/" not in result
+
+    def test_container_to_host_windows_exact(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("FLOWFILE_HOST_CATALOG_TABLES_DIR", self.WIN_CATALOG)
+        monkeypatch.setenv("FLOWFILE_KERNEL_CATALOG_TABLES_DIR", "/catalog_tables")
+        assert flowfile_client._translate_container_path_to_host("/catalog_tables") == self.WIN_CATALOG
+
+    def test_container_to_host_posix(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("FLOWFILE_HOST_CATALOG_TABLES_DIR", "/home/u/.flowfile/catalog_tables")
+        monkeypatch.setenv("FLOWFILE_KERNEL_CATALOG_TABLES_DIR", "/catalog_tables")
+        result = flowfile_client._translate_container_path_to_host("/catalog_tables/orders_ab12")
+        assert result == "/home/u/.flowfile/catalog_tables/orders_ab12"
+
+    def test_container_to_host_no_env_passthrough(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("FLOWFILE_HOST_CATALOG_TABLES_DIR", raising=False)
+        path = "/catalog_tables/orders_ab12"
+        assert flowfile_client._translate_container_path_to_host(path) == path
+
+    def test_windows_roundtrip(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("FLOWFILE_HOST_CATALOG_TABLES_DIR", self.WIN_CATALOG)
+        monkeypatch.setenv("FLOWFILE_KERNEL_CATALOG_TABLES_DIR", "/catalog_tables")
+        host = self.WIN_CATALOG + r"\orders_ab12"
+        container = flowfile_client._translate_host_path_to_container(host)
+        assert container == "/catalog_tables/orders_ab12"
+        assert flowfile_client._translate_container_path_to_host(container) == host
+
+
+TABLE_MIME = "application/vnd.flowfile.table+json"
+GWALKER_MIME = "application/vnd.flowfile.gwalker+json"
+
+
+class TestDisplayDataFrames:
+    """flowfile_ctx.display / explore rendering of Polars frames."""
+
+    def test_display_dataframe_emits_table_mime(self):
+        flowfile_client._reset_displays()
+        df = pl.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+        flowfile_client.display(df)
+
+        out = flowfile_client._get_displays()
+        assert len(out) == 1
+        assert out[0]["mime_type"] == TABLE_MIME
+        payload = json.loads(out[0]["data"])
+        assert payload["columns"] == ["a", "b"]
+        assert payload["data"] == [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]
+        assert payload["total_rows"] == 2
+        assert payload["loaded_rows"] == 2
+        assert payload["truncated"] is False
+
+    def test_display_field_semantic_types(self):
+        flowfile_client._reset_displays()
+        df = pl.DataFrame({"num": [1.5], "name": ["a"], "day": [datetime.date(2024, 1, 1)]})
+        flowfile_client.display(df)
+
+        payload = json.loads(flowfile_client._get_displays()[0]["data"])
+        sem = {f["name"]: f["semanticType"] for f in payload["fields"]}
+        analytic = {f["name"]: f["analyticType"] for f in payload["fields"]}
+        assert sem == {"num": "quantitative", "name": "nominal", "day": "temporal"}
+        assert analytic == {"num": "measure", "name": "dimension", "day": "dimension"}
+
+    def test_display_lazyframe_head_collected_and_truncated(self):
+        flowfile_client._reset_displays()
+        lf = pl.LazyFrame({"n": list(range(25))})
+        flowfile_client.display(lf, max_rows=10)
+
+        payload = json.loads(flowfile_client._get_displays()[0]["data"])
+        assert payload["total_rows"] == 25
+        assert payload["loaded_rows"] == 10
+        assert payload["truncated"] is True
+        assert len(payload["data"]) == 10
+
+    def test_display_temporal_decimal_are_json_safe(self):
+        flowfile_client._reset_displays()
+        df = pl.DataFrame(
+            {
+                "d": [datetime.date(2024, 1, 2)],
+                "ts": [datetime.datetime(2024, 1, 2, 3, 4, 5)],
+                "dec": [Decimal("1.25")],
+            }
+        )
+        flowfile_client.display(df)
+
+        row = json.loads(flowfile_client._get_displays()[0]["data"])["data"][0]
+        assert row["d"] == "2024-01-02"
+        assert row["ts"] == "2024-01-02T03:04:05"
+        assert row["dec"] == 1.25
+
+    def test_display_non_finite_floats_become_null(self):
+        flowfile_client._reset_displays()
+        df = pl.DataFrame({"x": [1.0, float("nan"), float("inf")]})
+        flowfile_client.display(df)
+
+        data = flowfile_client._get_displays()[0]["data"]
+        # Browser JSON.parse rejects NaN/Infinity tokens.
+        assert "NaN" not in data
+        assert "Infinity" not in data
+        rows = json.loads(data)["data"]
+        assert rows[0]["x"] == 1.0
+        assert rows[1]["x"] is None
+        assert rows[2]["x"] is None
+
+    def test_explore_emits_gwalker_mime(self):
+        flowfile_client._reset_displays()
+        flowfile_client.explore(pl.DataFrame({"a": [1]}))
+
+        out = flowfile_client._get_displays()
+        assert out[0]["mime_type"] == GWALKER_MIME
+        assert json.loads(out[0]["data"])["columns"] == ["a"]
+
+    def test_explore_non_frame_falls_back_to_display(self):
+        flowfile_client._reset_displays()
+        flowfile_client.explore("hello")
+
+        out = flowfile_client._get_displays()
+        assert out[0]["mime_type"] == "text/plain"
+        assert out[0]["data"] == "hello"
+
+    def test_display_non_frame_stays_text(self):
+        flowfile_client._reset_displays()
+        flowfile_client.display({"k": "v"})
+
+        out = flowfile_client._get_displays()
+        assert out[0]["mime_type"] == "text/plain"
+
+    def test_display_pandas_stays_text(self):
+        pd = pytest.importorskip("pandas")
+        flowfile_client._reset_displays()
+        flowfile_client.display(pd.DataFrame({"a": [1, 2]}))
+
+        out = flowfile_client._get_displays()
+        assert out[0]["mime_type"] == "text/plain"
+
+    def test_auto_display_dataframe_is_text_repr(self):
+        flowfile_client._reset_displays()
+        flowfile_client._auto_display(pl.DataFrame({"a": [1, 2]}))
+
+        out = flowfile_client._get_displays()
+        assert out[0]["mime_type"] == "text/plain"
+        assert "shape:" in out[0]["data"]
+
+    def test_auto_display_non_frame_delegates_to_display(self):
+        flowfile_client._reset_displays()
+        flowfile_client._auto_display("<b>hi</b>")
+
+        out = flowfile_client._get_displays()
+        assert out[0]["mime_type"] == "text/html"
+
+
+class TestDryRunMode:
+    """A dry run must run real code but write nothing to the artifact catalog."""
+
+    def _dry_ctx(self, tmp_dir: Path, dry_run: bool) -> None:
+        flowfile_client._set_context(
+            node_id=1,
+            input_paths={},
+            output_dir=str(tmp_dir),
+            artifact_store=ArtifactStore(),
+            flow_id=-1,
+            source_registration_id=7,
+            dry_run=dry_run,
+        )
+
+    def test_is_dry_run_defaults_to_false(self, ctx: dict):
+        assert flowfile_client.is_dry_run() is False
+
+    def test_is_dry_run_without_any_context(self):
+        # Notebook/interactive use must not raise just for asking.
+        assert flowfile_client.is_dry_run() is False
+
+    def test_is_dry_run_true_when_requested(self, tmp_dir: Path):
+        self._dry_ctx(tmp_dir, dry_run=True)
+        assert flowfile_client.is_dry_run() is True
+
+    def test_publish_global_is_sandboxed_and_returns_a_positive_id(self, tmp_dir: Path):
+        """No HTTP call is made — an unreachable core would raise if one were."""
+        self._dry_ctx(tmp_dir, dry_run=True)
+        artifact_id = flowfile_client.publish_global("model", {"w": [1, 2]}, tags=["ml"])
+        assert isinstance(artifact_id, int) and artifact_id > 0
+        assert flowfile_client.get_global("model") == {"w": [1, 2]}
+
+    def test_sandboxed_publish_survives_republish_as_a_new_version(self, tmp_dir: Path):
+        self._dry_ctx(tmp_dir, dry_run=True)
+        flowfile_client.publish_global("model", {"v": 1})
+        flowfile_client.publish_global("model", {"v": 2})
+        assert flowfile_client.get_global("model") == {"v": 2}
+        infos = [i for i in flowfile_client._dry_run_globals.get().values()]
+        assert infos[0]["info"].version == 2
+
+    def test_sandboxed_delete_removes_without_touching_core(self, tmp_dir: Path):
+        self._dry_ctx(tmp_dir, dry_run=True)
+        flowfile_client.publish_global("model", {"w": 1})
+        flowfile_client.delete_global_artifact("model")
+        assert "model" not in flowfile_client._dry_run_globals.get()
+
+    def test_unpicklable_object_still_fails_in_a_dry_run(self, tmp_dir: Path):
+        """The check runs before the sandbox, so an unpersistable object still fails."""
+        from kernel_runtime.serialization import UnpickleableObjectError
+
+        self._dry_ctx(tmp_dir, dry_run=True)
+        with pytest.raises(UnpickleableObjectError):
+            flowfile_client.publish_global("bad", (i for i in range(3)))
+
+    def test_sandbox_is_reset_between_executions(self, tmp_dir: Path):
+        self._dry_ctx(tmp_dir, dry_run=True)
+        flowfile_client.publish_global("model", {"w": 1})
+        self._dry_ctx(tmp_dir, dry_run=True)
+        assert flowfile_client._dry_run_globals.get() == {}
+
+    def test_non_dry_run_context_has_no_sandbox(self, tmp_dir: Path):
+        self._dry_ctx(tmp_dir, dry_run=False)
+        assert flowfile_client._dry_run_globals.get() is None
+
+    def test_sandbox_ids_are_never_reused_after_a_delete(self, tmp_dir: Path):
+        """len(sandbox)+1 would hand 'c' the id already live on 'b'."""
+        self._dry_ctx(tmp_dir, dry_run=True)
+        first = flowfile_client.publish_global("a", {1: 1})
+        second = flowfile_client.publish_global("b", {2: 2})
+        flowfile_client.delete_global_artifact("a")
+        third = flowfile_client.publish_global("c", {3: 3})
+        assert len({first, second, third}) == 3, (first, second, third)
+
+    def test_deleting_a_non_sandboxed_name_never_reaches_the_catalog(self, tmp_dir: Path, monkeypatch):
+        """A dry run must not delete real catalog data it did not publish."""
+        calls = []
+
+        class _Recorder:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def delete(self, url, **kwargs):
+                calls.append(url)
+                raise AssertionError("dry run issued a real DELETE: %s" % url)
+
+            def get(self, url, **kwargs):
+                calls.append(url)
+                raise AssertionError("dry run issued a real GET: %s" % url)
+
+        monkeypatch.setattr(flowfile_client.httpx, "Client", _Recorder)
+        self._dry_ctx(tmp_dir, dry_run=True)
+        flowfile_client.publish_global("mine", {"w": 1})
+
+        with pytest.raises(KeyError, match="was not published in this dry run"):
+            flowfile_client.delete_global_artifact("someone_elses_prod_model")
+        with pytest.raises(KeyError, match="was not published in this dry run"):
+            flowfile_client.delete_global_artifact("someone_elses_prod_model", version=1)
+        assert calls == []
+
+        # The node's own artifact still deletes, from the sandbox only.
+        flowfile_client.delete_global_artifact("mine")
+        assert "mine" not in flowfile_client._dry_run_globals.get()
+        assert calls == []

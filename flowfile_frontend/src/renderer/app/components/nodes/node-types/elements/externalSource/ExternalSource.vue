@@ -40,7 +40,6 @@ import GenericNodeSettings from "../../../baseNode/genericNodeSettings.vue";
 const nodeStore = useNodeStore();
 const nodeExternalSource = ref<null | NodeExternalSource>(null);
 
-// Use the standardized node settings composable
 const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSettings({
   nodeRef: nodeExternalSource,
   onBeforeSave: async () => {
@@ -66,7 +65,6 @@ const isDirty = ref(false);
 
 let activeWatchStopHandle: WatchStopHandle | null = null;
 watchEffect(() => {
-  // Clean up the previous watch if the condition changes
   if (activeWatchStopHandle) {
     activeWatchStopHandle();
     activeWatchStopHandle = null;
@@ -115,7 +113,7 @@ defineExpose({
 .context-menu {
   position: fixed;
   z-index: 1000;
-  border: 1px solid #ccc;
+  border: 1px solid var(--color-border-primary);
   background-color: var(--color-background-primary);
   padding: 8px;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
@@ -135,7 +133,7 @@ defineExpose({
 }
 
 .context-menu button:hover {
-  background-color: #f0f0f0;
+  background-color: var(--color-background-hover);
 }
 
 .table-wrapper {
@@ -149,7 +147,7 @@ defineExpose({
 .context-menu {
   position: fixed;
   z-index: 1000;
-  border: 1px solid #ccc;
+  border: 1px solid var(--color-border-primary);
   background-color: var(--color-background-primary);
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
   border-radius: 4px;
@@ -191,7 +189,7 @@ defineExpose({
   align-items: center;
   justify-content: flex-start;
   background-color: var(--color-background-secondary);
-  border: 1px solid #ddd;
+  border: 1px solid var(--color-border-primary);
   border-radius: 4px;
   padding: 10px 15px;
   color: var(--color-text-primary);

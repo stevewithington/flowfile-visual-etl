@@ -1,6 +1,6 @@
 # Visual UI Integration
 
-Flowfile provides a web-based visual interface that can be launched directly from Python. This allows seamless transitions between code and visual pipeline development.
+Flowfile provides a web-based visual interface that can be launched directly from Python, so you can move a code-built pipeline into the visual editor and back.
 
 ## Starting the Web UI
 
@@ -27,7 +27,7 @@ flowfile run ui --no-browser
 ```
 
 !!! info "Unified Mode"
-    The web UI runs in "unified mode" - a single service that combines the Core API, Worker, and Web UI. No separate services or Docker required!
+    The web UI runs in unified mode: one process hosting the Core API, the Worker, and the UI. No separate services or Docker involved.
 
 ## Opening Pipelines in the Editor
 
@@ -55,19 +55,19 @@ ff.open_graph_in_editor(result.flow_graph)
 
 When you call `open_graph_in_editor()`:
 
-1. **Saves the graph** to a temporary `.flowfile` 
-2. **Checks if server is running** at `http://localhost:63578`
-3. **Starts server if needed** using `flowfile run ui --no-browser`
-4. **Imports the flow** via API endpoint
-5. **Opens browser tab** at `http://localhost:63578/ui/flow/{id}`
+1. **Saves the graph** to a temporary `.yaml` flow file
+2. **Checks if the server is running** by probing `http://localhost:63578`
+3. **Starts the server if needed** using `flowfile run ui --no-browser`
+4. **Imports the flow** via an API endpoint
+5. **Opens a browser tab** at `http://localhost:63578/ui/flow/{id}`
 
 ### Advanced Options
 
 ```python
-# Save to specific location instead of temp file
+# Save to a specific location instead of a temp file
 ff.open_graph_in_editor(
     result.flow_graph,
-    storage_location="./my_pipeline.flowfile"
+    storage_location="./my_pipeline.yaml"
 )
 
 # Don't automatically open browser
@@ -82,6 +82,42 @@ ff.open_graph_in_editor(
     module_name="my_custom_flowfile"
 )
 ```
+
+## Visual groups
+
+A visual group is a labelled box around nodes on the canvas. It is organizational only: it never changes execution or results, and it is unrelated to `group_by` (aggregation). `ff.FlowGroup` builds one from Python, and `add_to_group` puts a frame's node in it. The examples below run in CI on every commit and share these imports:
+
+```python
+--8<-- "docs/examples/visual_groups.py:imports"
+```
+
+```python
+--8<-- "docs/examples/visual_groups.py:nested"
+```
+
+- `FlowGroup(name="Group", *, color=None, parent_group=None)`. `color` is one of the designer's tints (`slate`, `blue`, `green`, `amber`, `rose`, `violet`, `cyan`); `None` keeps the default tint. `parent_group` nests the group inside another one.
+- `add_to_group(group)` returns the frame (or the native node), so it chains. It adds only that frame's node; a chain needs one call per node you want in the box.
+- A group is placed on the graph the first time a node joins it, its parents first, so it can be declared before any data is read. `group.id`, `group.flow_graph` and `group.node_ids` are `None` or empty until then.
+- A group holds nodes of one graph. A join or a concat of frames from two graphs moves every group of both onto the merged graph, so a group built before the join keeps working after it; adding a frame of an unrelated graph raises `NativeNodeError`.
+- Groups are saved with the flow (`save_graph`, `open_graph_in_editor`) and come back from the designer's **FlowFrame** code export and the canvas notebook as the same `ff.FlowGroup` declarations and `add_to_group` calls.
+
+A group holds one graph's nodes. A join merges the graphs of its two frames and moves the group along, after which frames from the other graph can join it:
+
+```python
+--8<-- "docs/examples/visual_groups.py:join"
+```
+
+The FlowFrame export declares the groups first and ends every grouped node's call with `add_to_group`, so the exported script rebuilds the same boxes; a saved flow reopens with them:
+
+```python
+--8<-- "docs/examples/visual_groups.py:export"
+```
+
+```python
+--8<-- "docs/examples/visual_groups.py:round-trip"
+```
+
+The older forms stay available: `with df.group("Cleaning"):` groups every node created inside the block, and `df.set_group("Cleaning")` finds or creates a group by name.
 
 ## Server Management
 
@@ -119,13 +155,7 @@ stop_flowfile_server_process()
 
 ## Configuration
 
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FLOWFILE_HOST` | `127.0.0.1` | Host to bind server to |
-| `FLOWFILE_PORT` | `63578` | Port for the server |
-| `FLOWFILE_MODULE_NAME` | `flowfile` | Module name to run |
+The web UI is hard-locked to `127.0.0.1:63578` — `start_server` raises `NotImplementedError` for any other host or port, so there is no environment variable that relocates it. The `FLOWFILE_MODULE_NAME` variable (default `flowfile`) selects which module the launcher runs.
 
 ### URLs and Endpoints
 
@@ -133,29 +163,14 @@ Once running, the following are available:
 
 - **Web UI**: `http://localhost:63578/ui`
 - **API Docs**: `http://localhost:63578/docs`
-- **Health Check**: `http://localhost:63578/docs` (used to verify server is running)
+
+`is_flowfile_running()` treats a reachable `/docs` as "server up" — it is the readiness probe the client library uses, not a dedicated health endpoint.
 
 ## Troubleshooting
 
 ### Server Won't Start
 
-```python
-# Check if port is already in use
-import socket
-
-def is_port_in_use(port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(('localhost', port)) == 0
-
-if is_port_in_use(63578):
-    print("Port 63578 is already in use")
-```
-
-### Server Starts but UI Doesn't Open
-
-- Manually navigate to `http://localhost:63578/ui`
-- Check server logs in terminal
-- Verify no firewall blocking localhost connections
+The UI is fixed to port 63578; if a previous session holds it, free it (`lsof -i :63578` / `netstat -ano | findstr :63578`) and retry. If the server starts but no tab opens, navigate to `http://localhost:63578/ui` manually.
 
 ### Import Fails
 
@@ -185,51 +200,7 @@ os.environ["POETRY_PATH"] = "/path/to/poetry"
 ff.open_graph_in_editor(df.flow_graph)
 ```
 
-## Best Practices
-
-### 1. Let Auto-start Handle It
-
-```python
-# ✅ Good: Let open_graph_in_editor start server
-ff.open_graph_in_editor(df.flow_graph)
-
-# ❌ Avoid: Manual server management unless necessary
-ff.start_web_ui()
-time.sleep(5)
-ff.open_graph_in_editor(df.flow_graph)
-```
-
-### 2. Use Temporary Files
-
-```python
-# ✅ Good: Let Flowfile handle temp files
-ff.open_graph_in_editor(df.flow_graph)
-
-# Only specify path if you need to keep the file
-ff.open_graph_in_editor(
-    df.flow_graph,
-    storage_location="./important_pipeline.flowfile"
-)
-```
-
-### 3. Single Server Instance
-
-The server is designed to be a singleton - multiple calls to `open_graph_in_editor()` will reuse the same server instance.
-
-```python
-# First call starts server
-ff.open_graph_in_editor(pipeline1.flow_graph)
-
-# Subsequent calls reuse server
-ff.open_graph_in_editor(pipeline2.flow_graph)  # No new server started
-ff.open_graph_in_editor(pipeline3.flow_graph)  # Still same server
-```
+The server is a singleton: the first `open_graph_in_editor()` call starts it, and every later call reuses it — there is no need to start it yourself or to manage the temporary flow files it writes (pass `storage_location` only when you want to keep the `.yaml`).
 
 ---
-
-!!! tip "Where to Go Next"
-
-    -   **Explore Visual Nodes:** Learn the details of each node available in the [Visual Editor](../../visual-editor/nodes/index.md).
-    -   **Convert Code to Visual:** See how your code translates into a visual workflow in the [Conversion Guide](../tutorials/flowfile_frame_api.md).
-    -   **Build with Code:** Dive deeper into the [code-first approach](../../visual-editor/building-flows.md) for building pipelines.
-    -   **Back to Index:** Return to the main [Python API Index](index.md).
+[← Previous: Cloud Storage](cloud-connections.md) | [Next: Catalog References →](catalog-references.md)

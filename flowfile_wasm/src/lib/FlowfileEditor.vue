@@ -18,6 +18,7 @@
       :toolbar-config="toolbarConfigMerged"
       :node-categories-config="props.nodeCategories"
       :readonly="props.readonly"
+      :teaching-mode="props.teachingMode"
       @execution-complete="onExecutionComplete"
       @output="onOutput"
     />
@@ -35,14 +36,18 @@ import type {
   FlowfileEditorProps,
   ToolbarConfig,
   FlowfileEditorAPI,
+  InputDataItem,
   InputDataMap,
   OutputData,
   EditorError
 } from './types'
 import type { FlowfileData, NodeResult } from '../types'
+import { binaryContent, type FileContent } from '../types/file-content'
+import { detectBinaryFormat } from '../utils/binary-format'
 
 const props = withDefaults(defineProps<FlowfileEditorProps>(), {
   readonly: false,
+  teachingMode: true,
   height: '100%',
   width: '100%'
 })
@@ -58,14 +63,12 @@ const emit = defineEmits<{
 
 const mounted = ref(false)
 
-// Initialize stores
 const pyodideStore = usePyodideStore()
 const flowStore = useFlowStore()
 const themeStore = useThemeStore()
 
 const { isReady: pyodideReady } = storeToRefs(pyodideStore)
 
-// Loading status from pyodide store
 const loadingStatusText = computed(() => {
   return pyodideStore.loadingStatus || 'Initializing Pyodide...'
 })
@@ -74,7 +77,6 @@ const showLoadingOverlay = computed(() => {
   return props.pyodide?.autoInit !== false
 })
 
-// Theme handling
 const effectiveTheme = computed(() => {
   if (props.theme?.mode && props.theme.mode !== 'system') {
     return props.theme.mode
@@ -91,7 +93,6 @@ const rootStyle = computed(() => ({
   flexDirection: 'column' as const
 }))
 
-// Merge toolbar config with defaults for embedded mode
 const toolbarConfigMerged = computed<ToolbarConfig>(() => ({
   showRun: true,
   showSaveLoad: true,
@@ -101,25 +102,21 @@ const toolbarConfigMerged = computed<ToolbarConfig>(() => ({
   ...props.toolbar
 }))
 
-// Watch for initialFlow prop changes
 watch(() => props.initialFlow, (flow) => {
   if (flow && pyodideReady.value) {
     flowStore.importFromFlowfile(flow)
   }
 }, { deep: true })
 
-// Watch for inputData prop changes — push to store as external datasets
 watch(() => props.inputData, (data) => {
   if (data) {
     pushExternalDatasets(data)
   }
 }, { deep: true })
 
-// Watch for pyodide ready
 watch(pyodideReady, (ready) => {
   if (ready) {
     emit('ready')
-    // Load initial flow if provided
     if (props.initialFlow) {
       flowStore.importFromFlowfile(props.initialFlow)
     }
@@ -132,12 +129,24 @@ watch(pyodideReady, (ready) => {
 
 /**
  * Push input data to the flow store as external datasets.
- * External Data nodes select from these by name.
+ * External Data nodes select from these by name. Binary content becomes
+ * tagged FileContent (explicit format preferred; PAR1 sniff as fallback).
  */
 function pushExternalDatasets(data: InputDataMap) {
-  const datasets: Record<string, string> = {}
+  const datasets: Record<string, string | FileContent> = {}
   for (const [name, config] of Object.entries(data)) {
-    datasets[name] = typeof config === 'string' ? config : config.content
+    if (typeof config === 'string') {
+      datasets[name] = config
+      continue
+    }
+    const { content, format } = config
+    if (content instanceof Uint8Array) {
+      const binFormat =
+        format === 'parquet' || format === 'arrow-ipc' ? format : detectBinaryFormat(content)
+      datasets[name] = binaryContent(content, binFormat)
+    } else {
+      datasets[name] = content
+    }
   }
   flowStore.setExternalDatasets(datasets)
 }
@@ -158,17 +167,14 @@ onMounted(async () => {
     pushExternalDatasets(props.inputData)
   }
 
-  // Set embedded mode on theme store
   themeStore.setEmbedded(true)
 
-  // Initialize theme
   if (props.theme?.mode) {
     themeStore.setTheme(props.theme.mode)
   } else {
     themeStore.initialize()
   }
 
-  // Initialize Pyodide unless autoInit is disabled
   if (props.pyodide?.autoInit !== false) {
     emit('loading-status', 'Initializing...')
     try {
@@ -182,11 +188,9 @@ onMounted(async () => {
 onUnmounted(() => {
   // Clean up output callbacks to prevent leaks if host forgets offOutput
   flowStore.clearOutputCallbacks()
-  // Restore non-embedded mode if needed
   themeStore.setEmbedded(false)
 })
 
-// Expose programmatic API
 const api: FlowfileEditorAPI = {
   get isReady() { return pyodideStore.isReady },
   get isExecuting() { return flowStore.isExecuting },
@@ -194,10 +198,11 @@ const api: FlowfileEditorAPI = {
   executeNode: (nodeId: number) => flowStore.executeNode(nodeId),
   exportFlow: () => flowStore.exportToFlowfile(),
   importFlow: (data: FlowfileData) => flowStore.importFromFlowfile(data),
-  setInputData: (name: string, content: string) => {
-    pushExternalDatasets({ [name]: content })
+  setInputData: (name: string, content: string | Uint8Array, format?: InputDataItem['format']) => {
+    pushExternalDatasets({ [name]: { content, format } })
   },
   getNodeResult: (nodeId: number) => flowStore.getNodeResult(nodeId),
+  getNodeResultArrow: (nodeId: number) => flowStore.getNodeResultArrow(nodeId),
   clearFlow: () => flowStore.clearFlow(),
   initializePyodide: () => pyodideStore.initialize()
 }

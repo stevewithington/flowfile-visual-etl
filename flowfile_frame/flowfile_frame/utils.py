@@ -1,4 +1,4 @@
-import uuid
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -6,6 +6,7 @@ import polars as pl
 
 from flowfile_core.flowfile.flow_graph import FlowGraph
 from flowfile_core.schemas import schemas
+from flowfile_core.schemas.input_schema import keep_paths_as_written
 
 # Re-export for backwards compatibility — canonical home is callable_utils
 from flowfile_frame.callable_utils import (  # noqa: F401
@@ -13,6 +14,12 @@ from flowfile_frame.callable_utils import (  # noqa: F401
     _get_function_source,
     _is_safely_representable,
 )
+from flowfile_frame.notebook import current
+
+
+def _expand_user(path: str) -> str:
+    """``os.path.expanduser(path)``, or ``path`` itself while paths are kept as written (a kernel notebook session)."""
+    return path if keep_paths_as_written.get() else os.path.expanduser(path)
 
 
 def _is_iterable(obj: Any) -> bool:
@@ -36,7 +43,6 @@ def _parse_inputs_as_iterable(
     if not inputs:
         return []
 
-    # Treat elements of a single iterable as separate inputs
     if len(inputs) == 1 and _is_iterable(inputs[0]):
         return list(inputs[0])
 
@@ -52,16 +58,10 @@ def ensure_inputs_as_iterable(inputs: Any | Iterable[Any]) -> list[Any]:
     """Convert inputs to list, treating strings as single items."""
     if inputs is None or (hasattr(inputs, "__len__") and len(inputs) == 0):
         return []
-    # Treat strings/bytes as atomic items, everything else check if iterable
     if isinstance(inputs, str | bytes) or not _is_iterable(inputs):
         return [inputs]
 
     return list(inputs)
-
-
-def _generate_id() -> int:
-    """Generate a simple unique ID for nodes."""
-    return int(uuid.uuid4().int % 100000)
 
 
 def create_flow_graph(flow_id: int = None) -> FlowGraph:
@@ -70,22 +70,26 @@ def create_flow_graph(flow_id: int = None) -> FlowGraph:
     Parameters
        - flow_id (int): Optional flow ID. If not provided, a new unique ID will be generated.
     Returns
-       - FlowGraph: A new instance of FlowGraph with the specified or generated flow ID.
+       - FlowGraph: A new instance of FlowGraph with the specified or generated flow ID, no file path,
+         history off and local execution (the same defaults as ``FlowGraph()``).
 
     """
     if flow_id is None:
-        flow_id = _generate_id()
+        return FlowGraph()
     flow_settings = schemas.FlowSettings(
         flow_id=flow_id,
         name=f"Flow_{flow_id}",
-        path=f"flow_{flow_id}",
-        track_history=False,  # Disable undo/redo history for flowfile_frame
+        path="",
+        track_history=False,
+        execution_location="local",
     )
-    flow_graph = FlowGraph(flow_settings=flow_settings)
-    flow_graph.flow_settings.execution_location = (
-        "local"  # always create a local frame so that the run time does not attempt to use the flowfile_worker process
-    )
-    return flow_graph
+    return FlowGraph(flow_settings=flow_settings)
+
+
+def _implicit_graph() -> FlowGraph:
+    """The graph a source without ``flow_graph=`` builds on: the notebook session graph, else a new one."""
+    mode = current()
+    return mode.graph if mode is not None else create_flow_graph()
 
 
 def stringify_values(v: Any) -> str:
@@ -95,17 +99,13 @@ def stringify_values(v: Any) -> str:
     All other types are converted to their string representation.
     """
     if isinstance(v, str):
-        # Escape any existing double quotes in the string
         escaped_str = v.replace('"', '\\"')
         return '"' + escaped_str + '"'
     elif isinstance(v, bool):
-        # Handle booleans explicitly (returns "True" or "False")
         return str(v)
     elif isinstance(v, int | float | complex | type(None)):
-        # Handle numbers and None explicitly
         return str(v)
     else:
-        # Handle any other types
         return str(v)
 
 
@@ -113,6 +113,10 @@ data = {"c": 0}
 
 
 def generate_node_id() -> int:
+    """Next node id; in notebook mode never at or below an id already on the session graph."""
+    mode = current()
+    if mode is not None:
+        data["c"] = max(data["c"], max((n.node_id for n in mode.graph.nodes), default=0))
     data["c"] += 1
     return data["c"]
 

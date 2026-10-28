@@ -16,6 +16,21 @@
           <el-icon><WarningFilled /></el-icon>
         </span>
       </div>
+      <div
+        v-if="relativeHint && nodeOutput.output_settings.directory === relativeHint.directory"
+        class="directory-hint"
+      >
+        <span>Writes to {{ relativeHint.location }}</span>
+        <el-button
+          v-if="relativeHint.suggestion"
+          link
+          type="primary"
+          size="small"
+          @click="useSuggestedDirectory"
+        >
+          Use {{ relativeHint.suggestion }}
+        </el-button>
+      </div>
 
       <el-autocomplete
         v-model="nodeOutput.output_settings.name"
@@ -37,11 +52,10 @@
           class="m-2"
           placeholder="Select"
           size="small"
-          :disabled="hasFileExtension"
           @change="handleFileTypeChange"
         >
           <el-option
-            v-for="type in ['csv', 'excel', 'parquet']"
+            v-for="type in ['csv', 'excel', 'parquet', 'ipc', 'ndjson', 'avro']"
             :key="type"
             :label="type"
             :value="type"
@@ -65,6 +79,23 @@
         />
       </el-select>
 
+      <div
+        v-if="
+          nodeOutput.output_settings.file_type === 'excel' &&
+          nodeOutput.output_settings.write_mode === 'update'
+        "
+        class="info-box"
+      >
+        <i class="fa-solid fa-info-circle"></i>
+        <div>
+          <p>Writes only this sheet; every other sheet in the workbook is kept.</p>
+          <p class="info-caveat">
+            Embedded images are dropped and formula results refresh when the file is next opened in
+            Excel.
+          </p>
+        </div>
+      </div>
+
       <CsvTableConfig
         v-if="isOutputCsvTable(nodeOutput.output_settings.table_settings)"
         v-model="nodeOutput.output_settings.table_settings"
@@ -77,19 +108,42 @@
         v-if="isOutputParquetTable(nodeOutput.output_settings.table_settings)"
         v-model="nodeOutput.output_settings.table_settings"
       />
+      <IpcTableConfig
+        v-if="isOutputIpcTable(nodeOutput.output_settings.table_settings)"
+        v-model="nodeOutput.output_settings.table_settings"
+      />
+      <NdjsonTableConfig
+        v-if="isOutputNdjsonTable(nodeOutput.output_settings.table_settings)"
+        v-model="nodeOutput.output_settings.table_settings"
+      />
+      <AvroTableConfig
+        v-if="isOutputAvroTable(nodeOutput.output_settings.table_settings)"
+        v-model="nodeOutput.output_settings.table_settings"
+      />
     </div>
 
     <el-dialog
       v-model="showFileSelectionModal"
       title="Select directory or file to write to"
       width="70%"
+      append-to-body
       :close-on-click-modal="false"
     >
       <file-browser
-        :allowed-file-types="['csv', 'xlsx', 'parquet']"
+        :allowed-file-types="[
+          'csv',
+          'xlsx',
+          'parquet',
+          'ipc',
+          'arrow',
+          'feather',
+          'ndjson',
+          'jsonl',
+          'avro',
+        ]"
         :allow-directory-selection="true"
         mode="create"
-        context="dataFiles"
+        context="output"
         :is-visible="showFileSelectionModal"
         @directory-selected="handleDirectorySelected"
         @overwrite-file="handleFileSelected"
@@ -99,25 +153,37 @@
   </div>
 </template>
 <script lang="ts" setup>
-import { ref, computed } from "vue";
+import { ref } from "vue";
 import {
   NodeOutput,
+  OutputSettings,
   isOutputCsvTable,
   isOutputParquetTable,
   isOutputExcelTable,
+  isOutputIpcTable,
+  isOutputNdjsonTable,
+  isOutputAvroTable,
 } from "../../../baseNode/nodeInput";
 import {
   createDefaultOutputSettings,
   createCsvTableSettings,
   createParquetTableSettings,
   createExcelTableSettings,
+  createIpcTableSettings,
+  createNdjsonTableSettings,
+  createAvroTableSettings,
 } from "./defaultValues";
 import { useNodeStore } from "../../../../../stores/node-store";
+import { useFileBrowserStore } from "../../../../../stores/fileBrowserStore";
 import { useNodeSettings } from "../../../../../composables/useNodeSettings";
+import { getDefaultPath } from "@/api/file.api";
 import axios, { AxiosError } from "axios";
 import CsvTableConfig from "./outputCsv.vue";
 import ExcelTableConfig from "./outputExcel.vue";
 import ParquetTableConfig from "./outputParquet.vue";
+import IpcTableConfig from "./outputIpc.vue";
+import NdjsonTableConfig from "./outputNdjson.vue";
+import AvroTableConfig from "./outputAvro.vue";
 import FileBrowser from "../../../../common/FileBrowser/fileBrowser.vue";
 import { WarningFilled } from "@element-plus/icons-vue";
 
@@ -129,23 +195,48 @@ interface LocalFileInfo {
 }
 
 const nodeStore = useNodeStore();
+const fileBrowserStore = useFileBrowserStore();
 const nodeOutput = ref<NodeOutput | null>(null);
 const dataLoaded = ref(false);
 
-// Use the standardized node settings composable
+/**
+ * Remember the chosen output directory so the next new output node defaults to
+ * it (persisted to localStorage via the "output" file-browser context).
+ */
+function rememberOutputDirectory(directory: string | undefined) {
+  if (directory) fileBrowserStore.setCurrentPath("output", directory);
+}
+
+// The default-folder lookup of a never-configured node; a save waits for it.
+let directoryLookup: Promise<void> | null = null;
+
 const { saveSettings, pushNodeData } = useNodeSettings({
   nodeRef: nodeOutput,
+  onBeforeSave: async () => {
+    await directoryLookup;
+    rememberOutputDirectory(nodeOutput.value?.output_settings.directory);
+  },
 });
 const showFileSelectionModal = ref(false);
 const selectedDirectoryExists = ref<boolean | null>(null);
 const localFileInfos = ref<LocalFileInfo[]>([]);
 
-const hasFileExtension = computed(() => {
-  return nodeOutput.value?.output_settings.name?.includes(".") ?? false;
-});
-
 function getWriteOptions(fileType: string): string[] {
-  return fileType === "csv" ? ["overwrite", "new file", "append"] : ["overwrite", "new file"];
+  if (fileType === "csv") return ["overwrite", "new file", "append"];
+  if (fileType === "excel") return ["overwrite", "update", "create"];
+  return ["overwrite", "new file"];
+}
+
+/**
+ * Keep the selected writing option valid for the file type: the options differ
+ * per format, so a mode the new format doesn't offer falls back to "overwrite".
+ */
+function clampWriteMode(fileType: string) {
+  if (!nodeOutput.value) return;
+  const settings = nodeOutput.value.output_settings;
+  if (!getWriteOptions(fileType).includes(settings.write_mode)) {
+    settings.write_mode = "overwrite";
+  }
 }
 
 async function fetchFiles() {
@@ -165,31 +256,37 @@ async function fetchFiles() {
   }
 }
 
+type OutputFileType = "csv" | "excel" | "parquet" | "ipc" | "ndjson" | "avro";
+
 function detectFileType(fileName: string) {
   if (!fileName) return;
 
   const extension = fileName.split(".").pop()?.toLowerCase();
-  if (!extension || !["csv", "xlsx", "xls", "parquet"].includes(extension)) {
-    return;
-  }
-  const verifiedExtension = extension as "csv" | "xlsx" | "xls" | "parquet";
-  const fileTypeMap: Record<"csv" | "xlsx" | "xls" | "parquet", "csv" | "excel" | "parquet"> = {
+  const fileTypeMap: Record<string, OutputFileType> = {
     csv: "csv",
     xlsx: "excel",
     xls: "excel",
     parquet: "parquet",
+    ipc: "ipc",
+    arrow: "ipc",
+    feather: "ipc",
+    ndjson: "ndjson",
+    jsonl: "ndjson",
+    avro: "avro",
   };
+  if (!extension || !fileTypeMap[extension]) {
+    return;
+  }
 
-  if (nodeOutput.value && fileTypeMap[verifiedExtension]) {
-    nodeOutput.value.output_settings.file_type = fileTypeMap[verifiedExtension];
-    nodeOutput.value.output_settings.write_mode = "overwrite";
+  if (nodeOutput.value) {
+    nodeOutput.value.output_settings.file_type = fileTypeMap[extension];
+    clampWriteMode(fileTypeMap[extension]);
 
-    // Update table_settings to match the new file type
-    updateTableSettings(fileTypeMap[verifiedExtension]);
+    updateTableSettings(fileTypeMap[extension]);
   }
 }
 
-function updateTableSettings(fileType: "csv" | "excel" | "parquet") {
+function updateTableSettings(fileType: OutputFileType) {
   if (!nodeOutput.value) return;
 
   switch (fileType) {
@@ -201,6 +298,15 @@ function updateTableSettings(fileType: "csv" | "excel" | "parquet") {
       break;
     case "excel":
       nodeOutput.value.output_settings.table_settings = createExcelTableSettings();
+      break;
+    case "ipc":
+      nodeOutput.value.output_settings.table_settings = createIpcTableSettings();
+      break;
+    case "ndjson":
+      nodeOutput.value.output_settings.table_settings = createNdjsonTableSettings();
+      break;
+    case "avro":
+      nodeOutput.value.output_settings.table_settings = createAvroTableSettings();
       break;
   }
 }
@@ -218,17 +324,19 @@ function handleFileTypeChange() {
     csv: ".csv",
     excel: ".xlsx",
     parquet: ".parquet",
+    ipc: ".arrow",
+    ndjson: ".ndjson",
+    avro: ".avro",
   };
 
-  const baseName = nodeOutput.value.output_settings.name.split(".")[0];
+  const currentName = nodeOutput.value.output_settings.name;
+  const lastDot = currentName.lastIndexOf(".");
+  const baseName = lastDot > 0 ? currentName.slice(0, lastDot) : currentName;
   nodeOutput.value.output_settings.name =
     baseName + (fileExtMap[nodeOutput.value.output_settings.file_type] || "");
 
-  if (!nodeOutput.value.output_settings.write_mode) {
-    nodeOutput.value.output_settings.write_mode = "overwrite";
-  }
+  clampWriteMode(nodeOutput.value.output_settings.file_type);
 
-  // Update table_settings when file type changes
   updateTableSettings(nodeOutput.value.output_settings.file_type);
 }
 
@@ -236,6 +344,7 @@ function handleDirectorySelected(directoryPath: string) {
   if (!nodeOutput.value) return;
 
   nodeOutput.value.output_settings.directory = directoryPath;
+  rememberOutputDirectory(directoryPath);
   showFileSelectionModal.value = false;
   fetchFiles();
 }
@@ -245,6 +354,7 @@ function handleFileSelected(filePath: string, currentPath: string, fileName: str
 
   nodeOutput.value.output_settings.name = fileName;
   nodeOutput.value.output_settings.directory = currentPath;
+  rememberOutputDirectory(currentPath);
   showFileSelectionModal.value = false;
   detectFileType(fileName);
 }
@@ -262,12 +372,93 @@ const querySearch = (queryString: string, cb: (suggestions: LocalFileInfo[]) => 
   cb(results);
 };
 
+/**
+ * A directory is "resolved" only if it's an absolute path the user can actually
+ * see the target of. A relative value like "." is not — the backend resolves it
+ * against its own working directory, so the UI can't tell where the file lands.
+ */
+function isResolvedDirectory(directory: string | undefined): boolean {
+  if (!directory || directory === ".") return false;
+  // Absolute: POSIX (/...), Windows drive (C:\ or C:/), or UNC (\\...).
+  return /^([a-zA-Z]:[\\/]|\\\\|\/)/.test(directory);
+}
+
+/**
+ * Pick a concrete output directory: the last directory the user wrote to
+ * (remembered in the "output" file-browser context), else the user's home
+ * location from the backend. Falls back to "." only if the backend is
+ * unreachable.
+ */
+async function resolveDefaultOutputDirectory(): Promise<string> {
+  const remembered = fileBrowserStore.getLastUsedPath("output");
+  if (isResolvedDirectory(remembered)) return remembered;
+  try {
+    return (await getDefaultPath()) || ".";
+  } catch {
+    return ".";
+  }
+}
+
+/**
+ * For a never-configured node, pre-fill a real, writable location rather than an
+ * unresolved "." — the last-used output dir (else home), remembered. Closing the drawer
+ * of such a node saves what it shows, so the field never shows an unpersisted value; a close
+ * before the lookup answered waits for it, since core resolves a saved "." against its own
+ * working directory.
+ */
+async function ensureResolvedDirectory() {
+  const settings = nodeOutput.value?.output_settings;
+  if (!settings || isResolvedDirectory(settings.directory)) return;
+
+  const resolved = await resolveDefaultOutputDirectory();
+  if (!isResolvedDirectory(resolved)) return; // backend unreachable — leave as-is
+
+  settings.directory = resolved;
+  rememberOutputDirectory(resolved);
+}
+
+/** The directory part of core's absolute file path. */
+function directoryOf(settings: OutputSettings): string | null {
+  const absolute = settings.abs_file_path;
+  if (!absolute) return null;
+  const name = settings.name;
+  const withName = name && (absolute.endsWith(`/${name}`) || absolute.endsWith(`\\${name}`));
+  return withName ? absolute.slice(0, -name.length - 1) : absolute;
+}
+
+// A configured node's saved relative directory stays as stored; this says where core writes.
+const relativeHint = ref<{ directory: string; location: string; suggestion: string | null } | null>(
+  null,
+);
+
+async function describeRelativeDirectory() {
+  relativeHint.value = null;
+  const settings = nodeOutput.value?.output_settings;
+  if (!settings || isResolvedDirectory(settings.directory)) return;
+  const directory = settings.directory;
+  const suggestion = await resolveDefaultOutputDirectory();
+  relativeHint.value = {
+    directory,
+    location: directoryOf(settings) ?? directory,
+    suggestion: isResolvedDirectory(suggestion) ? suggestion : null,
+  };
+}
+
+function useSuggestedDirectory() {
+  const suggestion = relativeHint.value?.suggestion;
+  if (!nodeOutput.value || !suggestion) return;
+  nodeOutput.value.output_settings.directory = suggestion;
+  rememberOutputDirectory(suggestion);
+  fetchFiles();
+}
+
 async function loadNodeData(nodeId: number) {
   const nodeResult = await nodeStore.getNodeData(nodeId, false);
   if (nodeResult?.setting_input && nodeResult.setting_input.is_setup) {
     nodeOutput.value = nodeResult.setting_input;
+    // Older flows may persist modes the current options no longer offer (e.g. excel "new file").
+    clampWriteMode(nodeResult.setting_input.output_settings.file_type);
   } else {
-    // Provide a default configuration that matches NodeBase interface
     nodeOutput.value = {
       output_settings: createDefaultOutputSettings(),
       flow_id: nodeStore.flow_id,
@@ -278,6 +469,13 @@ async function loadNodeData(nodeId: number) {
       is_setup: false,
       description: "",
     };
+  }
+  if (nodeOutput.value?.is_setup === false) {
+    relativeHint.value = null;
+    directoryLookup = ensureResolvedDirectory();
+    await directoryLookup;
+  } else {
+    await describeRelativeDirectory();
   }
   dataLoaded.value = true;
 }
@@ -314,9 +512,9 @@ defineExpose({
   background-color: var(--color-button-secondary);
   border: 1px solid transparent;
   border-radius: 4px;
-  padding: 10px 20px;
+  padding: 5px 12px;
   color: var(--color-text-inverse);
-  font-size: 16px;
+  font-size: 13px;
   cursor: pointer;
   transition: all 0.3s ease;
 }
@@ -329,5 +527,46 @@ defineExpose({
   color: var(--color-danger);
   display: flex;
   align-items: center;
+}
+
+.directory-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: -12px 0 12px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  word-break: break-all;
+}
+
+.info-box {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.5rem 0.625rem;
+  background-color: var(--color-accent-subtle);
+  border-left: 3px solid var(--color-accent);
+  border-radius: 4px;
+  margin: 0.5rem 0;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+
+.info-box i {
+  color: var(--color-accent-dark);
+  font-size: 0.875rem;
+  flex-shrink: 0;
+  padding-top: 3px;
+}
+
+.info-box p {
+  margin: 0;
+  color: var(--color-text-secondary);
+}
+
+.info-box .info-caveat {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--color-text-tertiary);
 }
 </style>

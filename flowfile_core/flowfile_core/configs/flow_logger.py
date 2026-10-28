@@ -3,7 +3,6 @@ import logging.handlers
 import os
 import queue
 import threading
-from datetime import datetime
 from pathlib import Path
 
 from shared.storage_config import storage
@@ -91,14 +90,12 @@ class FlowLogger:
 
     def cleanup_self(self):
         """Clean up just this logger instance (not global)"""
-        # Try with non-blocking lock first
         if self._file_lock.acquire(blocking=False):
             try:
                 self._cleanup_handlers()
             finally:
                 self._file_lock.release()
         else:
-            # If we can't get lock, proceed anyway
             main_logger.warning(f"Could not acquire lock for flow {self.flow_id}, proceeding with cleanup anyway")
             self._cleanup_handlers()
 
@@ -114,36 +111,44 @@ class FlowLogger:
 
     def recreate_self(self):
         """Recreate this logger instance after cleanup"""
-        # Try with non-blocking lock first
         if self._file_lock.acquire(blocking=False):
             try:
                 self._recreate_impl()
             finally:
                 self._file_lock.release()
         else:
-            # If we can't get lock, proceed anyway
             main_logger.warning(f"Could not acquire lock for flow {self.flow_id}, proceeding with recreation anyway")
             self._recreate_impl()
 
     def _recreate_impl(self):
         """Implementation of recreate operation"""
-        # Make sure the log directory exists
         log_dir = Path(self.log_file_path).parent
         log_dir.mkdir(exist_ok=True, parents=True)
 
         try:
-            # Create an empty file
             with open(self.log_file_path, "w"):
                 pass
 
-            # Re-setup the logger
             self._setup_new_logger()
             main_logger.info(f"Log file was recreated for flow {self.flow_id}")
         except Exception as e:
             main_logger.error(f"Error recreating log file for flow {self.flow_id}: {e}")
 
     def refresh_logger_if_needed(self):
-        """Check if log file exists and refresh logger if needed"""
+        """Re-point or recreate the file handler when it no longer matches reality.
+
+        Instances are cached per flow_id for the process lifetime, so a logger
+        built before the logs directory moved would keep writing to the old
+        path while every reader resolves the new one through
+        ``get_flow_log_file``. Rebinding appends rather than truncating, so an
+        existing log at the new location is preserved.
+        """
+        current_path = get_flow_log_file(self.flow_id)
+        if current_path != self.log_file_path:
+            main_logger.info(f"Log path moved for flow {self.flow_id}, rebinding to: {current_path}")
+            self.log_file_path = current_path
+            self.setup_logging()
+            return True
         if not os.path.exists(self.log_file_path):
             main_logger.info(f"Log file missing, recreating: {self.log_file_path}")
             self.cleanup_self()
@@ -168,30 +173,25 @@ class FlowLogger:
             finally:
                 self._file_lock.release()
         else:
-            # Try with timeout
             if self._file_lock.acquire(timeout=1):
                 try:
                     self._setup_logging_impl()
                 finally:
                     self._file_lock.release()
             else:
-                # If still can't get lock, proceed anyway
                 main_logger.warning(f"Could not acquire lock for flow {self.flow_id}, proceeding with setup anyway")
                 self._setup_logging_impl()
 
     def _setup_logging_impl(self):
         """Implementation of setup_logging without lock handling"""
-        # Remove existing handlers
         for handler in self._logger.handlers[:]:
             if isinstance(handler, logging.FileHandler):
                 handler.close()
                 self._logger.removeHandler(handler)
 
-        # Make sure the log directory exists
         log_dir = Path(self.log_file_path).parent
         log_dir.mkdir(exist_ok=True, parents=True)
 
-        # Add file handler
         file_handler = logging.FileHandler(self.log_file_path)
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         file_handler.setFormatter(formatter)
@@ -205,14 +205,12 @@ class FlowLogger:
             finally:
                 self._file_lock.release()
         else:
-            # If can't get lock, try with timeout
             if self._file_lock.acquire(timeout=1):
                 try:
                     self._clear_log_impl()
                 finally:
                     self._file_lock.release()
             else:
-                # If still can't get lock, proceed anyway
                 main_logger.warning(
                     f"Could not acquire lock for flow {self.flow_id}, proceeding with file clearing anyway"
                 )
@@ -221,9 +219,7 @@ class FlowLogger:
     def _clear_log_impl(self):
         """Implementation of clear_log_file without lock handling"""
         try:
-            # Ensure parent directory exists
             self.refresh_logger_if_needed()
-            # Truncate file
             with open(self.log_file_path, "w"):
                 pass
             main_logger.info(f"Log file cleared for flow {self.flow_id}")
@@ -247,7 +243,6 @@ class FlowLogger:
             finally:
                 self._file_lock.release()
         else:
-            # If can't get lock, proceed anyway
             main_logger.warning(f"Could not acquire lock for flow {self.flow_id}, proceeding with cleanup anyway")
             self._cleanup_handlers()
 
@@ -261,7 +256,6 @@ class FlowLogger:
         """Get a logger for a specific node in this flow"""
         return NodeLogger(node_id, flow_id=self.flow_id, flow_logger_parent=self)
 
-    # Logging methods with automatic refresh
     def info(self, msg: str, extra: dict = None, node_id: str | int = -1):
         self.refresh_logger_if_needed()
         if node_id != -1:
@@ -296,7 +290,6 @@ class FlowLogger:
 
     def read_from_line(self, start_line: int = 0):
         """Read log content starting from a specific line"""
-        # Refresh logger if needed before reading
         self.refresh_logger_if_needed()
 
         if self._file_lock.acquire(blocking=False):
@@ -325,14 +318,12 @@ class FlowLogger:
             # Get a copy of keys to avoid modification during iteration
             flow_ids = list(cls._instances.keys())
 
-            # Cleanup all instances
             for flow_id in flow_ids:
                 try:
                     cls.cleanup_instance(flow_id)
                 except Exception as e:
                     main_logger.error(f"Error cleaning up instance for flow {flow_id}: {e}")
 
-            # Stop queue listener
             with cls._queue_listener_lock:
                 if cls._queue_listener:
                     try:
@@ -341,7 +332,6 @@ class FlowLogger:
                     except Exception as e:
                         main_logger.error(f"Error stopping queue listener: {e}")
 
-            # Clear instances
             cls._instances.clear()
 
     def __del__(self):
@@ -357,31 +347,12 @@ def get_flow_log_file(flow_id: int) -> Path:
     return storage.logs_directory / f"flow_{flow_id}.log"
 
 
-def cleanup_old_logs(max_age_days: int = 7):
-    """Delete log files older than specified days"""
-    logs_dir = storage.logs_directory
-    now = datetime.now().timestamp()
-    deleted_count = 0
-
-    for log_file in logs_dir.glob("flow_*.log"):
-        try:
-            if (now - log_file.stat().st_mtime) > (max_age_days * 24 * 60 * 60):
-                log_file.unlink()
-                deleted_count += 1
-        except Exception as e:
-            main_logger.error(f"Failed to delete old log file {log_file}: {e}")
-
-    if deleted_count > 0:
-        main_logger.info(f"Deleted {deleted_count} old log files")
-
-
 def clear_all_flow_logs():
     """Delete all flow log files"""
     logs_dir = storage.logs_directory
     deleted_count = 0
 
     try:
-        # First close all handlers
         with FlowLogger._instances_lock:
             for flow_id, instance in FlowLogger._instances.items():
                 try:
@@ -393,8 +364,7 @@ def clear_all_flow_logs():
                 except Exception as e:
                     main_logger.error(f"Error closing handlers for flow {flow_id}: {e}")
 
-        # Now delete all log files
-        for log_file in logs_dir.glob("*.log"):
+        for log_file in logs_dir.glob("flow_*.log"):
             try:
                 os.remove(log_file)
                 deleted_count += 1
@@ -411,12 +381,10 @@ def read_log_from_line(log_file_path: Path, start_line: int = 0):
     lines = []
     try:
         with open(log_file_path) as file:
-            # Skip lines efficiently if needed
             if start_line > 0:
                 for _ in range(start_line):
                     next(file, None)
 
-            # Read remaining lines
             lines = file.readlines()
     except FileNotFoundError:
         main_logger.error(f"Log file not found: {log_file_path}")

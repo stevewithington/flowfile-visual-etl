@@ -16,9 +16,12 @@ from flowfile_core.flowfile.flow_node.models import (
     ExecutionDecision,
     ExecutionStrategy,
     InvalidationReason,
+    InvalidExpressionError,
 )
 from flowfile_core.flowfile.flow_node.state import NodeExecutionState, SourceFileInfo
+from flowfile_core.flowfile.parameter_resolver import node_parameters_resolved
 from flowfile_core.schemas import schemas
+from shared.path_utils import is_url
 
 if TYPE_CHECKING:
     from flowfile_core.configs.flow_logger import NodeLogger
@@ -113,23 +116,11 @@ class NodeExecutor:
 
         state = self.state_provider.get_state(self.node.node_id, self.node.parent_uuid)
 
-        # Handle explicit cache reset
         if reset_cache:
             self._clear_cache(state)
 
-        # Decide execution strategy
         decision = self._decide_execution(state, run_location, performance_mode, reset_cache)
-
-        # Override for wide transforms when optimizing for downstream
-        if (
-            decision.should_run
-            and decision.strategy == ExecutionStrategy.LOCAL_WITH_SAMPLING
-            and self.node.node_default
-            and self.node.node_default.transform_type == "wide"
-            and optimize_for_downstream
-            and run_location != "local"
-        ):
-            decision = ExecutionDecision(True, ExecutionStrategy.REMOTE, decision.reason)
+        decision = self._override_for_downstream(decision, run_location, optimize_for_downstream)
         if not decision.should_run:
             return
 
@@ -143,17 +134,73 @@ class NodeExecutor:
         if self.node.node_settings.cache_results:
             effective_performance_mode = False
 
-        # Prepare and execute
+        if decision.reason == InvalidationReason.SOURCE_FILE_CHANGED:
+            # The worker keys results by node hash, which a source change does not rotate.
+            self._clear_cache(state)
+
         self._prepare_for_execution(state)
         self.node.reset()
+        self._release_deferred_seed()
+        self.node._last_exception_class = None  # a previous run's class must never describe this one
+
+        # Snapshot before the scan so files arriving mid-run are not silently marked as seen.
+        pending_source_info = self._pending_source_snapshot()
 
         try:
+            self._raise_on_invalid_expression()
             self._execute_with_strategy(state, decision.strategy, effective_performance_mode, node_logger)
-            self._update_source_file_info(state)
+            if pending_source_info is not None:
+                state.source_file_info = pending_source_info
             self._sync_state_to_legacy(state)
             self.state_provider.save_state(self.node.node_id, self.node.parent_uuid, state)
         except Exception as e:
+            if state.is_canceled:
+                # Cancelled mid-run (e.g. a cancel_check-aborted DB read): record a clean
+                # cancellation instead of a failure, and skip the error/retry path.
+                node_logger.info("Node execution cancelled")
+                state.reset_results_only()
+                self._sync_state_to_legacy(state)
+                return
             self._handle_error(state, e, run_location, effective_performance_mode, retry, node_logger)
+
+    def _override_for_downstream(
+        self,
+        decision: ExecutionDecision,
+        run_location: schemas.ExecutionLocationsLiteral,
+        optimize_for_downstream: bool,
+    ) -> ExecutionDecision:
+        """Promote a sampled wide transform to a full remote run so downstream nodes can reuse it."""
+        if (
+            decision.should_run
+            and decision.strategy == ExecutionStrategy.LOCAL_WITH_SAMPLING
+            and self.node.node_default
+            and self.node.node_default.transform_type == "wide"
+            and optimize_for_downstream
+            and run_location != "local"
+        ):
+            return ExecutionDecision(True, ExecutionStrategy.REMOTE, decision.reason)
+        return decision
+
+    def _raise_on_invalid_expression(self) -> None:
+        """Fail a formula/advanced-filter node whose expression cannot run against its input.
+
+        The check is data-free (a zero-row collect). Running it here, before the strategy builds
+        the lazy plan, makes a leaf node's bad expression surface at all and attributes it to this
+        node instead of whichever downstream sink would otherwise be the first to collect it.
+
+        A formula node's own ``collect_schema`` step does not type-check the temporal/string
+        namespaces, so the chain check is what catches those — it is not redundant with it.
+        """
+        from flowfile_core.flowfile.settings_validation import node_expression_issue, node_formula_chain_issue
+
+        if self.node.node_type == "formula":
+            message = node_formula_chain_issue(self.node, allow_prediction=False)
+            if message is not None:
+                raise InvalidExpressionError(message)
+            return
+        issue = node_expression_issue(self.node, allow_prediction=False)
+        if issue is not None and issue.kind in ("type", "parse"):
+            raise InvalidExpressionError(issue.message)
 
     def _decide_execution(
         self,
@@ -167,15 +214,37 @@ class NodeExecutor:
 
         Determines both WHETHER to run and HOW to run in one place.
         """
-        # Output nodes always run
         if self.node.node_template.node_group == "output":
             strategy = self._determine_strategy(run_location)
             return ExecutionDecision(True, strategy, InvalidationReason.OUTPUT_NODE)
 
-        # Forced refresh (reset_cache=True)
+        if self.node.node_type == "run_flow":
+            # The referenced flow file can change without any parent-settings
+            # change, so a subflow node is never considered up to date.
+            strategy = self._determine_strategy(run_location)
+            return ExecutionDecision(True, strategy, InvalidationReason.OUTPUT_NODE)
+
+        if self.node.node_type == "gate" and self._gate_routes_on_formula():
+            # The formula's source data can change without any hash changing,
+            # so the gate must re-evaluate its routing decision every run.
+            strategy = self._determine_strategy(run_location)
+            return ExecutionDecision(True, strategy, InvalidationReason.OUTPUT_NODE)
+
         if force_refresh:
             strategy = self._determine_strategy(run_location)
             return ExecutionDecision(True, strategy, InvalidationReason.FORCED_REFRESH)
+
+        # Changed source data outranks every cache: the node hash does not rotate when a file
+        # on disk changes, so a cache hit here would serve data the user just replaced.
+        if self._source_file_changed(state):
+            strategy = self._determine_strategy(run_location)
+            return ExecutionDecision(True, strategy, InvalidationReason.SOURCE_FILE_CHANGED)
+
+        # A vanished worker artifact outranks the in-memory "already ran" flag: the held
+        # result is a scan of that file, so skipping here hands downstream a dangling plan.
+        if self.node.results.artifact_is_missing():
+            strategy = self._determine_strategy(run_location)
+            return ExecutionDecision(True, strategy, InvalidationReason.CACHE_MISSING)
 
         # Cache-enabled nodes: check if cache file is still present
         # This must come before performance_mode so cached results are preserved
@@ -186,24 +255,21 @@ class NodeExecutor:
             strategy = self._determine_strategy(run_location)
             return ExecutionDecision(True, strategy, InvalidationReason.CACHE_MISSING)
 
-        # In performance mode we always evaluate all objects
         if performance_mode:
             strategy = self._determine_strategy(run_location)
             return ExecutionDecision(True, strategy, InvalidationReason.PERFORMANCE_MODE)
 
-        # Never ran before
         if not state.has_run_with_current_setup:
             strategy = self._determine_strategy(run_location)
             return ExecutionDecision(True, strategy, InvalidationReason.NEVER_RAN)
 
-        # Check if source file changed (for read nodes)
-        if self._source_file_changed(state):
-            strategy = self._determine_strategy(run_location)
-            return ExecutionDecision(True, strategy, InvalidationReason.SOURCE_FILE_CHANGED)
-
         # Already ran with current settings → skip
         # Results are available in memory from previous execution
         return ExecutionDecision(False, ExecutionStrategy.SKIP, None)
+
+    def _gate_routes_on_formula(self) -> bool:
+        gate_input = getattr(self.node.setting_input, "gate_input", None)
+        return gate_input is not None and getattr(gate_input, "condition_source", "parameter") == "formula"
 
     def _determine_strategy(
         self,
@@ -224,20 +290,15 @@ class NodeExecutor:
         When cache_results is enabled, the node must run fully remote so the
         result can be materialized and stored in the cache.
         """
-        # Local execution mode (e.g., WASM, no worker available)
         if run_location == "local":
             return ExecutionStrategy.FULL_LOCAL
 
-        # Caching requires full remote execution to materialize and store results
         if self.node.node_settings.cache_results:
             return ExecutionStrategy.REMOTE
 
-        # Narrow transforms are lightweight column-level operations that can
-        # run locally with an external sampler for preview data
         if self.node.node_default is not None and self.node.node_default.transform_type == "narrow":
             return ExecutionStrategy.LOCAL_WITH_SAMPLING
 
-        # Full remote execution for wide transforms and everything else
         return ExecutionStrategy.REMOTE
 
     def _execute_with_strategy(
@@ -320,27 +381,53 @@ class NodeExecutor:
             return None
 
         rf = setting_input.received_file
-        # Prefer absolute path if available
         if hasattr(rf, "abs_file_path") and rf.abs_file_path:
             return rf.abs_file_path
         return rf.path if hasattr(rf, "path") else None
 
-    def _update_source_file_info(self, state: NodeExecutionState) -> None:
-        """Update source file tracking after successful execution."""
-        if self.node.node_type != "read":
-            return
+    def _pending_source_snapshot(self) -> SourceFileInfo | None:
+        """Snapshot the source *before* the scan, to be committed only if the run succeeds.
 
-        path = self._get_source_path()
-        if path:
-            state.source_file_info = SourceFileInfo.from_path(path)
+        Taken up front so a file written while the node is reading counts as a later change
+        instead of being folded into this run's fingerprint. Returns None for non-read nodes
+        and for sources that cannot be stat'ed, in which case any existing snapshot is kept.
+        """
+        if self.node.node_type != "read":
+            return None
+
+        received_file = getattr(self.node.setting_input, "received_file", None)
+        if received_file is not None and not is_url(getattr(received_file, "path", None)):
+            # Idempotent: recomputes the pattern from the ${param}-substituted path.
+            received_file.set_absolute_filepath()
+
+        return self._snapshot_source(self._get_source_path())
+
+    def _snapshot_source(self, path: str | None) -> SourceFileInfo | None:
+        """Fingerprint *path* for change detection: an aggregate in directory mode, a single stat otherwise."""
+        if self.node.node_type != "read" or not path:
+            return None
+
+        received_file = getattr(self.node.setting_input, "received_file", None)
+        if received_file is not None and getattr(received_file, "scan_mode", "single_file") == "directory":
+            return SourceFileInfo.from_pattern(path)
+        return SourceFileInfo.from_path(path)
 
     def _prepare_for_execution(self, state: NodeExecutionState) -> None:
         """Prepare node state before execution."""
         self.node.clear_table_example()
         state.reset_results_only()
+        state.is_canceled = False  # clear any stale cancel flag from a prior run
+        self.node.node_stats.is_canceled = False
         self.node.results.errors = None
         self.node.results.resulting_data = None
         self.node.results.example_data = None
+
+    def _release_deferred_seed(self) -> None:
+        """Let this run execute a seeded node; called after ``reset()``, which re-arms a node placed deferred."""
+        if self.node.deferred_until_run:
+            self.node.deferred_until_run = False
+            # the seed's per-handle schemas would outlive the run: multi-output refills skip them
+            self.node._named_schemas = {}
 
     def _clear_cache(self, state: NodeExecutionState) -> None:
         """Clear cached results."""
@@ -369,19 +456,25 @@ class NodeExecutor:
         state.mark_failed(error_str)
         self._sync_state_to_legacy(state)
         self.node.results.errors = error_str
+        # Class name only, never the message; a worker wrapper carries the original class.
+        self.node._last_exception_class = getattr(error, "original_class", None) or type(error).__name__
 
         # Retry on missing file errors (upstream cache was cleared)
         if "No such file or directory (os error" in error_str and retry:
             node_logger.warning("Input file missing, retrying upstream nodes...")
             for node_input in self.node.node_inputs.get_all_inputs():
-                # Recursively execute upstream nodes
-                node_input.execute_node(
-                    run_location=run_location,
-                    performance_mode=performance_mode,
-                    retry=True,
-                    reset_cache=True,
-                    node_logger=node_logger,
-                )
+                # The run loop substitutes only into the node it is about to run.
+                try:
+                    with node_parameters_resolved(node_input):
+                        node_input.execute_node(
+                            run_location=run_location,
+                            performance_mode=performance_mode,
+                            retry=True,
+                            reset_cache=True,
+                            node_logger=node_logger,
+                        )
+                except ValueError as e:
+                    node_logger.error(f"Could not retry upstream node {node_input.node_id}: {e}")
             # Retry this node once (no further retries)
             self.execute(
                 run_location=run_location,
@@ -391,7 +484,6 @@ class NodeExecutor:
             )
             return
 
-        # Log appropriate error message
         if "Connection refused" in error_str and "/submit_query/" in error_str:
             node_logger.warning(
                 "Could not connect to remote worker. "

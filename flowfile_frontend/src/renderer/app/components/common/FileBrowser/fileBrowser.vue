@@ -1,5 +1,5 @@
 <template>
-  <div class="file-browser">
+  <div class="file-browser" :class="{ dense }">
     <!-- Title Section -->
     <div class="browser-header">
       <div class="browser-title">
@@ -11,7 +11,7 @@
       <!-- Navigation and Search Section -->
       <div class="browser-toolbar">
         <div class="path-navigation">
-          <button class="nav-button" :disabled="loading" @click="navigateUpDirectory">
+          <button class="nav-button" :disabled="loading || isAtRoot" @click="navigateUpDirectory">
             <span class="material-icons">arrow_upward</span>
             <span>Up</span>
           </button>
@@ -47,7 +47,11 @@
               <el-option label="Name" value="name" />
               <el-option label="Size" value="size" />
               <el-option label="Modified" value="last_modified" />
-              <el-option label="Created" value="created_date" />
+              <el-option
+                v-if="provider.capabilities.createdDate"
+                label="Created"
+                value="created_date"
+              />
             </el-select>
             <el-button class="sort-direction-button" size="small" @click="toggleSortDirection">
               <span class="material-icons">
@@ -56,7 +60,7 @@
             </el-button>
           </div>
 
-          <label class="show-hidden-toggle">
+          <label v-if="provider.capabilities.hiddenFiles" class="show-hidden-toggle">
             <el-checkbox v-model="showHidden" @change="loadCurrentDirectory">
               Show hidden files
             </el-checkbox>
@@ -76,6 +80,28 @@
             <el-button type="primary" size="small" @click.stop="loadCurrentDirectory">
               <span class="material-icons">refresh</span>
               Retry
+            </el-button>
+          </div>
+        </div>
+
+        <!-- Credentials cannot enumerate containers; ask for one instead of dead-ending -->
+        <div v-else-if="rootListingDenied" class="denied-state" @click.stop>
+          <span class="material-icons">lock</span>
+          <span>This connection is not allowed to list buckets.</span>
+          <div class="bucket-entry">
+            <el-input
+              v-model="bucketInput"
+              size="small"
+              placeholder="Enter a bucket name to open"
+              @keyup.enter="openTypedBucket"
+            />
+            <el-button
+              type="primary"
+              size="small"
+              :disabled="!bucketInput.trim()"
+              @click="openTypedBucket"
+            >
+              Open
             </el-button>
           </div>
         </div>
@@ -103,7 +129,7 @@
                 />
                 <img
                   v-else-if="isFlowfile(file)"
-                  src="/images/flowfile.svg"
+                  src="/images/flowfile.png"
                   alt="Flow file"
                   class="file-icon"
                 />
@@ -120,23 +146,37 @@
                   {{ file.name }}
                 </div>
                 <div class="file-info">
-                  {{ formatFileSize(file.size) }} •
-                  {{ formatDate(file.last_modified) }}
+                  {{ formatEntryMeta(file) }}
                 </div>
               </div>
             </div>
           </div>
         </div>
 
+        <!-- Object stores return one page at a time -->
+        <div v-if="!loading && !error && truncated" class="truncation-bar" @click.stop>
+          <span class="material-icons">more_horiz</span>
+          <span
+            >Showing the first {{ files.length }} entries. Narrow the path or search to
+            refine.</span
+          >
+          <el-button v-if="nextToken" size="small" :loading="loadingMore" @click="loadMoreEntries">
+            Load more
+          </el-button>
+        </div>
+
         <!-- Empty state hint when no file is selected -->
-        <div v-if="!loading && !error && filteredFiles.length === 0" class="empty-state">
+        <div
+          v-if="!loading && !error && !rootListingDenied && filteredFiles.length === 0"
+          class="empty-state"
+        >
           <span class="material-icons">folder_open</span>
           <span>No files found</span>
         </div>
       </div>
       <!-- Bottom Action Bar -->
       <div class="browser-actions">
-        <template v-if="mode === 'create'">
+        <template v-if="mode === 'create' && provider.capabilities.createFile">
           <el-button
             v-if="selectedFile && !selectedFile.is_directory && showWarningOnOverwrite"
             type="warning"
@@ -172,7 +212,7 @@
           @click="handleSelectDirectory"
         >
           <span class="material-icons">folder</span>
-          Select This Directory
+          {{ currentIsDeltaTable ? "Select This Delta Table" : "Select This Directory" }}
         </el-button>
 
         <el-button
@@ -224,20 +264,21 @@
 </template>
 
 <script setup lang="ts">
-// TODO(refactor): ~1020 LOC. Plan to extract:
-//   - useFileBrowserSort composable: sort/filter (~lines 555-604)
-//   - FileBrowserToolbar.vue (~lines 13-65), FileBrowserGrid.vue (~84-135)
-//   - FileCreateDialog.vue (~192-222), useFileBrowserNavigation composable (~344-377)
+// TODO(refactor): ~1130 LOC. Plan to extract:
+//   - useFileBrowserSort composable: sort/filter (~lines 705-760)
+//   - FileBrowserToolbar.vue (~lines 12-69), FileBrowserGrid.vue (~109-154)
+//   - FileCreateDialog.vue (~232-262), useFileBrowserNavigation composable (~394-500)
+// Storage is already abstracted behind the `location` prop -> ./storage providers;
+// the navigation composable should take the provider rather than reach for the API.
 import { ref, computed, onMounted, onActivated, watch } from "vue";
-import { FileInfo } from "./types";
+import { FileInfo, StorageLocation } from "./types";
 import { useFileBrowserStore, type FileBrowserContext } from "../../../stores/fileBrowserStore";
 
 import { ElMessage, ElMessageBox } from "element-plus";
-import { getDirectoryContents, getDefaultPath, getParentPath, joinPath } from "./fileSystemApi";
+import { resolveStorageProvider, storageScopeKey } from "./storage";
+import { basename, dirname, normalizePath } from "../../../utils/storagePath";
 
 import { FLOWFILE_EXTENSIONS, DATA_FILE_EXTENSIONS, ALLOWED_SAVE_EXTENSIONS } from "./constants";
-
-import path from "path-browserify";
 
 const fileBrowserStore = useFileBrowserStore();
 
@@ -262,6 +303,14 @@ interface Props {
   isVisible?: boolean;
   /** Context for state management - each context maintains its own path state */
   context?: FileBrowserContext;
+  /** When set, browsing is locked to this directory (start dir + no navigating above it). */
+  rootPath?: string;
+  /** Prefill for the "Create New File" dialog (e.g. the current flow's name on Save As). */
+  defaultNewFileName?: string;
+  /** Compact row rhythm for height-capped hosts (the Save/Create dialogs). */
+  dense?: boolean;
+  /** Which storage to browse. Omit for the local filesystem. */
+  location?: StorageLocation;
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -273,7 +322,17 @@ const props = withDefaults(defineProps<Props>(), {
   showWarningOnOverwrite: true,
   isVisible: true,
   context: "flows",
+  rootPath: undefined,
+  defaultNewFileName: "",
+  dense: false,
+  location: () => ({ kind: "local" }) as StorageLocation,
 });
+
+const provider = computed(() => resolveStorageProvider(props.location));
+/** Null for local so the existing contexts gain no extra localStorage entry. */
+const storedScope = computed(() =>
+  props.location.kind === "local" ? null : storageScopeKey(props.location),
+);
 
 // Emits
 const emit = defineEmits<{
@@ -292,22 +351,64 @@ const showHidden = ref(false);
 const loading = ref(false);
 const error = ref<string | null>(null);
 
+// Object-store listings arrive one page at a time and may be refused at the
+// container-list level; local listings never set any of these.
+const truncated = ref(false);
+const nextToken = ref<string | null>(null);
+const loadingMore = ref(false);
+const rootListingDenied = ref(false);
+const currentIsDeltaTable = ref(false);
+const bucketInput = ref("");
+
 // Create file state
 const showCreateDialog = ref(false);
 const newFileName = ref("");
 const fileNameError = ref("");
 const selectedFile = ref<FileInfo | null>(null);
 
+// Seed the filename from the caller's default (e.g. the flow's name on Save As);
+// handleDialogClosed resets it, so a reopen re-seeds.
+watch(showCreateDialog, (open) => {
+  if (open && !newFileName.value && props.defaultNewFileName) {
+    newFileName.value = props.defaultNewFileName;
+  }
+});
+
+const normalizeForCompare = (p: string): string => {
+  const n = normalizePath(p);
+  return n.length > 1 && n.endsWith("/") ? n.slice(0, -1) : n;
+};
+
+const isWithinRoot = (p: string): boolean => {
+  if (!props.rootPath) return true;
+  const root = normalizeForCompare(props.rootPath);
+  const target = normalizeForCompare(p);
+  return target === root || target.startsWith(root + "/");
+};
+
+const isAtRoot = computed(
+  () =>
+    (!!props.rootPath &&
+      normalizeForCompare(currentPath.value) === normalizeForCompare(props.rootPath)) ||
+    provider.value.isRoot(currentPath.value),
+);
+
 const loadDirectoryContents = async (directoryPath: string) => {
   loading.value = true;
   error.value = null;
   try {
-    const filesResponse = await getDirectoryContents(directoryPath, {
-      include_hidden: showHidden.value,
+    const listing = await provider.value.list(directoryPath, {
+      includeHidden: showHidden.value,
     });
-    files.value = filesResponse;
-    currentPath.value = directoryPath;
-    fileBrowserStore.setCurrentPath(props.context, directoryPath);
+    files.value = listing.entries;
+    currentPath.value = listing.path || directoryPath;
+    truncated.value = listing.truncated;
+    nextToken.value = listing.nextToken;
+    rootListingDenied.value = listing.rootListingDenied;
+    currentIsDeltaTable.value = listing.currentIsDeltaTable;
+    if (!props.rootPath) {
+      fileBrowserStore.setCurrentPath(props.context, currentPath.value, storedScope.value);
+    }
   } catch (err: any) {
     error.value = err.message || "Failed to load directory";
   } finally {
@@ -315,11 +416,30 @@ const loadDirectoryContents = async (directoryPath: string) => {
   }
 };
 
+/** Append the next page in place; object stores cap how much one listing returns. */
+const loadMoreEntries = async () => {
+  if (!nextToken.value || loadingMore.value) return;
+  loadingMore.value = true;
+  try {
+    const listing = await provider.value.list(currentPath.value, {
+      includeHidden: showHidden.value,
+      pageToken: nextToken.value,
+    });
+    files.value = [...files.value, ...listing.entries];
+    truncated.value = listing.truncated;
+    nextToken.value = listing.nextToken;
+  } catch (err: any) {
+    ElMessage.warning(err.message || "Could not load more entries");
+  } finally {
+    loadingMore.value = false;
+  }
+};
+
 const loadDefaultDirectory = async () => {
   loading.value = true;
   error.value = null;
   try {
-    const defaultPath = await getDefaultPath();
+    const defaultPath = await provider.value.defaultPath();
     await loadDirectoryContents(defaultPath);
   } catch (err: any) {
     error.value = err.message || "Failed to load directory";
@@ -328,9 +448,16 @@ const loadDefaultDirectory = async () => {
 };
 
 const loadCurrentDirectory = async () => {
-  const storedPath = fileBrowserStore.getCurrentPath(props.context);
+  if (props.rootPath) {
+    await loadDirectoryContents(props.rootPath);
+    return;
+  }
 
-  if (storedPath) {
+  const storedPath = fileBrowserStore.getCurrentPath(props.context);
+  // A path remembered against a different connection must not be replayed here.
+  const sameStorage = fileBrowserStore.getScope(props.context) === storedScope.value;
+
+  if (storedPath && sameStorage) {
     await loadDirectoryContents(storedPath);
     if (error.value) {
       fileBrowserStore.resetContext(props.context);
@@ -341,11 +468,19 @@ const loadCurrentDirectory = async () => {
   }
 };
 
+const openTypedBucket = async () => {
+  const typed = bucketInput.value.trim();
+  if (!typed) return;
+  await navigateToPath(provider.value.join(currentPath.value, typed));
+  bucketInput.value = "";
+};
+
 /**
  * Navigate to a specific directory path.
  * On failure, stays at the current directory and shows a warning instead of an error state.
  */
 const navigateToPath = async (directoryPath: string) => {
+  if (!isWithinRoot(directoryPath)) return;
   const previousPath = currentPath.value;
   const previousFiles = [...files.value];
   await loadDirectoryContents(directoryPath);
@@ -366,9 +501,10 @@ const navigateToPath = async (directoryPath: string) => {
  * Navigate up one directory level
  */
 const navigateUpDirectory = async () => {
-  const parentPath = getParentPath(currentPath.value);
-  if (parentPath && parentPath !== currentPath.value) {
-    await navigateToPath(parentPath);
+  if (isAtRoot.value) return;
+  const parent = provider.value.parent(currentPath.value);
+  if (parent && parent !== currentPath.value && isWithinRoot(parent)) {
+    await navigateToPath(parent);
   }
 };
 
@@ -376,25 +512,23 @@ const navigateUpDirectory = async () => {
  * Navigate into a subdirectory
  */
 const navigateIntoDirectory = async (directoryName: string) => {
-  const newPath = joinPath(currentPath.value, directoryName);
+  const newPath = provider.value.join(currentPath.value, directoryName);
   await navigateToPath(newPath);
 };
 
-const handleInitialFileSelection = async () => {
-  if (!props.initialFilePath) return;
+const handleInitialFileSelection = async (filePath?: string) => {
+  const initialPath = filePath || props.initialFilePath;
+  if (!initialPath) return;
 
   loading.value = true;
   error.value = null;
 
   try {
-    // Get the directory path from the full file path
-    const directoryPath = path.dirname(props.initialFilePath);
-    const fileName = path.basename(props.initialFilePath);
+    const directoryPath = dirname(initialPath);
+    const fileName = basename(initialPath);
 
-    // Navigate to the directory using stateless approach
     await loadDirectoryContents(directoryPath);
 
-    // Find and select the file
     const fileToSelect = files.value.find((file) => file.name === fileName);
     if (fileToSelect) {
       selectedFile.value = fileToSelect;
@@ -427,7 +561,8 @@ const formatFileSize = (bytes: number): string => {
   return (bytes / (1024 * 1024 * 1024)).toFixed(1) + " GB";
 };
 
-const formatDate = (dateString: string | Date): string => {
+const formatDate = (dateString: string | Date | null): string => {
+  if (!dateString) return "";
   const date = new Date(dateString);
   return `${date.toLocaleDateString("en-US", {
     year: "numeric",
@@ -439,6 +574,17 @@ const formatDate = (dateString: string | Date): string => {
     hour12: false,
   })}`;
 };
+/** Object stores report no size for a prefix and no timestamp for many entries. */
+const formatEntryMeta = (file: FileInfo): string => {
+  if (provider.value.kind === "local") {
+    return `${formatFileSize(file.size)} • ${formatDate(file.last_modified)}`;
+  }
+  if (file.is_directory) return "Folder";
+  const parts = [formatFileSize(file.size)];
+  if (file.last_modified) parts.push(formatDate(file.last_modified));
+  return parts.join(" • ");
+};
+
 const handleBackgroundClick = () => {
   // Deselect file when clicking on empty area (file item clicks are stopped with @click.stop)
   selectedFile.value = null;
@@ -512,7 +658,7 @@ const previewFileName = computed(() => {
 const handleCreateFile = () => {
   if (validateFileName(newFileName.value)) {
     const fileName = previewFileName.value;
-    const newFilePath = path.join(currentPath.value, fileName);
+    const newFilePath = provider.value.join(currentPath.value, fileName);
     emit("createFile", newFilePath, currentPath.value, fileName);
     showCreateDialog.value = false;
   }
@@ -556,17 +702,24 @@ defineExpose({
   selectedFile: computed(() => selectedFile.value),
 });
 
+/** Fall back to name when the active sort key means nothing for this storage. */
+const effectiveSortBy = computed(() =>
+  sortBy.value === "created_date" && !provider.value.capabilities.createdDate
+    ? "name"
+    : sortBy.value,
+);
+
+const toTime = (value: string | Date | null): number => (value ? new Date(value).getTime() : 0);
+
 const calculateSortedFiles = () => {
   return files.value
     .filter((file) => {
-      // For directories, only apply search and hidden filters
       if (file.is_directory) {
         const matchesSearch = file.name.toLowerCase().includes(searchTerm.value.toLowerCase());
         const matchesHidden = showHidden.value || !file.is_hidden;
         return matchesSearch && matchesHidden;
       }
 
-      // For files, apply all filters
       const matchesSearch = file.name.toLowerCase().includes(searchTerm.value.toLowerCase());
       const matchesHidden = showHidden.value || !file.is_hidden;
       const matchesType =
@@ -577,25 +730,22 @@ const calculateSortedFiles = () => {
       return matchesSearch && matchesHidden && matchesType;
     })
     .sort((a, b) => {
-      // Sort logic
       let comparison = 0;
-      switch (sortBy.value) {
+      switch (effectiveSortBy.value) {
         case "size": {
-          // Add block scope with curly braces
           const aSize = a.is_directory ? a.size || 0 : a.size;
           const bSize = b.is_directory ? b.size || 0 : b.size;
           comparison = aSize - bSize;
           break;
         }
         case "last_modified":
-          comparison = new Date(a.last_modified).getTime() - new Date(b.last_modified).getTime();
+          comparison = toTime(a.last_modified) - toTime(b.last_modified);
           break;
         case "created_date":
-          comparison = new Date(a.created_date).getTime() - new Date(b.created_date).getTime();
+          comparison = toTime(a.created_date) - toTime(b.created_date);
           break;
         case "name":
         default:
-          // Special handling for name to be case-insensitive
           comparison = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
           break;
       }
@@ -607,7 +757,6 @@ const filteredFiles = computed(() => {
   return calculateSortedFiles();
 });
 
-// Watch for changes in allowedFileTypes
 watch(
   () => props.allowedFileTypes,
   () => {
@@ -624,23 +773,28 @@ watch(
   },
 );
 
-// Watch for visibility changes to auto-refresh
 watch(
   () => props.isVisible,
   async (newVisible, oldVisible) => {
-    // Refresh when becoming visible (transitioning from false to true)
     if (newVisible && !oldVisible) {
       await loadCurrentDirectory();
     }
   },
 );
 
+// The caller can swap the connection while the browser is open.
+watch(storedScope, async (next, previous) => {
+  if (next !== previous) {
+    selectedFile.value = null;
+    await loadDefaultDirectory();
+  }
+});
+
 // For keep-alive components, refresh when re-activated
 onActivated(async () => {
   await loadCurrentDirectory();
 });
 
-// Initialize
 onMounted(async () => {
   if (props.initialFilePath) {
     await handleInitialFileSelection();
@@ -882,6 +1036,47 @@ onMounted(async () => {
   color: var(--color-text-secondary);
 }
 
+.denied-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  height: 200px;
+  color: var(--color-text-secondary);
+  text-align: center;
+}
+
+.denied-state .material-icons {
+  font-size: 40px;
+  opacity: 0.5;
+}
+
+.bucket-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 320px;
+  max-width: 100%;
+}
+
+.truncation-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border-primary);
+  border-radius: 6px;
+  background-color: var(--color-background-secondary);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.truncation-bar .material-icons {
+  font-size: 16px;
+}
+
 .empty-state .material-icons {
   font-size: 48px;
   opacity: 0.5;
@@ -950,6 +1145,42 @@ onMounted(async () => {
   width: 24px;
   height: 24px;
   object-fit: contain;
+}
+
+/* Opt-in compact mode: the Save/Create dialogs cap the browser's height so the
+   catalog options below stay visible, which leaves too little room for the
+   default row rhythm. Every other consumer keeps the roomier default. */
+.file-browser.dense .browser-main {
+  padding: 8px 16px;
+}
+
+.file-browser.dense .grid-container {
+  gap: 8px;
+  padding: 4px;
+}
+
+.file-browser.dense .file-item-content {
+  padding: 6px 10px;
+  gap: 10px;
+}
+
+.file-browser.dense .file-icon-wrapper {
+  width: 24px;
+  height: 24px;
+}
+
+.file-browser.dense .file-icon {
+  width: 20px;
+  height: 20px;
+}
+
+.file-browser.dense .file-name {
+  font-size: 13px;
+  margin-bottom: 1px;
+}
+
+.file-browser.dense .file-info {
+  font-size: 11px;
 }
 
 /* Add new styles for sort controls */

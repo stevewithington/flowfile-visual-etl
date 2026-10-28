@@ -2,7 +2,6 @@ import logging
 import os
 import secrets
 import string
-from importlib.metadata import PackageNotFoundError, version
 
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
@@ -11,12 +10,9 @@ from flowfile_core.auth.password import get_password_hash
 from flowfile_core.database import models as db_models
 from flowfile_core.database.connection import SessionLocal
 from flowfile_core.database.migration import run_startup_migration
+from shared._version import get_version
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# Ensure a basic logging config exists so warnings emitted at import time
-# (before main.py's lifespan configures logging) are visible in container logs.
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +34,7 @@ def create_default_local_user(db: Session):
             email="local@flowfile.app",
             full_name="Local User",
             hashed_password=hashed_password,
-            must_change_password=False,  # Local user doesn't need to change password
+            must_change_password=False,
         )
         db.add(local_user)
         db.commit()
@@ -52,15 +48,12 @@ def create_docker_admin_user(db: Session):
     Only runs when FLOWFILE_MODE=docker.
     Reads FLOWFILE_ADMIN_USER and FLOWFILE_ADMIN_PASSWORD from environment.
     """
-    # Only run in Docker mode
     if os.environ.get("FLOWFILE_MODE") != "docker":
         return False
 
-    # Read environment variables
     admin_username = os.environ.get("FLOWFILE_ADMIN_USER")
     admin_password = os.environ.get("FLOWFILE_ADMIN_PASSWORD")
 
-    # Skip if either is not set
     if not admin_username or not admin_password:
         logger.warning(
             "Docker mode detected but FLOWFILE_ADMIN_USER or FLOWFILE_ADMIN_PASSWORD "
@@ -68,11 +61,9 @@ def create_docker_admin_user(db: Session):
         )
         return False
 
-    # Check if user already exists
     existing_user = db.query(db_models.User).filter(db_models.User.username == admin_username).first()
 
     if existing_user:
-        # Ensure existing admin user has is_admin=True
         if not existing_user.is_admin:
             existing_user.is_admin = True
             db.commit()
@@ -81,7 +72,6 @@ def create_docker_admin_user(db: Session):
             logger.info(f"Admin user '{admin_username}' already exists with admin privileges.")
         return False
 
-    # Create user with hashed password and admin privileges
     hashed_password = get_password_hash(admin_password)
     admin_user = db_models.User(
         username=admin_username,
@@ -89,7 +79,7 @@ def create_docker_admin_user(db: Session):
         full_name="Admin User",
         hashed_password=hashed_password,
         is_admin=True,
-        must_change_password=True,  # Force password change on first login
+        must_change_password=True,
     )
     db.add(admin_user)
     db.commit()
@@ -98,71 +88,67 @@ def create_docker_admin_user(db: Session):
 
 
 def create_default_catalog_namespace(db: Session):
-    """Create the default 'General' catalog with a 'default' schema if they don't exist."""
+    """Create the seeded 'General' catalog and its schemas if they don't exist."""
+    # Imported here, not at module level: this module runs Alembic at import time,
+    # before the catalog package (and its polars dependency chain) is importable.
+    from flowfile_core.catalog.constants import ROOT_CATALOG, SEEDED_SCHEMAS, SYSTEM_SCHEMA_NAMES
+
     local_user = db.query(db_models.User).filter(db_models.User.username == "local_user").first()
     if not local_user:
         return
 
-    general = db.query(db_models.CatalogNamespace).filter_by(name="General", parent_id=None).first()
+    # Seeded namespaces are public containers: visible to every user in multi-user
+    # mode even though the catalog is otherwise private-by-default (auth/sharing.py).
+    general = db.query(db_models.CatalogNamespace).filter_by(name=ROOT_CATALOG.name, parent_id=None).first()
     if not general:
         general = db_models.CatalogNamespace(
-            name="General",
+            name=ROOT_CATALOG.name,
             parent_id=None,
             level=0,
-            description="Default catalog",
+            description=ROOT_CATALOG.description,
             owner_id=local_user.id,
+            is_public=True,
         )
         db.add(general)
         db.commit()
         db.refresh(general)
 
-    default_schema = db.query(db_models.CatalogNamespace).filter_by(name="default", parent_id=general.id).first()
-    if not default_schema:
-        default_schema = db_models.CatalogNamespace(
-            name="default",
-            parent_id=general.id,
-            level=1,
-            description="Default schema for user flows",
-            owner_id=local_user.id,
+    for schema in SEEDED_SCHEMAS:
+        existing = db.query(db_models.CatalogNamespace).filter_by(name=schema.name, parent_id=general.id).first()
+        if existing:
+            continue
+        db.add(
+            db_models.CatalogNamespace(
+                name=schema.name,
+                parent_id=general.id,
+                level=1,
+                description=schema.description,
+                owner_id=local_user.id,
+                is_public=True,
+            )
         )
-        db.add(default_schema)
         db.commit()
 
-    # Dedicated schema for quick-created / unnamed flows so they don't clutter 'default'
-    unnamed_schema = db.query(db_models.CatalogNamespace).filter_by(name="Unnamed Flows", parent_id=general.id).first()
-    if not unnamed_schema:
-        unnamed_schema = db_models.CatalogNamespace(
-            name="Unnamed Flows",
-            parent_id=general.id,
-            level=1,
-            description="Quick-created flows that have not yet been named",
-            owner_id=local_user.id,
+    # Repair app-managed schemas created outside the seed path (Python Editor is
+    # made on demand by ensure_python_editor_flows_namespace): before this they
+    # inherited is_public=False and were invisible to everyone but General's owner.
+    repaired = (
+        db.query(db_models.CatalogNamespace)
+        .filter(
+            db_models.CatalogNamespace.parent_id == general.id,
+            db_models.CatalogNamespace.name.in_(SYSTEM_SCHEMA_NAMES),
+            db_models.CatalogNamespace.is_public.is_(False),
         )
-        db.add(unnamed_schema)
+        .update({db_models.CatalogNamespace.is_public: True}, synchronize_session=False)
+    )
+    if repaired:
         db.commit()
-
-    # Dedicated schema for flows saved to arbitrary disk locations, distinct from
-    # catalog-managed flows so users can tell disk-backed and catalog flows apart.
-    local_schema = db.query(db_models.CatalogNamespace).filter_by(name="Local Flows", parent_id=general.id).first()
-    if not local_schema:
-        local_schema = db_models.CatalogNamespace(
-            name="Local Flows",
-            parent_id=general.id,
-            level=1,
-            description="Flows saved to disk at user-chosen paths",
-            owner_id=local_user.id,
-        )
-        db.add(local_schema)
-        db.commit()
+        logger.info(f"Marked {repaired} app-managed catalog schema(s) public")
 
 
 def update_db_info(db: Session):
     """Upsert the application version into the db_info table."""
-    try:
-        app_version = version("Flowfile")
-    except PackageNotFoundError:
-        app_version = "unknown"
-
+    app_version = get_version()
     row = db.query(db_models.DbInfo).filter(db_models.DbInfo.id == 1).first()
     if row:
         row.app_version = app_version

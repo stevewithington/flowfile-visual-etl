@@ -105,7 +105,7 @@ flowfile_frontend/src/renderer/app/
 │   ├── AiGhostNode.vue
 │   ├── AiMentionAutocomplete.vue / mentionVocabulary.ts
 │   └── markdown.ts (+ test)
-└── views/AiProvidersView/AiSettingsTab.vue    # BYOK panel
+└── views/AiSettingsView/                      # Settings → AI page: ProvidersPanel (BYOK + OnDeviceProviderRow), AssistantPanel
 ```
 
 ---
@@ -158,6 +158,9 @@ So every AI endpoint inherits the gate without per-route boilerplate. The Mutabl
 ---
 
 ## Routes catalog
+
+!!! info "Verify against the package"
+    The routes and Pydantic model names below are a snapshot of the `ai/*_routes.py` files. Request/response model names in particular drift as the surface evolves — treat this table as a map, and read the matching `*_routes.py` for the authoritative signature before depending on one.
 
 | Route | Method | Request | Response | Source |
 |-------|--------|---------|----------|--------|
@@ -227,12 +230,15 @@ Per-vendor subclasses override class-level fields:
 
 | Class | `name` | `model_prefix` | `default_model` | Notable surface defaults |
 |-------|--------|----------------|-----------------|--------------------------|
-| `AnthropicProvider` | `anthropic` | `anthropic/` | `claude-sonnet-4-6` | Haiku 4.5 for Cmd+K / ghost / autocomplete / agent_staged; Opus 4.7 for `agent_complex` |
+| `AnthropicProvider` | `anthropic` | `anthropic/` | `claude-sonnet-5-5` | Sonnet 5.5 for `explain` / `docgen` / `lineage`; Haiku 4.5 for Cmd+K / ghost / autocomplete / agent_staged; Opus 4.7 for `agent_complex` |
 | `OpenAIProvider` | `openai` | `""` | `gpt-4.1-mini` | `gpt-4.1` for `explain` / `agent_complex` / `docgen` / `lineage` |
 | `GoogleProvider` | `google` | `gemini/` | `gemini-2.5-flash` | `gemini-2.5-pro` for `agent_complex` |
-| `GroqProvider` | `groq` | `groq/` | `qwen/qwen3-coder-30b-a3b-instruct` | One model across surfaces |
-| `OpenRouterProvider` | `openrouter` | `openrouter/` | `qwen/qwen3-coder-30b-a3b-instruct` | `meta-llama/llama-3.3-70b-instruct` for `agent_staged` (free tier) |
-| `OllamaProvider` | `ollama` | `ollama_chat/` | `llama3.1:8b` | `llama3.1:70b` for `agent_complex`. `default_api_base="http://localhost:11434"` |
+| `GroqProvider` | `groq` | `groq/` | `qwen/qwen3-32b` | `qwen/qwen3-coder-30b-a3b-instruct` for most surfaces (ghost / explain / agent_* / docgen / lineage / …); `qwen/qwen3-32b` for `cmd_k` |
+| `OpenRouterProvider` | `openrouter` | `openrouter/` | `qwen/qwen3.6-35b-a3b` | same for `agent_staged`; `anthropic/claude-sonnet-5.5` / `claude-haiku-4.5` / `claude-opus-4.7` mirror the Anthropic adapter |
+| `OllamaProvider` | `ollama` | `ollama_chat/` | `qwen3.5:9b` | `qwen3.6:35b-a3b` for `agent_complex`. `default_api_base="http://localhost:11434"`; `extra_params={"reasoning_effort": "none"}` (thinking off) |
+
+!!! note "`default_model` vs surface models"
+    `default_model` is the terminal fallback the class uses when no other rule fires (see the resolution order below). It is **not** the model most surfaces run on — `surface_models[surface]` usually shadows it. Groq is a good example: the class default is `qwen/qwen3-32b`, but every surface except `cmd_k` maps to `qwen/qwen3-coder-30b-a3b-instruct`. The model names in this table rot as vendors rename releases; check each provider's `surface_models` dict in `providers/{name}.py` for the current values.
 
 `provider_factory(name, *, model, surface, api_key, api_base)` in `providers/registry.py` is the construction entry point. The `PROVIDERS` dict registers all six classes; `list_supported_providers()` returns the names in registration order.
 
@@ -253,7 +259,7 @@ Per-vendor subclasses override class-level fields:
 5. `cls.surface_models[surface]` (class-level per-surface default).
 6. `cls.default_model` (terminal fallback).
 
-Steps 3 and 4 (added in workstream W29) make multi-model curation work for OpenRouter and similar providers — users can pin a list of free-tier models and still get sensible per-surface routing when one of those models matches the surface preference.
+Steps 3 and 4 make multi-model curation work for OpenRouter and similar providers — users can pin a list of free-tier models and still get sensible per-surface routing when one of those models matches the surface preference.
 
 **Env-var fallback.** If no credential row exists, `provider_factory(name)` is called with no `api_key` / `api_base`; litellm picks up the standard env var (e.g., `ANTHROPIC_API_KEY`). `detect_env_fallback(provider)` exists separately so `GET /ai/providers` can show users the distinction between "configured via key" and "configured via env" in the UI.
 
@@ -341,7 +347,7 @@ PlannerEventName = Literal[
 
 ### Three surfaces
 
-The `surface` field on the start request picks the loop shape. Note: the **backend default** on `POST /ai/agent/start` is `"agent_staged"`, but the **frontend drawer default** (per-flow preference, persisted) is `"agent_live"` — that's the one most user sessions land on unless explicitly switched. A request with `surface="agent_complex"` against a `supports_tools=False` model returns `422` at validation.
+The `surface` field on the start request picks the loop shape. Note: the **backend default** on `POST /ai/agent/start` is `"agent_staged"`, but the **frontend default** (a device-wide preference under Settings → AI → Assistant, persisted in localStorage) is `"agent_live"` — that's the one most user sessions land on unless explicitly switched. A request with `surface="agent_complex"` against a `supports_tools=False` model returns `422` at validation.
 
 **`agent_staged`.** The big idea: smaller models can't reliably function-call against a wide tool catalog. Solution: expose **one tool per LLM round** so each round is a tightly-scoped enum / shape decision. Mode is `"stage"` — proposals accumulate and are bundled into a `GraphDiff` for accept/reject. State machine:
 
@@ -361,7 +367,7 @@ plan ──▶ classify ─[op_kind=add]──▶ pick_type ──▶ pick_upstr
 
 **`agent_complex`.** Single-shot, full tool catalog in one call. Best for big models (Sonnet, Opus, GPT-4.1, Gemini Pro). The state machine field is unused; the planner runs each round as a free-form tool-using turn. Same `mode="stage"` and accept/reject GraphDiff flow as `agent_staged`. Higher rate-limit pressure, fewer round-trips.
 
-**`agent_live`.** Same state machine as `agent_staged`, but `mode="apply"` — each tool call **mutates the live graph immediately**, the affected subgraph is run (Performance) or a sample is evaluated (Development), and the runtime observation is fed back as the next tool reply. On runtime failure the just-added node is auto-deleted and the LLM retries up to `max_retries_per_step`. **There is no bundled `staged_results` GraphDiff and no accept/reject step** — `applied_results` on the session is the record of truth, and the canvas itself is the running record. This is the variant the frontend drawer defaults to.
+**`agent_live`.** Same state machine as `agent_staged`, but `mode="apply"` — each tool call **mutates the live graph immediately**, the affected subgraph is run (Performance) or a sample is evaluated (Development), and the runtime observation is fed back as the next tool reply. On runtime failure the just-added node is auto-deleted and the LLM retries up to `max_retries_per_step`. **There is no bundled `staged_results` GraphDiff and no accept/reject step** — `applied_results` on the session is the record of truth, and the canvas itself is the running record. This is the variant the frontend defaults to.
 
 ### Session lifecycle
 
@@ -537,12 +543,12 @@ Components in `features/ai/`:
 - `AiAssistant.vue` — the drawer (chat + agent).
 - `AiAgentRun.vue` / `AiAgentEvent.vue` — agent panel and per-event renderers.
 - `AiDiffPanel.vue` / `AiDiffPreview.vue` — diff review UI.
-- `AiInlineActions.vue` — the ✨ menu on a node.
+- `AiInlineActions.vue` — the inline-actions (sparkle) menu on a node.
 - `AiCommandPalette.vue` — Cmd+K.
 - `AiGhostNode.vue` — edge-stub suggestions.
 - `AiMentionAutocomplete.vue` (+ `mentionVocabulary.ts`) — `@flow` / `@node:id` completion.
 
-The BYOK panel lives in `views/AiProvidersView/AiSettingsTab.vue` and talks to the BYOK routes through `api/ai.api.ts`.
+The BYOK panel lives in `views/AiSettingsView/ProvidersPanel.vue` (the Providers tab of Settings → AI) and talks to the BYOK routes through `views/AiSettingsView/api.ts`; the same directory holds the Assistant tab (default model, simple-task tier, agent variant, verification — device-wide, persisted by `stores/ai-store-persistence.ts` under `flowfile.ai.settings.v1`) and the on-device model as a row inside Providers (`OnDeviceProviderRow.vue` over `localModelApi.ts`).
 
 ---
 

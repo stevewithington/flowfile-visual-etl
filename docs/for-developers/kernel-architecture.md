@@ -3,7 +3,9 @@
 The kernel system provides isolated Python code execution inside Docker containers. This page explains the internal architecture, component interactions, and key design decisions.
 
 !!! info "Looking for the user guide?"
-    See [Kernel Execution](../users/visual-editor/kernels.md) for the user-facing documentation on how to write code and use the `flowfile` API inside kernels.
+    See [Kernel Execution](../users/visual-editor/kernels.md) for the user-facing documentation on how to write code and use the `flowfile_ctx` API inside kernels.
+
+Kernels are one half of a pair: the catalog is where their inputs and outputs live — Delta write-back, global artifacts, and the notebooks whose Python cells execute here. [Catalog Architecture](catalog-architecture.md) (especially its [Notebooks](catalog-architecture.md#notebooks) section) covers that side of the contract.
 
 ---
 
@@ -14,27 +16,7 @@ The kernel system consists of two main components:
 1. **Kernel Manager** (`flowfile_core/flowfile_core/kernel/`) — Orchestrates Docker container lifecycle and proxies execution requests from the Core API
 2. **Kernel Runtime** (`kernel_runtime/`) — A FastAPI application that runs inside each Docker container, executes user code, and manages artifacts
 
-```mermaid
-graph LR
-    Frontend["Frontend<br/>(Vue/Electron)"]
-    Core["Core API<br/>(port 63578)"]
-    Manager["Kernel Manager<br/>(Docker API)"]
-    K1["Kernel Container<br/>(port 9999)"]
-    K2["Kernel Container<br/>(port 9999)"]
-    Shared["Shared Volume<br/>(parquet I/O, artifacts)"]
-
-    Frontend -->|JWT auth| Core
-    Core --> Manager
-    Manager -->|docker run / stop / rm| K1
-    Manager -->|docker run / stop / rm| K2
-    Core -->|HTTP ExecuteRequest| K1
-    Core -->|HTTP ExecuteRequest| K2
-    K1 -->|log callback| Core
-    K2 -->|log callback| Core
-    K1 --- Shared
-    K2 --- Shared
-    Core --- Shared
-```
+![Kernel architecture: the Frontend authenticates to the Core API (:63578) with JWT; Core drives Docker kernel containers two ways — the Kernel Manager runs the container lifecycle (docker run / stop / rm) while Core sends HTTP ExecuteRequests directly to each container, which stream log callbacks back — and Core, the kernels, and a shared volume exchange parquet I/O and artifacts.](../assets/images/architecture/kernel-flow.svg)
 
 ---
 
@@ -48,8 +30,8 @@ The `KernelManager` is a singleton that runs inside the Core service. It manages
 
 | Operation | What Happens |
 |-----------|-------------|
-| **Create** | Allocates a `KernelInfo` record, persists config to the database |
-| **Start** | Verifies the `flowfile-kernel` Docker image exists, runs `docker.containers.run()`, polls `/health` until ready (120s timeout) |
+| **Create** | Allocates a `KernelInfo` record, pulls the flavour or custom image when it is missing (`_ensure_image`), bakes extra `packages` into a derived image, persists config to the database |
+| **Start** | Pulls the pinned kernel image (`flowfile-kernel-{base,ml,lite,notebook}:<tag>`) when it is missing, rebuilds a derived image whose base moved, runs `docker.containers.run()`, polls `/health` until ready (120s timeout) |
 | **Execute** | Serializes inputs to parquet, sends `ExecuteRequest` via HTTP, tracks kernel state |
 | **Stop** | Stops and removes the Docker container |
 | **Delete** | Stops if running, removes from in-memory registry and database |
@@ -86,6 +68,54 @@ RECOVERY_MODE="lazy|eager|clear"
 
 ---
 
+## Versioning & compatibility
+
+Flowfile does **not** define compatibility *ranges* between app and kernel versions, and performs **no runtime version handshake**. The contract is simply: each Flowfile release pins one exact kernel image tag.
+
+### Three independent version numbers
+
+| Version | Where | Role |
+|---------|-------|------|
+| App / root | root `pyproject.toml` `version` | The Flowfile release |
+| Kernel **image** tag | `flowfile_core/flowfile_core/kernel/images.py` (`_KERNEL_IMAGE_{BASE,ML,LITE}_DEFAULT` — read the current value there) | The image the app pulls / runs |
+| **Notebook** image tag | `images.py` (`_KERNEL_IMAGE_NOTEBOOK_REPO` + the app version from `shared/_version.py`) | The notebook flavour's image: the lite image of the pinned kernel release with this app's `flowfile` installed |
+| Kernel **runtime API** | `kernel_runtime/__init__.py` (`__version__`) | The kernel's HTTP API version, reported by `/health` |
+
+Read each value from its source rather than assuming a number — the three are decoupled. They evolve **independently**: bumping the app does not require bumping the kernel image, and vice versa. The notebook image is the exception by design: it bakes `flowfile`, whose version must be the app's (core checks it when a session opens), so its tag *is* the app version and it publishes with every app release.
+
+### How the pin works
+
+- Each Flowfile version hardcodes **one exact kernel tag per flavour** (e.g. `edwardvaneechoud/flowfile-kernel-ml:<version>`) in `images.py`. That single tag — not a `>=x,<y` range — is the version the app is built and tested against.
+- Core reads the running kernel's runtime version from `/health` into `KernelInfo.kernel_version` **for display only** (the "Kernel runtime" line in the Kernel Manager). There is no min/max gate and nothing that rejects or warns about an "out-of-range" kernel.
+- The only **hard** coupling is **polars**: `kernel_runtime` pins a polars (and the `polars-ds` plugin) compatible with the app's `polars >=1.39.0,<1.44`. These must be bumped together, but that compatibility is guaranteed at *image-build time* via the pinned tag — not by a runtime check.
+
+So the practical contract is "use the pinned tag." An older kernel image is **not blocked** — it simply may lack fixes or features the app expects. That gap is surfaced as a non-blocking **"Update available"** hint in the Kernel Manager (per flavour) and the kernel details modal (per kernel), rather than a hard version gate.
+
+### Shipping a kernel change
+
+Because the app only re-pulls a kernel tag it doesn't already have locally (`images.get(tag)` pulls only on a miss), a fix to `kernel_runtime/` reaches users only when the image **tag changes**. **Any change to an image input needs a kernel version bump**: `kernel_runtime/pyproject.toml`, `poetry.lock`, `Dockerfile`, `entrypoint.sh` or the runtime code under `kernel_runtime/kernel_runtime/`. Published tags are immutable and the publish workflow skips a tag that already exists, so a change merged under an already-published version never ships: the fastapi 0.142.2 lock bump never reached the published 0.6.1 images, whose constraints then made `pip install flowfile` fail on a fastapi conflict until 0.6.2.
+
+CI enforces this: the **Kernel release guard** step of `test.yaml`'s `check-kernel-data` job runs `tools/check_kernel_release_needed.py` against the PR base (or the push's previous commit). It fails only when an image input changed, the kernel version did not, and that version is already on Docker Hub; a Docker Hub it cannot reach fails the step too, asking for a re-run.
+
+To ship a change:
+
+1. Bump `version` in `kernel_runtime/pyproject.toml` (CI tags the published images from it).
+2. Bump the three `_KERNEL_IMAGE_{BASE,ML,LITE}_DEFAULT` tags in `images.py` to match. CI enforces this pairing: `tools/check_kernel_version_sync.py` hard-fails the publish run when the pins and the kernel version drift.
+3. Regenerate the image dependency manifest with `make kernel_manifest` (`make bump-version-kernel` does this for you) and commit it. `make check_kernel_manifest` fails CI otherwise, and a stale manifest makes core report the wrong packages as present.
+4. Merge — CI (`docker-publish.yml`) checks Docker Hub and builds/pushes `flowfile-kernel-{base,ml,lite}:<new>` only if that tag is absent, so published version tags stay immutable and a missed publish self-heals on the next kernel-path push. (A `workflow_dispatch` with `force_kernel` republishes an existing tag, but a machine that already pulled that tag keeps its stale copy, so bump instead.) The app then asks for the new tag: creating **and starting** a kernel pull it when missing (a start after an update therefore pulls the new release, and a derived image baked on the old base — labelled `flowfile_base_image` — is rebuilt), and the Kernel Manager offers it as **Update available**.
+
+For local development, build the image yourself (`docker build -t flowfile-kernel-base:local kernel_runtime/`); the `:local` tag is preferred by the resolver when the pinned registry tag isn't present, and is excluded from the version comparison (so it shows as a **local** build, not "up to date" or "update available").
+
+### The notebook image
+
+`flowfile-kernel-notebook:<app version>` is the fourth published flavour (`ImageFlavour.NOTEBOOK`) and the only one the canvas notebook runs on: `kernel_runtime/Dockerfile.notebook` installs a `flowfile` wheel on `flowfile-kernel-lite:<kernel version>` and then rewrites `/opt/constraints.txt` from `pip freeze`, so a kernel's extra packages cannot move flowfile's dependency tree. Nothing is built on the user's machine: the notebook toolbar's **Create notebook kernel** is a pull plus a start, and an app update is a restart (the start resolves the new tag and pulls it).
+
+- **Publishing:** `docker-publish.yml` builds it on every `v*` tag in its own `build-notebook`/`merge-notebook` jobs after the kernel images (its `FROM` may be a lite image the same run publishes), from a wheel `poetry build` makes in the run — never from PyPI. `tools/docker_publish_matrix.py` emits the `notebook_*` matrices; `base_image` carries no org, like every image name in the outputs.
+- **Contents:** `kernel/flavours.py` derives them at load time — the lite manifest entry plus `flowfile` at `get_version()` — so the manifest and its drift gate never see the app version. A `FLOWFILE_KERNEL_IMAGE_NOTEBOOK` override on another release makes the flavour `unknown`, as for the others.
+- **Locally:** `make notebook_kernel_dev` builds `flowfile-kernel-notebook:local` from the checkout on the published lite image of the pinned kernel release (pulled by `docker build`); the resolver prefers it while the app-version tag is absent, so the one-click setup works on an unreleased branch. With an unpublished kernel change, build lite first (`make rebuild_kernel KERNEL_FLAVOUR=lite`) and pass `NOTEBOOK_BASE_IMAGE=flowfile-kernel-lite:local`, as `test-notebook-kernel.yml` does before running `flowfile_core/tests/notebook/test_kernel_notebook_docker.py`.
+
+---
+
 ## Kernel Runtime
 
 **Location:** `kernel_runtime/kernel_runtime/main.py`
@@ -119,12 +149,12 @@ sequenceDiagram
     Runtime->>Runtime: Get/create namespace for flow
     Runtime->>Runtime: Clear previous node artifacts
     Runtime->>Code: exec(code, namespace)
-    Code->>Runtime: flowfile.read_input()
+    Code->>Runtime: flowfile_ctx.read_input()
     Runtime-->>Code: pl.LazyFrame
     Code->>Code: Transform data
-    Code->>Runtime: flowfile.publish_output(df)
-    Code->>Runtime: flowfile.display(fig)
-    Code->>Core: flowfile.log("message") [HTTP callback]
+    Code->>Runtime: flowfile_ctx.publish_output(df)
+    Code->>Runtime: flowfile_ctx.display(fig)
+    Code->>Core: flowfile_ctx.log("message") [HTTP callback]
     Runtime-->>Manager: ExecuteResult
     Manager-->>Core: ExecuteResult
 ```
@@ -137,6 +167,8 @@ User code runs in a dedicated thread so the FastAPI event loop stays responsive.
 
 - **HTTP interrupt:** `POST /interrupt` injects `KeyboardInterrupt` via `PyThreadState_SetAsyncExc()`
 - **Signal fallback:** Docker `kill -SIGUSR1` for blocking C extensions
+
+Cancellation is scoped to one execution, not to the kernel. Every `ExecuteRequest` carries an `exec_token`, and `POST /interrupt` takes an optional `{"exec_token": ...}` naming the cell to stop. Kernels are shared across flows, so this matters: without it, cancelling one flow would cancel whatever cell happened to be running. A token whose cell has already finished interrupts nothing — it never falls back to the newest cell. Core enforces the same rule on its side, refusing to send an interrupt unless that execution is the one currently holding the kernel's exec lock.
 
 ### Persistent Namespaces
 
@@ -231,12 +263,13 @@ All endpoints require JWT authentication and enforce user ownership:
 | `DELETE /kernels/{id}` | Delete kernel |
 | `POST /kernels/{id}/execute` | Execute code |
 | `POST /kernels/{id}/execute_cell` | Execute in interactive mode |
-| `POST /kernels/{id}/interrupt` | Cancel execution |
 | `GET /kernels/{id}/artifacts` | List artifacts |
 | `POST /kernels/{id}/clear` | Clear all artifacts |
 | `GET /kernels/{id}/display_outputs` | Get display outputs |
 | `GET /kernels/{id}/memory` | Get memory usage |
 | `GET /kernels/docker-status` | Check Docker availability |
+
+There is no core-side interrupt route. Cancellation is a kernel-runtime concern: the runtime container exposes `POST /interrupt` on its own port (see [Thread-based Execution](#thread-based-execution)), which Core reaches directly, not through a `/kernels/{id}/interrupt` proxy. It is always addressed to one execution's `exec_token`, so cancelling a flow never touches another flow's cell on the same kernel.
 
 ### Database Persistence
 
@@ -274,7 +307,7 @@ The internal token is passed per-request in the `ExecuteRequest` and also set as
 
 - **Process isolation** — Each kernel runs in its own Docker container
 - **Resource limits** — Memory (`mem_limit`) and CPU (`nano_cpus`) are enforced by Docker
-- **Filesystem isolation** — Only the shared volume is mounted; the host filesystem is not accessible
+- **Filesystem isolation** — A kernel writes only to `/shared` and `/catalog_tables` and mounts no other host folder; a notebook kernel reads files, catalog tables, flow files and custom node sources through core
 - **User ownership** — Each kernel is owned by the user who created it; other users cannot access it
 
 ### Trust Boundaries
@@ -291,13 +324,17 @@ Artifact serialization uses pickle/cloudpickle. This is acceptable because:
 
 ### Building the Kernel Image
 
-```bash
-# Via docker compose
-docker compose build flowfile-kernel
+The resolver looks for `flowfile-kernel-{base,ml,lite,notebook}:local` when the pinned registry tag isn't present locally, so tag your local build to match the flavour you want to run (`make notebook_kernel_dev` does so for the notebook image):
 
-# Or directly
-docker build -t flowfile-kernel -f kernel_runtime/Dockerfile kernel_runtime/
+```bash
+# Via docker compose (builds the base flavour as flowfile-kernel-base:local)
+docker compose --profile kernel build flowfile-kernel
+
+# Or directly — tag the flavour explicitly
+docker build -t flowfile-kernel-base:local -f kernel_runtime/Dockerfile kernel_runtime/
 ```
+
+A bare `docker build -t flowfile-kernel …` produces a tag the app will not pick up.
 
 The image is based on `python:3.12-slim` and includes:
 
@@ -308,21 +345,21 @@ The image is based on `python:3.12-slim` and includes:
 
 ### Docker Compose Integration
 
-The `docker-compose.yml` includes a build-only service for the kernel image:
+The `docker-compose.yml` includes a build-only service per kernel flavour (`flowfile-kernel`, `flowfile-kernel-ml`, `flowfile-kernel-lite`). The base flavour:
 
 ```yaml
 flowfile-kernel:
   build:
     context: kernel_runtime
     dockerfile: Dockerfile
-  image: flowfile-kernel
+  image: flowfile-kernel-base:local
   entrypoint: ["true"]
   restart: "no"
   profiles:
     - kernel
 ```
 
-This service is not started by `docker compose up` — it only builds the image. The Core service creates kernel containers dynamically via the Docker API.
+These services are not started by `docker compose up` — the `kernel` profile only builds the images (the `entrypoint: ["true"]` exits immediately). The Core service creates kernel containers dynamically via the Docker API, using the `flowfile-kernel-{base,ml,lite}:local` tags.
 
 !!! warning "Docker Socket"
     The Core service requires access to the Docker socket (`/var/run/docker.sock`) to manage kernel containers. In production, consider using a Docker socket proxy (e.g., `tecnativa/docker-socket-proxy`) to restrict API access.
@@ -353,8 +390,8 @@ python -m pytest kernel_runtime/tests -v
 ### Integration Tests (Docker Required)
 
 ```bash
-# Build the kernel image first
-docker build -t flowfile-kernel -f kernel_runtime/Dockerfile kernel_runtime/
+# Build the base kernel image first (tag must match the resolver's flavour tag)
+docker build -t flowfile-kernel-base:local -f kernel_runtime/Dockerfile kernel_runtime/
 
 # Run kernel integration tests
 poetry run pytest flowfile_core/tests -m kernel -v

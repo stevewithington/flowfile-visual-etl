@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import inspect
 import pickle
 
+import polars as pl
 import pytest
 
 from flowfile_core.catalog import (
+    AmbiguousFlowError,
     CatalogService,
+    FlowNotFoundError,
     NamespaceNotFoundError,
     SQLAlchemyCatalogRepository,
 )
@@ -22,9 +26,16 @@ from flowfile_core.database.models import (
 )
 from flowfile_frame import (
     CatalogReference,
+    FlowInput,
+    FlowRef,
+    NativeNodeError,
+    RunFlow,
     SchemaReference,
     default_schema,
+    from_dict,
+    get_catalog,
     list_catalogs,
+    register_flow,
 )
 from flowfile_frame.catalog_reference import _resolve_namespace_id
 
@@ -240,3 +251,125 @@ class TestDefaultSchema:
         assert schema.id == default_id
         assert schema.catalog.name == "General"
         assert schema.catalog.id == general_id
+
+
+def _child_flow():
+    """A registrable child flow: one input passed straight to one output."""
+    frame = FlowInput("orders", schema={"id": pl.Int64})
+    return frame.to_flow_output("orders_out")
+
+
+class TestCatalogNavigation:
+    def test_get_catalog_resolves_eagerly(self):
+        cat_id = _seed_catalog("NavCat")
+        assert get_catalog("NavCat") == CatalogReference("NavCat")
+        assert get_catalog("NavCat").id == cat_id
+        with pytest.raises(NamespaceNotFoundError):
+            get_catalog("NoSuchCatalog")
+
+    def test_get_schema_is_an_alias_of_schema(self):
+        cat = CatalogReference("AliasCat", auto_create=True)
+        created = cat.get_schema("s", auto_create=True)
+        assert created == cat.schema("s")
+        assert isinstance(created, SchemaReference)
+        with pytest.raises(NamespaceNotFoundError):
+            cat.get_schema("missing")
+
+    def test_register_get_and_list_flows(self):
+        schema = CatalogReference("FlowCat", auto_create=True).schema("sales", auto_create=True)
+        first = schema.register_flow(_child_flow(), name="Clean orders")
+        second = schema.register_flow(_child_flow(), name="Archive orders")
+        assert isinstance(first, FlowRef)
+        assert get_catalog("FlowCat").get_schema("sales").get_flow("Clean orders") == first
+        assert schema.list_flows() == [second, first]
+        assert CatalogReference("FlowCat").schema("sales", auto_create=True).list_flows() == [second, first]
+        with pytest.raises(NativeNodeError, match="No flow named 'Missing flow' in 'FlowCat.sales'") as info:
+            schema.get_flow("Missing flow")
+        assert isinstance(info.value.__cause__, FlowNotFoundError)
+
+    def test_flow_ref_keeps_its_schema_handle(self):
+        schema = CatalogReference("HandleCat", auto_create=True).schema("raw", auto_create=True)
+        ref = schema.get_flow(schema.register_flow(_child_flow(), name="Loader").name)
+        assert ref.schema == schema
+        assert ref.schema.catalog == schema.catalog
+        assert ref.namespace_full_name == "HandleCat.raw"
+        assert ref.schema.list_tables() == []
+        revived = pickle.loads(pickle.dumps(ref))
+        assert revived == ref and revived.schema == schema and revived.flow_path == ref.flow_path
+
+    def test_duplicate_name_in_one_schema_is_ambiguous(self):
+        schema = CatalogReference("DupCat", auto_create=True).schema("raw", auto_create=True)
+        ref = schema.register_flow(_child_flow(), name="Twice")
+        with get_db_context() as db:
+            copy = FlowRegistration(name="Twice", flow_path=f"{ref.flow_path}.copy", namespace_id=schema.id, owner_id=1)
+            db.add(copy)
+            db.commit()
+        with pytest.raises(NativeNodeError, match="pick one with registration_id= or uuid=") as info:
+            schema.get_flow("Twice")
+        assert f"DupCat.raw.Twice (id={ref.registration_id})" in str(info.value)
+        assert isinstance(info.value.__cause__, AmbiguousFlowError)
+        assert len(info.value.__cause__.candidates) == 2
+        assert {c["namespace_name"] for c in info.value.__cause__.candidates} == {"DupCat.raw"}
+
+    def test_the_default_schema_needs_a_general_catalog(self):
+        with pytest.raises(NativeNodeError, match="no 'General' catalog to hold the default schema; pass schema="):
+            register_flow(_child_flow(), name="Orphan")
+        with pytest.raises(NativeNodeError, match="pass schema="):
+            RunFlow(_child_flow(), name="Orphan")
+
+    def test_a_deleted_schema_handle_is_a_native_error(self):
+        schema = CatalogReference("GoneCat", auto_create=True).schema("raw", auto_create=True)
+        with get_db_context() as db:
+            db.query(CatalogNamespace).filter_by(id=schema.id).delete()
+            db.commit()
+        with pytest.raises(NativeNodeError, match="SchemaReference 'raw' .* no longer exists") as info:
+            schema.list_flows()
+        assert isinstance(info.value.__cause__, NamespaceNotFoundError)
+
+
+@pytest.fixture
+def table_schema():
+    """A fresh schema whose tables are deleted with their Delta files afterwards."""
+    schema = CatalogReference("ReadCat", auto_create=True).schema("raw", auto_create=True)
+    yield schema
+    with get_db_context() as db:
+        service = CatalogService(SQLAlchemyCatalogRepository(db))
+        for table in db.query(CatalogTable).filter_by(namespace_id=schema.id).all():
+            service.delete_table(table.id, delete_file=True)
+
+
+def _reader_ids(frame) -> tuple[int | None, int | None]:
+    settings = frame.flow_graph.get_node(frame.node_id).setting_input
+    return settings.catalog_table_id, settings.catalog_namespace_id
+
+
+class TestSchemaReadCatalogTable:
+    def test_reads_the_same_table_as_read_table(self, table_schema):
+        table_schema.write_table(from_dict({"currency": ["EUR", "USD"], "amount": [1.5, 2.0]}), "fx_rates")
+        aliased = table_schema.read_catalog_table("fx_rates")
+        direct = table_schema.read_table("fx_rates")
+        assert aliased.collect().equals(direct.collect())
+        assert aliased.collect().columns == ["currency", "amount"]
+        assert _reader_ids(aliased) == _reader_ids(direct)
+        assert _reader_ids(aliased)[1] == table_schema.id
+
+    def test_passes_keywords_through(self, table_schema):
+        table_schema.write_table(from_dict({"v": [1, 2]}), "versions")
+        table_schema.write_table(from_dict({"v": [3, 4, 5]}), "versions")
+        assert table_schema.read_catalog_table("versions", delta_version=0).collect()["v"].to_list() == [1, 2]
+        assert table_schema.read_catalog_table("versions").collect()["v"].to_list() == [3, 4, 5]
+
+    def test_signature_matches_read_table(self):
+        assert inspect.signature(SchemaReference.read_catalog_table) == inspect.signature(SchemaReference.read_table)
+
+    def test_missing_table_fails_like_read_table(self, table_schema):
+        with pytest.raises(Exception) as direct:
+            table_schema.read_table("missing").collect()
+        with pytest.raises(type(direct.value)) as aliased:
+            table_schema.read_catalog_table("missing").collect()
+        assert str(aliased.value) == str(direct.value)
+
+    def test_handle_stays_immutable(self, table_schema):
+        with pytest.raises(AttributeError, match="immutable"):
+            table_schema.read_catalog_table = None
+        assert pickle.loads(pickle.dumps(table_schema)) == table_schema

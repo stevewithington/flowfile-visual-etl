@@ -15,6 +15,8 @@ from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
 
+from flowfile_core.auth.jwt import get_current_active_user
+from flowfile_core.auth.models import User
 from flowfile_core.routes.user_defined_components import (
     router,
     IconInfo,
@@ -26,9 +28,10 @@ from flowfile_core.routes.user_defined_components import (
 
 @pytest.fixture
 def app():
-    """Create a test FastAPI application with the router."""
+    """Create a test FastAPI application with the router (auth dependency stubbed)."""
     test_app = FastAPI()
     test_app.include_router(router, prefix="/user_defined_components")
+    test_app.dependency_overrides[get_current_active_user] = lambda: User(username="test_user", id=1)
     return test_app
 
 
@@ -68,7 +71,7 @@ class TestIconInfo:
     def test_icon_info_defaults(self):
         """Test IconInfo default values."""
         info = IconInfo(file_name="test.png")
-        assert info.is_custom is True  # Default value
+        assert info.is_custom is True
 
 
 class TestAllowedIconExtensions:
@@ -124,7 +127,6 @@ class TestListIcons:
 
     def test_list_icons_with_files(self, client, mock_storage, temp_icons_dir):
         """Test listing icons when files exist."""
-        # Create some test icon files
         (temp_icons_dir / "icon1.png").write_bytes(b"fake png")
         (temp_icons_dir / "icon2.svg").write_bytes(b"fake svg")
         (temp_icons_dir / "not_an_icon.txt").write_text("not an icon")
@@ -134,7 +136,6 @@ class TestListIcons:
             assert response.status_code == 200
             icons = response.json()
 
-            # Should only include icon files, not .txt
             file_names = [icon["file_name"] for icon in icons]
             assert "icon1.png" in file_names
             assert "icon2.svg" in file_names
@@ -142,7 +143,6 @@ class TestListIcons:
 
     def test_list_icons_sorted(self, client, mock_storage, temp_icons_dir):
         """Test that icons are sorted alphabetically."""
-        # Create files in non-alphabetical order
         (temp_icons_dir / "zebra.png").write_bytes(b"fake")
         (temp_icons_dir / "alpha.png").write_bytes(b"fake")
         (temp_icons_dir / "beta.png").write_bytes(b"fake")
@@ -173,7 +173,6 @@ class TestUploadIcon:
             assert data["success"] is True
             assert data["file_name"] == "test.png"
 
-            # Verify file was created
             assert (temp_icons_dir / "test.png").exists()
 
     def test_upload_valid_svg(self, client, mock_storage, temp_icons_dir):
@@ -222,7 +221,6 @@ class TestUploadIcon:
             )
 
             assert response.status_code == 200
-            # Spaces and parentheses should be replaced
             safe_name = response.json()["file_name"]
             assert " " not in safe_name
             assert "(" not in safe_name
@@ -385,7 +383,7 @@ class MyCustomNode(CustomNodeBase):
         info = _extract_node_info_from_file(temp_node_file_without_icon)
 
         assert info.node_name == "My Custom Node"
-        assert info.node_icon == "user-defined-icon.png"  # Default value
+        assert info.node_icon == "user-defined-icon.png"
 
 
 class TestCustomNodeBaseIcon:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import sys
+from base64 import b64encode
 import threading
 import time
 from typing import Any
@@ -21,6 +22,7 @@ from flowfile_worker.viz_sessions import (
     viz_session_registry,
 )
 from shared.storage_config import storage
+from tests.conftest import INTERNAL_AUTH_HEADERS
 
 
 def _setup_storage(tmp_path, monkeypatch=None):
@@ -42,6 +44,26 @@ def _write_delta_table(tmp_path, name: str = "viz_test") -> str:
         {
             "category": ["a", "b", "a", "c", "b"],
             "value": [1, 2, 3, 4, 5],
+        }
+    )
+    target = storage.catalog_tables_directory / name
+    target.mkdir(parents=True, exist_ok=True)
+    df.write_delta(str(target))
+    return name
+
+
+def _write_constant_delta_table(tmp_path, name: str = "viz_degenerate") -> str:
+    """Delta table whose numeric column has a single distinct value.
+
+    Binning such a column used to divide by a zero-width step (step == 0 ->
+    0/0 == NaN) and crash the strict Int64 cast inside polars-gw, which the
+    worker surfaced as an error response.  polars-gw >= 0.1.3 collapses a
+    degenerate column to a single bucket instead.
+    """
+    df = pl.DataFrame(
+        {
+            "category": ["a", "a", "a", "a", "a"],
+            "value": [5, 5, 5, 5, 5],
         }
     )
     target = storage.catalog_tables_directory / name
@@ -84,9 +106,7 @@ def _wait_dead(handle, deadline: float = 5.0) -> bool:
     return not handle.process.is_alive()
 
 
-# ======================================================================
 # 1-12: registry-level unit tests (no FastAPI)
-# ======================================================================
 
 
 def test_spawn_on_first_request(tmp_path):
@@ -121,6 +141,37 @@ def test_second_request_hits_same_child(tmp_path):
         reg.shutdown()
 
 
+def test_rotated_session_key_sees_new_delta_version(tmp_path):
+    """A version-addressed key rotation spawns a fresh child that sees the new data.
+
+    The old key's child pins its scan_delta snapshot at spawn (documented
+    behavior); core rotates the key on any Delta write, so the next request
+    lands on a fresh child.
+    """
+    _setup_storage(tmp_path)
+    table_dir = _write_delta_table(tmp_path)
+    reg = VizSessionRegistry()
+    try:
+        src_v0 = _physical_source("tbl:1:v0", table_dir)
+        rows_v0, _ = reg.execute(src_v0, "execute", _RAW_PAYLOAD, 100)
+        assert len(rows_v0["rows"]) == 5
+
+        pl.DataFrame({"category": ["z"], "value": [99]}).write_delta(
+            str(storage.catalog_tables_directory / table_dir), mode="overwrite"
+        )
+
+        stale_rows, hit = reg.execute(src_v0, "execute", _RAW_PAYLOAD, 100)
+        assert hit is True
+        assert len(stale_rows["rows"]) == 5
+
+        src_v1 = _physical_source("tbl:1:v1", table_dir)
+        fresh_rows, hit = reg.execute(src_v1, "execute", _RAW_PAYLOAD, 100)
+        assert hit is False
+        assert len(fresh_rows["rows"]) == 1
+    finally:
+        reg.shutdown()
+
+
 def test_eviction_kills_os_process(tmp_path):
     _setup_storage(tmp_path)
     table_dir = _write_delta_table(tmp_path)
@@ -143,54 +194,93 @@ def test_eviction_kills_os_process(tmp_path):
         reg.shutdown()
 
 
-@pytest.mark.slow
-def test_two_session_keys_run_in_parallel(tmp_path):
-    _setup_storage(tmp_path)
-    big_df = pl.DataFrame(
-        {
-            "category": ["a", "b", "c", "d"] * 250_000,
-            "value": list(range(1_000_000)),
-        }
-    )
-    big_dir = storage.catalog_tables_directory / "viz_par"
-    big_dir.mkdir(parents=True, exist_ok=True)
-    big_df.write_delta(str(big_dir))
+def test_two_session_keys_run_in_parallel():
+    """Distinct session keys must overlap in flight: barrier rendezvous, not flaky wall-clock speedup."""
+    import queue as _q
+
     reg = VizSessionRegistry()
-    # Each call uses a fresh session_key so spawn + first-collect cost lands
-    # in the timing — polars caches subsequent agg calls down to microseconds,
-    # which would make a warmed comparison degenerate.
-    payload = _RAW_PAYLOAD
-    max_rows = 1_000_000
+    spawn_barrier = threading.Barrier(2)
+    request_barrier = threading.Barrier(2)
+    barrier_timeout = 15.0
+
+    def _overlapped(barrier: threading.Barrier) -> bool:
+        try:
+            barrier.wait(timeout=barrier_timeout)
+            return True
+        except threading.BrokenBarrierError:
+            return False
+
+    class _FakeProcess:
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout=None) -> None:
+            pass
+
+        def terminate(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            pass
+
+    spawn_overlap: dict[str, bool] = {}
+
+    def _fake_spawn(source: models.VizWorkerSource) -> viz_sessions_module.SessionHandle:
+        spawn_overlap[source.session_key] = _overlapped(spawn_barrier)
+        request_q: _q.Queue = _q.Queue()
+        response_q: _q.Queue = _q.Queue()
+
+        def _child() -> None:
+            while True:
+                msg = request_q.get()
+                if msg.get("op") == "shutdown":
+                    return
+                response_q.put(
+                    {
+                        "request_id": msg["request_id"],
+                        "ok": True,
+                        "result": {"overlapped": _overlapped(request_barrier)},
+                    }
+                )
+
+        threading.Thread(target=_child, daemon=True, name=f"fake-viz-{source.session_key}").start()
+        return viz_sessions_module.SessionHandle(
+            key=source.session_key,
+            process=_FakeProcess(),
+            request_q=request_q,
+            response_q=response_q,
+        )
+
+    reg._spawn_child = _fake_spawn
+    s1 = _physical_source("unit:par:s1", "viz_par")
+    s2 = _physical_source("unit:par:s2", "viz_par")
+    results: dict[str, dict] = {}
+    errors: list[BaseException] = []
+
+    def _run(src: models.VizWorkerSource) -> None:
+        try:
+            res, _ = reg.execute(src, "execute", _RAW_PAYLOAD, 100)
+            results[src.session_key] = res
+        except BaseException as exc:
+            errors.append(exc)
+
     try:
-        s1 = _physical_source("unit:par:s1", "viz_par")
-        t0 = time.perf_counter()
-        reg.execute(s1, "execute", payload, max_rows)
-        t1 = time.perf_counter() - t0
-        s2 = _physical_source("unit:par:s2", "viz_par")
-        t0 = time.perf_counter()
-        reg.execute(s2, "execute", payload, max_rows)
-        t2 = time.perf_counter() - t0
-
-        if t1 + t2 < 0.1:
-            pytest.skip(f"workload too fast to measure overlap: t1+t2={t1 + t2:.4f}s")
-
-        p1 = _physical_source("unit:par:p1", "viz_par")
-        p2 = _physical_source("unit:par:p2", "viz_par")
-
-        def _run(src):
-            reg.execute(src, "execute", payload, max_rows)
-
-        threads = [threading.Thread(target=_run, args=(s,)) for s in (p1, p2)]
-        t_start = time.perf_counter()
+        threads = [threading.Thread(target=_run, args=(s,)) for s in (s1, s2)]
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
-        t_par = time.perf_counter() - t_start
-        # 0.85 (was 0.7): GitHub-hosted runners only have 4 vCPUs and Polars
-        # is multithreaded, so two parallel workloads compete for cores.
-        # Catastrophic serialisation still gives ratio ~1.0 and trips this.
-        assert t_par < 0.85 * (t1 + t2), f"t_par={t_par:.3f}s t1+t2={t1 + t2:.3f}s"
+            t.join(timeout=4 * barrier_timeout)
+        assert not any(t.is_alive() for t in threads), "execute() deadlocked across session keys"
+        assert not errors, f"execute failed: {errors[0]!r}"
+        for src in (s1, s2):
+            assert spawn_overlap[src.session_key], (
+                f"{src.session_key}: spawn was not concurrent with the other session — "
+                "a registry lock is being held across _spawn_child"
+            )
+            assert results[src.session_key]["overlapped"], (
+                f"{src.session_key}: request was not in flight concurrently with the "
+                "other session — distinct session keys are being serialised"
+            )
     finally:
         reg.shutdown()
 
@@ -343,7 +433,7 @@ def test_child_crash_propagates_as_5xx(tmp_path):
     _setup_storage(tmp_path)
     _write_delta_table(tmp_path)
     viz_session_registry.evict_all()
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
     payload = {
         "source": {
             "kind": "physical",
@@ -366,7 +456,7 @@ def test_value_error_propagates_as_response_error(tmp_path):
     _setup_storage(tmp_path)
     table_dir = _write_delta_table(tmp_path)
     viz_session_registry.evict_all()
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
     # Bad workflow op → child loads ok, raises during execute → ValueError → 200 + error.
     payload = {
         "source": {
@@ -405,7 +495,7 @@ def test_visualize_stats_shape(tmp_path):
     _setup_storage(tmp_path)
     table_dir = _write_delta_table(tmp_path)
     viz_session_registry.evict_all()
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
     payload = {
         "source": {
             "kind": "physical",
@@ -436,13 +526,7 @@ def test_request_queue_full_returns_503(tmp_path, monkeypatch):
         # Warm the child so spawn isn't on the busy path.
         reg.execute(src, "execute", _AGG_PAYLOAD, 100)
         handle = reg._sessions[src.session_key]
-        # Drain the response queue to ensure the child is idle.
-        # Now block the child by filling its request_q without ever awaiting a response.
-        # Simpler: simulate "queue full" by pre-filling the bounded queue.
-        # The current child is idle waiting on get(); fill the queue while it's
-        # consuming one — so put two items: child eats one immediately, second
-        # blocks slot. This is racy; instead, manually replace request_q with a
-        # tiny fake to exercise the queue.Full path deterministically.
+        # Replace request_q with a tiny fake to exercise the queue.Full path deterministically.
         import queue as _q
 
         class _Full:
@@ -499,7 +583,7 @@ def test_polars_gw_not_in_parent_sys_modules(tmp_path):
     table_dir = _write_delta_table(tmp_path)
     viz_session_registry.evict_all()
     sys.modules.pop("polars_gw", None)
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
     r = client.post(
         "/catalog/visualize_query",
         json={
@@ -517,9 +601,7 @@ def test_polars_gw_not_in_parent_sys_modules(tmp_path):
     assert "polars_gw" not in sys.modules, "polars_gw leaked into FastAPI parent process"
 
 
-# ======================================================================
 # Existing HTTP-level tests (kept; flipped manager → registry)
-# ======================================================================
 
 
 @pytest.mark.worker
@@ -528,7 +610,7 @@ def test_visualize_query_endpoint_physical_delta(tmp_path):
     table_dir = _write_delta_table(tmp_path)
     viz_session_registry.evict_all()
 
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
     payload = {
         "source": {
             "kind": "physical",
@@ -553,12 +635,53 @@ def test_visualize_query_endpoint_physical_delta(tmp_path):
 
 
 @pytest.mark.worker
+def test_visualize_query_kpi_aggregate_returns_single_row(tmp_path):
+    """A dashboard KPI tile's payload: filter step + empty-groupBy aggregate + limit 2."""
+    _setup_storage(tmp_path)
+    table_dir = _write_delta_table(tmp_path)
+    viz_session_registry.evict_all()
+
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
+    kpi_payload = {
+        "workflow": [
+            {"type": "filter", "filters": [{"fid": "category", "rule": {"type": "one of", "value": ["a", "b"]}}]},
+            {
+                "type": "view",
+                "query": [
+                    {
+                        "op": "aggregate",
+                        "groupBy": [],
+                        "measures": [
+                            {"field": "value", "agg": "sum", "asFieldKey": "value_sum"},
+                            {"field": "*", "agg": "count", "asFieldKey": "row_count"},
+                            {"agg": "expr", "expression": 'COUNT(DISTINCT "category")', "asFieldKey": "n_category"},
+                        ],
+                    }
+                ],
+            },
+        ],
+        "limit": 2,
+    }
+    r = client.post(
+        "/catalog/visualize_query",
+        json={
+            "source": {"kind": "physical", "session_key": "test:kpi:1", "table_path": table_dir},
+            "payload": kpi_payload,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["error"] is None
+    assert body["rows"] == [{"value_sum": 11, "row_count": 4, "n_category": 2}]
+
+
+@pytest.mark.worker
 def test_visualize_fields_endpoint_returns_imutfields(tmp_path):
     _setup_storage(tmp_path)
     table_dir = _write_delta_table(tmp_path)
     viz_session_registry.evict_all()
 
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
     body = {
         "source": {
             "kind": "physical",
@@ -584,7 +707,7 @@ def test_visualize_query_endpoint_ipc_path(tmp_path):
     ipc_name = "fvt-1-deadbeefdeadbeef.arrow"
     pl.DataFrame({"category": ["a", "b", "a"], "value": [1, 2, 3]}).write_ipc(str(target_dir / ipc_name))
 
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
     payload = {
         "source": {
             "kind": "ipc_path",
@@ -613,7 +736,7 @@ def test_visualize_query_sql_with_virtual_refs(tmp_path):
     ipc_name = "fvt-2-cafebabecafebabe.arrow"
     pl.DataFrame({"category": ["a", "b"], "boost": [10, 20]}).write_ipc(str(target_dir / ipc_name))
 
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
     payload = {
         "source": {
             "kind": "sql",
@@ -641,7 +764,7 @@ def test_visualize_evict_endpoint(tmp_path):
     _setup_storage(tmp_path)
     _write_delta_table(tmp_path)
     viz_session_registry.evict_all()
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
 
     client.post(
         "/catalog/visualize_query",
@@ -663,5 +786,132 @@ def test_visualize_evict_endpoint(tmp_path):
     assert "evict:1" not in keys
 
 
+@pytest.mark.worker
+def test_visualize_query_degenerate_column_bins_without_error(tmp_path):
+    """Binning a single-distinct-value column must not surface an error.
+
+    Regression for the polars-gw divide-by-zero NaN crash: a constant column
+    gave a zero-width bin step (0/0 == NaN) and the strict Int64 cast raised,
+    which the worker caught and returned as an error response (with a noisy
+    traceback) instead of a chart.  polars-gw >= 0.1.3 collapses the column to
+    a single bucket, so every binning op now succeeds.
+    """
+    _setup_storage(tmp_path)
+    table_dir = _write_constant_delta_table(tmp_path)
+    viz_session_registry.evict_all()
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
+
+    degenerate_payloads = {
+        # equal-width bin (the reported crash): step == 0 on a constant column.
+        "bin": {"workflow": [{"type": "transform", "transform": [
+            {"key": "value_bin", "expression": {"op": "bin", "params": ["value"], "as": "value_bin", "num": 10}}
+        ]}]},
+        # quantile binCount on a constant column.
+        "binCount": {"workflow": [{"type": "transform", "transform": [
+            {"key": "value_q", "expression": {"op": "binCount", "params": ["value"], "as": "value_q", "num": 4}}
+        ]}]},
+        # binBy view op with a zero bin size (0/0 -> NaN), which falls back to
+        # the default width.
+        "binBy": {"workflow": [{"type": "view", "query": [
+            {"op": "bin", "binBy": "value", "newBinCol": "value_bin", "binSize": 0}
+        ]}]},
+    }
+    for name, payload in degenerate_payloads.items():
+        r = client.post(
+            "/catalog/visualize_query",
+            json={
+                "source": {
+                    "kind": "physical",
+                    "session_key": f"test:degenerate:{name}",
+                    "table_path": table_dir,
+                },
+                "payload": payload,
+            },
+        )
+        assert r.status_code == 200, f"{name}: {r.text}"
+        body = r.json()
+        assert body["error"] is None, f"{name}: {body['error']}"
+        assert body["total_rows"] == 5, f"{name}: {body['total_rows']}"
+
+
 # Silence ruff: imported for type-only constants
 _ = REQUEST_QUEUE_MAXSIZE
+
+
+# ---- Flow-node sources: a serialised plan, scanned live ---------------------
+
+
+@pytest.mark.worker
+def test_visualize_query_endpoint_plan(tmp_path):
+    """A flow node ships its plan; the child scans the source per query.
+
+    Nothing is materialised — the whole point of `kind="plan"` is that Polars
+    pushes each chart's projection into the node's own sources.
+    """
+    _setup_storage(tmp_path)
+    viz_session_registry.evict_all()
+
+    src = tmp_path / "node_source.parquet"
+    pl.DataFrame({"category": ["a", "b", "a"], "value": [1, 2, 3]}).write_parquet(str(src))
+    plan_bytes = pl.scan_parquet(str(src)).serialize()
+
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
+    r = client.post(
+        "/catalog/visualize_query",
+        json={
+            "source": {
+                "kind": "plan",
+                "session_key": "test:plan:1",
+                "plan_bytes": b64encode(plan_bytes).decode("ascii"),
+            },
+            "payload": _AGG_PAYLOAD,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["error"] is None
+    assert {row["category"]: row["value_sum"] for row in body["rows"]} == {"a": 4, "b": 2}
+
+    # No file was written anywhere on the way.
+    assert list(storage.catalog_virtual_results_directory.glob("*.arrow")) == []
+
+
+@pytest.mark.worker
+def test_visualize_plan_session_is_reused(tmp_path):
+    """Successive chart queries on one plan must hit the same warm child."""
+    _setup_storage(tmp_path)
+    viz_session_registry.evict_all()
+
+    src = tmp_path / "node_source_reuse.parquet"
+    pl.DataFrame({"category": ["a", "b"], "value": [1, 2]}).write_parquet(str(src))
+    body = {
+        "source": {
+            "kind": "plan",
+            "session_key": "test:plan:reuse",
+            "plan_bytes": b64encode(pl.scan_parquet(str(src)).serialize()).decode("ascii"),
+        },
+        "payload": _AGG_PAYLOAD,
+    }
+
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
+    first = client.post("/catalog/visualize_query", json=body)
+    second = client.post("/catalog/visualize_query", json=body)
+    assert first.status_code == 200 and second.status_code == 200, second.text
+    assert first.json()["cache_hit"] is False
+    assert second.json()["cache_hit"] is True, "same session_key must reuse the child"
+
+
+@pytest.mark.worker
+def test_visualize_plan_requires_plan_bytes(tmp_path):
+    _setup_storage(tmp_path)
+    viz_session_registry.evict_all()
+
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
+    r = client.post(
+        "/catalog/visualize_query",
+        json={
+            "source": {"kind": "plan", "session_key": "test:plan:empty"},
+            "payload": _AGG_PAYLOAD,
+        },
+    )
+    assert r.status_code >= 400 or r.json().get("error")

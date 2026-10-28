@@ -11,11 +11,52 @@ import type {
   NodeJoinSettings,
   NodePivotSettings,
   NodeUnpivotSettings,
+  NodeCrossJoinSettings,
+  NodeRecordIdSettings,
+  NodeDynamicRenameSettings,
+  DynamicRenameInput,
   AggType,
   SelectInput,
   AggCol,
   JoinSettings
 } from '../types'
+import { dataTypeGroup } from '../utils/dtypeGroup'
+
+/**
+ * Canonical Polars name for a declared data type, or null when the name means
+ * nothing here. Mirrors `polars_type_from_name` in the engine's dtypes.py:
+ * flowfile_core's friendly aliases resolve, a parametrised name matches on its
+ * base, and an unrecognised name reads as "no type was asked for" rather than
+ * as a silent String.
+ */
+const CAST_TYPE_ALIASES: Record<string, string> = {
+  int: 'Int64', integer: 'Int64', char: 'String', 'fixed decimal': 'Float32',
+  double: 'Float64', float: 'Float64', bool: 'Boolean', byte: 'UInt8',
+  bit: 'Binary', date: 'Date', datetime: 'Datetime', string: 'String',
+  str: 'String', time: 'Time',
+  int8: 'Int8', int16: 'Int16', int32: 'Int32', int64: 'Int64', int128: 'Int128',
+  uint8: 'UInt8', uint16: 'UInt16', uint32: 'UInt32', uint64: 'UInt64',
+  float32: 'Float32', float64: 'Float64', boolean: 'Boolean', utf8: 'String',
+  binary: 'Binary', duration: 'Duration', categorical: 'Categorical', null: 'Null'
+}
+
+export function canonicalCastType(name: string | null | undefined): string | null {
+  if (!name) return null
+  return CAST_TYPE_ALIASES[String(name).split('(')[0].trim().toLowerCase()] ?? null
+}
+
+/**
+ * The dtype a select entry casts its column to, or null for no cast.
+ *
+ * The engine compares the declared type against the column's live dtype, which
+ * a code generator has no access to; `data_type_change` is defined as exactly
+ * that comparison (both editors stamp it on save, and both flow-file dialects
+ * carry it), so the two agree — and a cast to the type a column already holds
+ * is a no-op anyway.
+ */
+export function selectCastTarget(entry: SelectInput): string | null {
+  return entry.data_type_change ? canonicalCastType(entry.data_type) : null
+}
 
 /**
  * Infer the output type for an aggregation function
@@ -71,7 +112,6 @@ function inferSelectSchema(
     return inputSchema
   }
 
-  // Filter to kept columns and sort by position
   const keptColumns = selectInput
     .filter((s: SelectInput) => s.keep !== false)
     .sort((a: SelectInput, b: SelectInput) => (a.position ?? 0) - (b.position ?? 0))
@@ -81,9 +121,13 @@ function inferSelectSchema(
   for (const selectCol of keptColumns) {
     const inputCol = findColumn(inputSchema, selectCol.old_name)
     if (inputCol) {
+      // build_select casts only where the declared type differs from the one
+      // arriving; the panel records a type for every column, changed or not.
+      const target = canonicalCastType(selectCol.data_type)
+      const cast = target && target !== canonicalCastType(inputCol.data_type)
       result.push({
         name: selectCol.new_name || selectCol.old_name,
-        data_type: selectCol.data_type || inputCol.data_type
+        data_type: cast ? target : inputCol.data_type
       })
     }
   }
@@ -105,7 +149,6 @@ function inferGroupBySchema(
 
   const result: ColumnSchema[] = []
 
-  // First add groupby columns (in order they appear)
   const groupCols = groupbyInput.agg_cols.filter((c: AggCol) => c.agg === 'groupby')
   for (const col of groupCols) {
     const inputCol = findColumn(inputSchema, col.old_name)
@@ -117,7 +160,6 @@ function inferGroupBySchema(
     }
   }
 
-  // Then add aggregation columns
   const aggCols = groupbyInput.agg_cols.filter((c: AggCol) => c.agg !== 'groupby')
   for (const col of aggCols) {
     const inputCol = findColumn(inputSchema, col.old_name)
@@ -157,19 +199,15 @@ function inferJoinSchema(
     return leftSchema
   }
 
-  // Get join key column names
   const leftKeySet = new Set(joinMapping.map((m: { left_col: string; right_col: string }) => m.left_col))
   const rightKeySet = new Set(joinMapping.map((m: { left_col: string; right_col: string }) => m.right_col))
 
-  // Get all column names from both schemas
   const leftColNames = new Set(leftSchema.map(c => c.name))
   const rightColNames = new Set(rightSchema.map(c => c.name))
 
   const result: ColumnSchema[] = []
 
-  // Add all left columns
   for (const col of leftSchema) {
-    // Check if this column exists in right schema (and is not a key column)
     const needsSuffix = rightColNames.has(col.name) && !leftKeySet.has(col.name)
     result.push({
       name: needsSuffix ? col.name + leftSuffix : col.name,
@@ -177,14 +215,12 @@ function inferJoinSchema(
     })
   }
 
-  // Add right columns that are not join keys
   for (const col of rightSchema) {
     if (rightKeySet.has(col.name)) {
       // Skip right key columns as they duplicate left keys
       continue
     }
 
-    // Check if this column exists in left schema
     const needsSuffix = leftColNames.has(col.name)
     result.push({
       name: needsSuffix ? col.name + rightSuffix : col.name,
@@ -210,7 +246,6 @@ function inferUnpivotSchema(
 
   const result: ColumnSchema[] = []
 
-  // Add index columns (these are preserved as-is)
   const indexColumns = unpivotInput.index_columns || []
   for (const colName of indexColumns) {
     const col = findColumn(inputSchema, colName)
@@ -219,15 +254,107 @@ function inferUnpivotSchema(
     }
   }
 
-  // Add the 'variable' column (contains original column names)
   result.push({ name: 'variable', data_type: 'String' })
 
-  // Add the 'value' column (type depends on unpivoted columns)
   // For simplicity, we'll use String as a safe default
   // since the actual type depends on the columns being unpivoted
   result.push({ name: 'value', data_type: 'String' })
 
   return result.length > 0 ? result : null
+}
+
+/**
+ * Infer output schema for a CROSS_JOIN node
+ */
+function inferCrossJoinSchema(
+  leftSchema: ColumnSchema[],
+  rightSchema: ColumnSchema[],
+  settings: NodeCrossJoinSettings
+): ColumnSchema[] {
+  const rightSuffix = settings.cross_join_input?.right_suffix || '_right'
+  const leftNames = new Set(leftSchema.map(c => c.name))
+  const result: ColumnSchema[] = [...leftSchema]
+  for (const col of rightSchema) {
+    result.push({
+      name: leftNames.has(col.name) ? col.name + rightSuffix : col.name,
+      data_type: col.data_type
+    })
+  }
+  return result
+}
+
+/**
+ * Infer output schema for a RECORD_ID node
+ */
+function inferRecordIdSchema(
+  inputSchema: ColumnSchema[],
+  settings: NodeRecordIdSettings
+): ColumnSchema[] {
+  const name = settings.record_id_input?.name || 'record_id'
+  return [{ name, data_type: 'UInt32' }, ...inputSchema]
+}
+
+/**
+ * Resolve a dynamic-rename rule against an input schema, client-side. Ports the
+ * Python engine's _select_rename_targets + _compute_renamed_names (prefix/suffix
+ * only — formula/first_row need the engine, so they yield an empty map) plus the
+ * duplicate-collision check. Used for both the live preview and schema inference,
+ * so they never disagree.
+ */
+export function resolveDynamicRenameMap(
+  inputSchema: ColumnSchema[],
+  settings: DynamicRenameInput
+): { map: Map<string, string>; duplicates: string[] } {
+  const cols = inputSchema.map(c => ({ name: c.name, group: dataTypeGroup(c.data_type) }))
+
+  let targets: string[] = []
+  if (settings.selection_mode === 'all') {
+    targets = cols.map(c => c.name)
+  } else if (settings.selection_mode === 'list') {
+    const available = new Set(cols.map(c => c.name))
+    targets = (settings.selected_columns || []).filter(n => available.has(n))
+  } else if (settings.selection_mode === 'data_type') {
+    const wanted = settings.selected_data_type
+    targets = wanted ? cols.filter(c => c.group === wanted).map(c => c.name) : []
+  }
+
+  const map = new Map<string, string>()
+  for (const name of targets) {
+    let newName = name
+    if (settings.rename_mode === 'prefix') newName = `${settings.prefix || ''}${name}`
+    else if (settings.rename_mode === 'suffix') newName = `${name}${settings.suffix || ''}`
+    else continue // formula / first_row resolved by the engine
+    if (newName !== name) map.set(name, newName)
+  }
+
+  // Duplicate detection (mirrors _assert_rename_has_no_duplicates).
+  const untouched = new Set(cols.map(c => c.name).filter(n => !map.has(n)))
+  const seen = new Set<string>()
+  const duplicates = new Set<string>()
+  for (const newName of map.values()) {
+    if (seen.has(newName) || untouched.has(newName)) duplicates.add(newName)
+    seen.add(newName)
+  }
+
+  return { map, duplicates: [...duplicates].sort() }
+}
+
+/**
+ * Infer output schema for a DYNAMIC RENAME node. prefix/suffix/all/list/data_type
+ * resolve client-side; formula and first_row depend on the engine/data, so return
+ * null to trigger lazy execution (like pivot/formula).
+ */
+function inferDynamicRenameSchema(
+  inputSchema: ColumnSchema[],
+  settings: NodeDynamicRenameSettings
+): ColumnSchema[] | null {
+  const dr = settings.dynamic_rename_input
+  if (!dr || dr.rename_mode === 'formula' || dr.rename_mode === 'first_row') return null
+  const { map } = resolveDynamicRenameMap(inputSchema, dr)
+  return inputSchema.map(col => ({
+    name: map.get(col.name) || col.name,
+    data_type: col.data_type
+  }))
 }
 
 /**
@@ -289,20 +416,37 @@ export function inferOutputSchema(
     case 'formula':
       return null
 
-    // Select - filter/reorder columns
     case 'select':
       return inferSelectSchema(inputSchema, settings as NodeSelectSettings)
 
-    // Group by - return grouped + aggregated columns
     case 'group_by':
       return inferGroupBySchema(inputSchema, settings as NodeGroupBySettings)
 
-    // Join - merge schemas
     case 'join':
       if (!rightInputSchema || rightInputSchema.length === 0) {
         return null
       }
       return inferJoinSchema(inputSchema, rightInputSchema, settings as NodeJoinSettings)
+
+    case 'cross_join':
+      if (!rightInputSchema || rightInputSchema.length === 0) {
+        return null
+      }
+      return inferCrossJoinSchema(inputSchema, rightInputSchema, settings as NodeCrossJoinSettings)
+
+    // Multi-input: defer to the Python pass.
+    case 'union':
+      return null
+
+    case 'record_id':
+      return inferRecordIdSchema(inputSchema, settings as NodeRecordIdSettings)
+
+    // Count Records collapses the input to one row with a single count column.
+    case 'record_count':
+      return [{ name: 'number_of_records', data_type: 'UInt32' }]
+
+    case 'dynamic_rename':
+      return inferDynamicRenameSchema(inputSchema, settings as NodeDynamicRenameSettings)
 
     // Pivot - can't infer without execution (depends on unique values)
     case 'pivot':
@@ -322,40 +466,24 @@ export function inferOutputSchema(
  * Check if a node type is a source node (produces data rather than transforming it)
  */
 export function isSourceNode(nodeType: string): boolean {
-  return nodeType === 'read' || nodeType === 'manual_input' || nodeType === 'external_data'
-}
-
-/**
- * Get downstream node IDs from a given node
- */
-export function getDownstreamNodeIds(
-  nodeId: number,
-  edges: { source: string; target: string }[]
-): number[] {
-  return edges
-    .filter(e => e.source === String(nodeId))
-    .map(e => parseInt(e.target))
+  return nodeType === 'read' || nodeType === 'manual_input' || nodeType === 'external_data' || nodeType === 'read_from_catalog'
 }
 
 /**
  * Infer a data type from a sample of string values
  */
 function inferDataTypeFromValues(values: string[]): string {
-  // Filter out empty values
   const nonEmpty = values.filter(v => v !== '' && v !== null && v !== undefined)
   if (nonEmpty.length === 0) return 'String'
 
-  // Check for booleans
   const allBooleans = nonEmpty.every(v =>
     v.toLowerCase() === 'true' || v.toLowerCase() === 'false'
   )
   if (allBooleans) return 'Boolean'
 
-  // Check for integers
   const allIntegers = nonEmpty.every(v => /^-?\d+$/.test(v.trim()))
   if (allIntegers) return 'Int64'
 
-  // Check for floats
   const allNumbers = nonEmpty.every(v => {
     const trimmed = v.trim()
     return !isNaN(parseFloat(trimmed)) && /^-?\d*\.?\d+$/.test(trimmed)
@@ -372,7 +500,8 @@ function inferDataTypeFromValues(values: string[]): string {
 export function inferSchemaFromCsv(
   csvContent: string,
   hasHeaders: boolean = true,
-  delimiter: string = ','
+  delimiter: string = ',',
+  inferTypes: boolean = true
 ): ColumnSchema[] | null {
   if (!csvContent || csvContent.trim().length === 0) {
     return null
@@ -390,7 +519,6 @@ export function inferSchemaFromCsv(
     const headerLine = lines[0]
     const columnNames = headerLine.split(actualDelimiter).map(c => c.trim())
 
-    // Get sample data for type inference (up to 100 rows)
     const sampleLines = lines.slice(1, Math.min(101, lines.length))
     const sampleData: string[][] = sampleLines.map(line =>
       line.split(actualDelimiter).map(c => c.trim())
@@ -398,7 +526,7 @@ export function inferSchemaFromCsv(
 
     columnNames.forEach((name, colIndex) => {
       const columnValues = sampleData.map(row => row[colIndex] || '')
-      const dataType = inferDataTypeFromValues(columnValues)
+      const dataType = inferTypes ? inferDataTypeFromValues(columnValues) : 'String'
 
       schema.push({
         name: name || `column_${colIndex + 1}`,
@@ -410,7 +538,6 @@ export function inferSchemaFromCsv(
     const firstLine = lines[0].split(actualDelimiter)
     const columnCount = firstLine.length
 
-    // Get sample data for type inference
     const sampleLines = lines.slice(0, Math.min(100, lines.length))
     const sampleData: string[][] = sampleLines.map(line =>
       line.split(actualDelimiter).map(c => c.trim())
@@ -418,7 +545,7 @@ export function inferSchemaFromCsv(
 
     for (let colIndex = 0; colIndex < columnCount; colIndex++) {
       const columnValues = sampleData.map(row => row[colIndex] || '')
-      const dataType = inferDataTypeFromValues(columnValues)
+      const dataType = inferTypes ? inferDataTypeFromValues(columnValues) : 'String'
 
       schema.push({
         name: `column_${colIndex + 1}`,

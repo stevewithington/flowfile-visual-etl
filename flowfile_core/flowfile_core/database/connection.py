@@ -2,9 +2,9 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from shared.database import get_catalog_engine, sqlite_database_path
 from shared.storage_config import get_database_url, storage
 
 
@@ -15,18 +15,11 @@ def get_app_data_dir() -> Path:
 
 def get_database_path() -> Path | None:
     """Get the actual path to the database file (useful for backup/info purposes)."""
-    url = get_database_url()
-    if url.startswith("sqlite:///"):
-        return Path(url.replace("sqlite:///", ""))
-    return None
+    return sqlite_database_path()
 
 
-# Create database engine
-engine = create_engine(
-    get_database_url(), connect_args={"check_same_thread": False} if "sqlite" in get_database_url() else {}
-)
+engine = get_catalog_engine()
 
-# Create session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

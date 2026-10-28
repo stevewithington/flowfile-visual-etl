@@ -12,9 +12,10 @@
         :show-data-type="true"
         :show-new-columns="true"
         :show-old-columns="true"
+        :source-types="sourceTypes"
+        :source-semantic-types="sourceSemanticTypes"
         :show-headers="true"
         :show-title="false"
-        :show-data="true"
         title="Select data"
         @update-select-inputs="updateSelectInputsHandler"
       />
@@ -26,10 +27,13 @@
 <script lang="ts" setup>
 import { ref } from "vue";
 import {
+  applySelectPositions,
   createNodeSelect,
+  sourceSemanticTypesFromSchema,
+  sourceTypesFromSchema,
   updateNodeSelect,
 } from "../../../baseNode/selectComponents/nodeSelectLogic";
-import { NodeSelect } from "../../../baseNode/nodeInput";
+import { NodeSelect, SemanticType } from "../../../baseNode/nodeInput";
 import { CodeLoader } from "vue-content-loader";
 import { useNodeStore } from "../../../../../stores/node-store";
 import { useNodeSettings } from "../../../../../composables/useNodeSettings";
@@ -41,31 +45,17 @@ const keepMissing = ref(false);
 const nodeStore = useNodeStore();
 const nodeSelect = ref<NodeSelect>(createNodeSelect().value);
 const dataLoaded = ref(false);
+const sourceTypes = ref<Record<string, string>>({});
+const sourceSemanticTypes = ref<Record<string, SemanticType>>({});
 
-// Use the standardized node settings composable
 const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSettings({
   nodeRef: nodeSelect,
   onBeforeSave: () => {
-    // Prepare select data before saving
-    nodeSelect.value.select_input.sort((a, b) => a.position - b.position);
-    const originalData = nodeStore.getCurrentNodeData();
-    const newColumnSettings = nodeSelect.value.select_input;
     nodeSelect.value.keep_missing = keepMissing.value;
-    if (originalData) {
-      newColumnSettings.forEach((newColumnSetting, index) => {
-        let original_index = originalData.main_input?.table_schema.findIndex(
-          (column) => column.name === newColumnSetting.old_name,
-        );
-        let original_object =
-          index !== -1 ? originalData.main_input?.table_schema[index] : undefined;
-        if (original_object) {
-          newColumnSetting.is_altered = original_object?.data_type !== newColumnSetting.data_type;
-          newColumnSetting.data_type_change = newColumnSetting.is_altered;
-          newColumnSetting.position = index;
-          newColumnSetting.original_position = original_index || index;
-        }
-      });
-    }
+    applySelectPositions(
+      nodeSelect.value.select_input,
+      nodeStore.getCurrentNodeData()?.main_input?.table_schema,
+    );
     return true;
   },
 });
@@ -74,6 +64,8 @@ const loadNodeData = async (nodeId: number) => {
   const result = await nodeStore.getNodeData(nodeId, false);
   if (result) {
     const main_input = result.main_input;
+    sourceTypes.value = sourceTypesFromSchema(main_input?.table_schema);
+    sourceSemanticTypes.value = sourceSemanticTypesFromSchema(main_input?.table_schema);
     try {
       if (result.setting_input && main_input && result.setting_input.is_setup) {
         nodeSelect.value = result.setting_input;

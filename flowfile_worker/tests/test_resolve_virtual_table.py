@@ -1,6 +1,8 @@
 """Tests for the flow-virtual-table resolve primitive on the worker."""
 from __future__ import annotations
 
+import os
+import time
 from base64 import b64encode
 from unittest.mock import patch
 
@@ -10,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from flowfile_worker import funcs, main, models
 from shared.storage_config import storage
+from tests.conftest import INTERNAL_AUTH_HEADERS
 
 
 @pytest.fixture(autouse=True)
@@ -30,7 +33,7 @@ def _plan_bytes() -> bytes:
 
 @pytest.mark.worker
 def test_resolve_virtual_table_round_trip():
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
     payload = {
         "table_id": 7,
         "plan_bytes": b64encode(_plan_bytes()).decode("ascii"),
@@ -58,7 +61,7 @@ def test_resolve_virtual_table_is_idempotent_on_versions_hash():
 
     The cache file's mtime must not change and the spawn helper must not run.
     """
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
     payload = {
         "table_id": 11,
         "plan_bytes": b64encode(_plan_bytes()).decode("ascii"),
@@ -85,7 +88,7 @@ def test_resolve_virtual_table_is_idempotent_on_versions_hash():
 
 @pytest.mark.worker
 def test_resolve_virtual_table_invalid_plan_returns_500():
-    client = TestClient(main.app)
+    client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
     payload = {
         "table_id": 99,
         "plan_bytes": b64encode(b"not a valid polars plan").decode("ascii"),
@@ -109,3 +112,194 @@ def test_resolve_virtual_table_function_path_normalises_under_results_dir():
     assert target.exists()
     # Must NOT live in the catalog_tables_directory (separation of concerns).
     assert not (storage.catalog_tables_directory / res.ipc_path).exists()
+
+
+# ---- kernel_shared target -------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _no_shared_dir_override(monkeypatch):
+    """shared_virtual_results_directory must resolve under the tmp base dir, not a dev env override."""
+    monkeypatch.delenv("FLOWFILE_SHARED_DIR", raising=False)
+
+
+@pytest.mark.worker
+def test_resolve_virtual_table_kernel_shared_writes_to_shared_dir():
+    req = models.ResolveVirtualTableRequest(
+        table_id=13,
+        plan_bytes=_plan_bytes(),
+        source_versions_hash="deadbeef" * 4,
+        target="kernel_shared",
+    )
+    res = funcs.resolve_virtual_table(req)
+    assert res.row_count == 3
+    target = storage.shared_virtual_results_directory / res.ipc_path
+    assert target.exists()
+    assert not (storage.catalog_virtual_results_directory / res.ipc_path).exists()
+    df = pl.read_ipc(target)
+    assert df["a"].to_list() == [1, 2, 3]
+
+
+@pytest.mark.worker
+def test_resolve_virtual_table_kernel_shared_always_rebuilds():
+    """Same key with changed plan bytes serves the NEW data.
+
+    A serialised plan hashes identically before and after the referenced data
+    changes, so an exists()-based cache would pin the first snapshot forever.
+    """
+    key = "cafebabe" * 4
+
+    def _request(lf: pl.LazyFrame) -> models.ResolveVirtualTableResponse:
+        return funcs.resolve_virtual_table(
+            models.ResolveVirtualTableRequest(
+                table_id=17,
+                plan_bytes=lf.serialize(),
+                source_versions_hash=key,
+                target="kernel_shared",
+            )
+        )
+
+    first = _request(pl.LazyFrame({"a": [1, 2, 3]}))
+    second = _request(pl.LazyFrame({"a": [1, 2, 3, 4]}))
+
+    assert second.ipc_path == first.ipc_path
+    assert second.row_count == 4
+    target = storage.shared_virtual_results_directory / second.ipc_path
+    assert pl.read_ipc(target)["a"].to_list() == [1, 2, 3, 4]
+
+
+@pytest.mark.worker
+def test_resolve_virtual_table_kernel_shared_removes_only_aged_superseded_siblings():
+    """Old snapshots of the same table are dropped; recent ones (a concurrent request's) and other tables' survive."""
+
+    def _request(versions_hash: str, table_id: int = 21) -> models.ResolveVirtualTableResponse:
+        return funcs.resolve_virtual_table(
+            models.ResolveVirtualTableRequest(
+                table_id=table_id,
+                plan_bytes=_plan_bytes(),
+                source_versions_hash=versions_hash,
+                target="kernel_shared",
+            )
+        )
+
+    shared_dir = storage.shared_virtual_results_directory
+    other = _request("0badf00d" * 4, table_id=99)
+    aged = _request("aaaaaaaa" * 4)
+    recent = _request("bbbbbbbb" * 4)
+    old = time.time() - funcs._SUPERSEDED_MIN_AGE_S - 60
+    os.utime(shared_dir / aged.ipc_path, (old, old))
+
+    latest = _request("cccccccc" * 4)
+
+    assert not (shared_dir / aged.ipc_path).exists()
+    assert (shared_dir / recent.ipc_path).exists()
+    assert (shared_dir / latest.ipc_path).exists()
+    assert (shared_dir / other.ipc_path).exists()
+
+
+@pytest.mark.worker
+def test_resolve_virtual_table_default_target_keeps_recent_superseded_siblings():
+    """Recent superseded hashes survive the min-age guard (a concurrent request may still scan them)."""
+
+    def _request(versions_hash: str) -> models.ResolveVirtualTableResponse:
+        return funcs.resolve_virtual_table(
+            models.ResolveVirtualTableRequest(
+                table_id=23,
+                plan_bytes=_plan_bytes(),
+                source_versions_hash=versions_hash,
+            )
+        )
+
+    first = _request("aaaaaaaa" * 4)
+    second = _request("bbbbbbbb" * 4)
+
+    results_dir = storage.catalog_virtual_results_directory
+    assert (results_dir / first.ipc_path).exists()
+    assert (results_dir / second.ipc_path).exists()
+    assert not (storage.shared_virtual_results_directory / first.ipc_path).exists()
+
+
+@pytest.mark.worker
+def test_resolve_virtual_table_default_target_noversions_always_rebuilds():
+    """A NO_VERSIONS_HASH key must never be served from the exists() cache.
+
+    Without a source-version fingerprint identical plan bytes cannot prove
+    freshness (the plan records paths, not data), so a repeated identical
+    request must re-execute instead of returning the existing file.
+    """
+    plan = _plan_bytes()
+
+    def _request() -> models.ResolveVirtualTableResponse:
+        return funcs.resolve_virtual_table(
+            models.ResolveVirtualTableRequest(
+                table_id=29,
+                plan_bytes=plan,
+                source_versions_hash="noversions",
+            )
+        )
+
+    first = _request()
+    target = storage.catalog_virtual_results_directory / first.ipc_path
+    assert target.exists()
+
+    with patch("flowfile_worker.funcs.mp_context", wraps=funcs.mp_context) as mock_mp:
+        second = _request()
+        assert mock_mp.Process.call_count == 1
+
+    assert second.ipc_path == first.ipc_path
+    assert second.row_count == 3
+
+
+@pytest.mark.worker
+def test_resolve_virtual_table_default_target_plan_change_rotates_file():
+    """Changed plan bytes under the same versions hash produce a fresh snapshot.
+
+    This is what keeps a manual-input edit (new plan, unchanged '[]' sources)
+    from being served the previous materialisation.
+    """
+    key = "beefcafe" * 4
+
+    def _request(lf: pl.LazyFrame) -> models.ResolveVirtualTableResponse:
+        return funcs.resolve_virtual_table(
+            models.ResolveVirtualTableRequest(
+                table_id=37,
+                plan_bytes=lf.serialize(),
+                source_versions_hash=key,
+            )
+        )
+
+    first = _request(pl.LazyFrame({"a": [1, 2, 3]}))
+    second = _request(pl.LazyFrame({"a": [1, 2, 3, 4]}))
+
+    assert second.ipc_path != first.ipc_path
+    assert second.row_count == 4
+    target = storage.catalog_virtual_results_directory / second.ipc_path
+    assert pl.read_ipc(target)["a"].to_list() == [1, 2, 3, 4]
+
+
+@pytest.mark.worker
+def test_resolve_virtual_table_default_target_prunes_aged_superseded_siblings():
+    """A rotated versions hash drops the table's aged snapshots; recent and other-table files survive."""
+
+    def _request(versions_hash: str, table_id: int = 31) -> models.ResolveVirtualTableResponse:
+        return funcs.resolve_virtual_table(
+            models.ResolveVirtualTableRequest(
+                table_id=table_id,
+                plan_bytes=_plan_bytes(),
+                source_versions_hash=versions_hash,
+            )
+        )
+
+    results_dir = storage.catalog_virtual_results_directory
+    other = _request("0badf00d" * 4, table_id=98)
+    aged = _request("aaaaaaaa" * 4)
+    recent = _request("bbbbbbbb" * 4)
+    old = time.time() - funcs._SUPERSEDED_MIN_AGE_S - 60
+    os.utime(results_dir / aged.ipc_path, (old, old))
+
+    latest = _request("cccccccc" * 4)
+
+    assert not (results_dir / aged.ipc_path).exists()
+    assert (results_dir / recent.ipc_path).exists()
+    assert (results_dir / latest.ipc_path).exists()
+    assert (results_dir / other.ipc_path).exists()

@@ -23,8 +23,18 @@
         :viz="viz"
         @edit="openEditor(viz)"
         @delete="onDelete(viz)"
+        @share="onShare(viz)"
       />
     </div>
+
+    <ShareDialog
+      v-if="shareViz"
+      v-model="showShareDialog"
+      resource-type="visualization"
+      :resource-id="shareViz.id"
+      :resource-name="shareViz.name"
+      :can-manage-grants="canManageGrants(shareViz)"
+    />
 
     <el-dialog
       v-model="editorOpen"
@@ -32,9 +42,12 @@
       width="92vw"
       destroy-on-close
       append-to-body
+      :close-on-click-modal="false"
+      :before-close="onEditorBeforeClose"
     >
       <VisualizationEditor
         v-if="editorOpen"
+        ref="editorRef"
         :source="tableSource"
         :viz="editingViz"
         :appearance="appearance"
@@ -54,8 +67,18 @@ import { useGraphicWalkerAppearance } from "../../composables/useGraphicWalkerAp
 import type { CatalogVisualization, VizSourceDescriptor } from "../../types";
 import VisualizationCard from "./VisualizationCard.vue";
 import VisualizationEditor from "./VisualizationEditor.vue";
+import ShareDialog from "../../components/sharing/ShareDialog.vue";
+import { useResourceSharing } from "../../composables/useResourceSharing";
 
 const props = defineProps<{ tableId: number }>();
+
+const { canManageGrants } = useResourceSharing();
+const shareViz = ref<CatalogVisualization | null>(null);
+const showShareDialog = ref(false);
+const onShare = (viz: CatalogVisualization) => {
+  shareViz.value = viz;
+  showShareDialog.value = true;
+};
 
 const store = useCatalogStore();
 const appearance = useGraphicWalkerAppearance();
@@ -92,6 +115,28 @@ watch(
 const openEditor = (viz?: CatalogVisualization) => {
   editingViz.value = viz ?? null;
   editorOpen.value = true;
+};
+
+const editorRef = ref<InstanceType<typeof VisualizationEditor> | null>(null);
+
+// Flush the create-mode draft while GW is still mounted (same guard as the other hosts).
+const onEditorBeforeClose = async (done: () => void) => {
+  const editor = editorRef.value;
+  if (!editor?.isDirty) {
+    done();
+    return;
+  }
+  await editor.flushDraft();
+  try {
+    await ElMessageBox.confirm(
+      "Close the chart builder? Your work is kept as a draft on this device.",
+      "Close chart builder",
+      { confirmButtonText: "Close", cancelButtonText: "Keep editing", type: "warning" },
+    );
+    done();
+  } catch {
+    // stay open
+  }
 };
 
 const onSaved = () => {

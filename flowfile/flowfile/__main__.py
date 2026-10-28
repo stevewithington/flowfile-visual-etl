@@ -1,5 +1,8 @@
 #  flowfile/__main__.py
 
+import codecs
+import json
+import logging
 import sys
 from pathlib import Path
 
@@ -16,7 +19,7 @@ def run_flow(flow_path: str, param_overrides: list[str] | None = None, run_id: i
     Returns:
         Exit code (0 for success, 1 for failure)
     """
-    # Disable worker communication for CLI execution
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     from flowfile_core.configs.settings import OFFLOAD_TO_WORKER
 
     OFFLOAD_TO_WORKER.set(False)
@@ -50,7 +53,6 @@ def run_flow(flow_path: str, param_overrides: list[str] | None = None, run_id: i
         _complete_run_if_needed(run_id, success=False, nodes_completed=0)
         return 1
 
-    # Apply --param overrides
     if param_overrides:
         override_dict: dict[str, str] = {}
         for raw in param_overrides:
@@ -59,7 +61,6 @@ def run_flow(flow_path: str, param_overrides: list[str] | None = None, run_id: i
                 return 1
             key, _, value = raw.partition("=")
             override_dict[key.strip()] = value.strip()
-        # Update matching parameters; add new ones if they don't exist yet
         existing = {p.name: p for p in flow.flow_settings.parameters}
         from flowfile_core.schemas.schemas import FlowParameter
 
@@ -87,6 +88,18 @@ def run_flow(flow_path: str, param_overrides: list[str] | None = None, run_id: i
     flow.print_tree()
     print("-" * 40)
 
+    # Stamp registration id before running so writes record producer lineage (mirrors canvas).
+    from flowfile_core.flowfile.catalog_helpers import resolve_source_registration_id
+
+    resolve_source_registration_id(flow)
+
+    try:
+        from flowfile_core import telemetry
+
+        telemetry.install_headless()
+    except Exception:
+        pass
+
     try:
         result = flow.run_graph()
     except Exception as e:
@@ -99,16 +112,22 @@ def run_flow(flow_path: str, param_overrides: list[str] | None = None, run_id: i
         _complete_run_if_needed(run_id, success=False, nodes_completed=0)
         return 1
 
-    # Report results back to the pre-created run record
+    node_results = None
+    try:
+        node_results = json.dumps([nr.model_dump(mode="json") for nr in (result.node_step_result or [])])
+    except Exception as e:
+        print(f"Warning: node results serialization failed: {e}", file=sys.stderr)
+
     _complete_run_if_needed(
         run_id,
         success=result.success,
         nodes_completed=result.nodes_completed,
         number_of_nodes=result.number_of_nodes,
+        node_results_json=node_results,
     )
 
-    # Display results
     print("-" * 40)
+    exit_code = 0
     if result.success:
         duration = ""
         if result.start_time and result.end_time:
@@ -121,9 +140,17 @@ def run_flow(flow_path: str, param_overrides: list[str] | None = None, run_id: i
             if not node_result.success and node_result.error:
                 node_name = node_result.node_name or f"Node {node_result.node_id}"
                 print(f"  - {node_name}: {node_result.error}", file=sys.stderr)
-        return 1
+        exit_code = 1
 
-    return 0
+    # This process exits right after; a short budget, and whatever misses it is spooled for a later run.
+    try:
+        from flowfile_core import telemetry
+
+        telemetry.flush(0.3)
+    except Exception:
+        pass
+
+    return exit_code
 
 
 def _complete_run_if_needed(
@@ -131,6 +158,7 @@ def _complete_run_if_needed(
     success: bool,
     nodes_completed: int,
     number_of_nodes: int = 0,
+    node_results_json: str | None = None,
 ) -> None:
     """Report results back to a pre-created run record if run_id is provided."""
     if run_id is None:
@@ -143,9 +171,222 @@ def _complete_run_if_needed(
             success=success,
             nodes_completed=nodes_completed,
             number_of_nodes=number_of_nodes,
+            node_results_json=node_results_json,
         )
     except Exception as e:
         print(f"Warning: Failed to update run record {run_id}: {e}", file=sys.stderr)
+
+    # Deliver from the finishing subprocess instead of waiting for the next scheduler tick.
+    try:
+        from shared.notifications.processor import process_pending_notifications
+
+        process_pending_notifications()
+    except Exception as e:
+        print(f"Warning: Notification processing failed: {e}", file=sys.stderr)
+
+
+CONVERT_USAGE = "Usage: flowfile convert yxdb <file-or-dir> [--out DIR] [--csv] [--overwrite]"
+
+
+def _run_convert_command(component: str | None, target: str | None, out: str | None, csv: bool, overwrite: bool) -> int:
+    """Convert Alteryx `.yxdb` data files the importer cannot read from an uploaded workflow."""
+    if component != "yxdb":
+        print(CONVERT_USAGE, file=sys.stderr)
+        return 1
+    if not target:
+        print(CONVERT_USAGE, file=sys.stderr)
+        return 1
+
+    source = Path(target)
+    if not source.exists():
+        print(f"Error: File not found: {target}", file=sys.stderr)
+        return 1
+
+    from flowfile_core.flowfile.converters.alteryx.yxdb import ConversionStats, convert_tree, convert_yxdb
+
+    out_dir = Path(out) if out else None
+    suffix = ".csv" if csv else ".parquet"
+    if source.is_dir():
+        results = convert_tree(source, out_dir, csv=csv, overwrite=overwrite)
+    else:
+        destination = out_dir / source.with_suffix(suffix).name if out_dir else None
+        try:
+            results = [convert_yxdb(source, destination, csv=csv, overwrite=overwrite)]
+        except Exception as exc:
+            results = [ConversionStats(source=source, error=str(exc))]
+
+    if not results:
+        print(f"No .yxdb files found under {source}")
+        return 0
+
+    failed = 0
+    skipped = 0
+    for stats in results:
+        if not stats.ok:
+            failed += 1
+            print(f"FAILED  {stats.source}: {stats.error}", file=sys.stderr)
+        elif stats.skipped:
+            skipped += 1
+            print(f"skipped {stats.source} -> {stats.destination} already exists (use --overwrite)")
+        else:
+            print(
+                f"{stats.source} -> {stats.destination}  {stats.rows} rows x {stats.columns} cols  {stats.seconds:.2f}s"
+            )
+        for warning in stats.warnings:
+            print(f"        warning: {warning}")
+
+    converted = len(results) - failed - skipped
+    print(f"{converted} converted, {skipped} skipped, {failed} failed")
+    return 1 if failed else 0
+
+
+IMPORT_USAGE = "Usage: flowfile import alteryx <file-or-dir> [--inspect] [--format md|json] [--out DIR] [--overwrite]"
+
+
+def _import_reports(source: Path) -> tuple[list, list[str]]:
+    """Convert every workflow under *source*, returning the results and the files that would not parse."""
+    from flowfile_core.flowfile.converters.alteryx import YxmdParseError, convert_yxmd
+
+    files = sorted(source.rglob("*.yxmd")) if source.is_dir() else [source]
+    results, failures = [], []
+    for path in files:
+        try:
+            results.append((path, convert_yxmd(path.read_bytes(), source_name=path.name)))
+        except YxmdParseError as exc:
+            failures.append(f"{path}: {exc}")
+        except Exception as exc:
+            failures.append(f"{path}: {type(exc).__name__}: {exc}")
+    return results, failures
+
+
+def _import_destination(path: Path, source: Path, out_dir: Path | None) -> Path:
+    """Where a converted workflow is written: beside the source, or mirrored under ``--out``."""
+    if out_dir is None:
+        return path.with_suffix(".yaml")
+    if source.is_dir():
+        return out_dir / path.relative_to(source).with_suffix(".yaml")
+    return out_dir / path.with_suffix(".yaml").name
+
+
+def _run_import_command(
+    component: str | None,
+    target: str | None,
+    inspect: bool,
+    fmt: str,
+    out: str | None,
+    overwrite: bool = False,
+) -> int:
+    """Convert Alteryx workflows to Flowfile flows, or just report what the conversion would do."""
+    if component != "alteryx" or not target:
+        print(IMPORT_USAGE, file=sys.stderr)
+        return 1
+
+    source = Path(target)
+    if not source.exists():
+        print(f"Error: File not found: {target}", file=sys.stderr)
+        return 1
+
+    from flowfile_core.flowfile.converters.alteryx import build_report, dump_flow_yaml
+
+    results, failures = _import_reports(source)
+    for failure in failures:
+        print(f"FAILED  {failure}", file=sys.stderr)
+    if not results:
+        if not failures:
+            print(f"No .yxmd workflows found under {source}", file=sys.stderr)
+        return 1
+
+    if inspect:
+        # One pooled report over a directory, so the table describes the whole corpus.
+        if source.is_dir():
+            rows = [row for _, result in results for row in result.report.rows]
+            report = build_report(source.resolve().name, rows)
+        else:
+            report = results[0][1].report
+        rendered = (
+            report.to_markdown()
+            if fmt == "md"
+            else json.dumps(report.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n"
+        )
+        if out:
+            Path(out).write_text(rendered, encoding="utf-8")
+            print(f"{len(results)} workflow(s) inspected -> {out}")
+        else:
+            print(rendered, end="")
+        return 1 if failures else 0
+
+    out_dir = Path(out) if out else None
+    skipped = 0
+    for path, result in results:
+        destination = _import_destination(path, source, out_dir)
+        if destination.exists() and not overwrite:
+            skipped += 1
+            print(f"skipped {path} -> {destination} already exists (use --overwrite)")
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("w", encoding="utf-8") as handle:
+            dump_flow_yaml(result.flow_data, handle)
+        coverage = result.report.coverage
+        print(f"{path} -> {destination}  {coverage.mapped}/{coverage.tools} tools mapped")
+    return 1 if failures or skipped else 0
+
+
+def _run_project_command(action: str | None, arg: str | None) -> None:
+    """Headless project init/open/save — the proof that build-from-scratch works without the UI."""
+    from fastapi import HTTPException
+
+    from flowfile_core.auth.utils import get_local_user_id
+    from flowfile_core.fileExplorer.funcs import validate_path_under_cwd
+    from flowfile_core.project import project_sync
+
+    def _validated_folder(usage: str) -> str:
+        if not arg:
+            print(usage, file=sys.stderr)
+            sys.exit(1)
+        try:
+            return validate_path_under_cwd(arg)
+        except HTTPException as e:
+            print(f"Invalid project path: {e.detail}", file=sys.stderr)
+            sys.exit(1)
+
+    owner_id = get_local_user_id()
+    if action == "init":
+        folder = _validated_folder("Usage: flowfile project init <folder>")
+        project = project_sync.init_project(folder, Path(folder).name, owner_id)
+        print(f"Initialized project '{project.name}' at {project.root}")
+    elif action == "open":
+        folder = _validated_folder("Usage: flowfile project open <folder>")
+        project, result = project_sync.open_project(folder, owner_id)
+        print(f"Opened project '{project.name}' at {project.root}")
+        print(
+            f"Imported: flows={result.imported_flows}, "
+            f"connections={result.imported_connections}, schedules={result.imported_schedules}"
+        )
+        missing = len(result.placeholder_secrets)
+        if missing:
+            print(f"{missing} value(s) need to be set (FLOWFILE_SECRET_<NAME> or update them in the app).")
+    elif action == "save":
+        if not arg:
+            print('Usage: flowfile project save "<message>"', file=sys.stderr)
+            sys.exit(1)
+        sha = project_sync.save_version(owner_id, arg)
+        print(f"Saved version {sha[:8] if sha else '(no changes)'}")
+    else:
+        print("Usage: flowfile project {init|open|save} <folder-or-message>", file=sys.stderr)
+        sys.exit(1)
+
+
+def _use_utf8_stdio() -> None:
+    """Switch stdout and stderr to UTF-8 when they are not already.
+
+    Windows encodes a redirected stream (a pipe, a file, ``DEVNULL``, a scheduled run's log) in the ANSI code page,
+    which cannot encode the glyphs ``FlowGraph.print_tree`` draws or a non-Latin flow or node name, so printing
+    them would end ``flowfile run flow`` with a ``UnicodeEncodeError``.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None)
+        if hasattr(stream, "reconfigure") and encoding and codecs.lookup(encoding).name != "utf-8":
+            stream.reconfigure(encoding="utf-8", errors=stream.errors)
 
 
 def main():
@@ -154,10 +395,23 @@ def main():
     """
     import argparse
 
+    _use_utf8_stdio()
     parser = argparse.ArgumentParser(description="FlowFile: A visual ETL tool with a Polars-like API")
-    parser.add_argument("command", nargs="?", choices=["run"], help="Command to execute")
-    parser.add_argument("component", nargs="?", choices=["ui", "core", "worker", "flow"], help="Component to run")
-    parser.add_argument("file_path", nargs="?", help="Path to flow file (for 'flow' component)")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["run", "seed-demo", "remove-demo", "project", "convert", "import"],
+        help="Command to execute",
+    )
+    parser.add_argument(
+        "component",
+        nargs="?",
+        choices=["ui", "core", "worker", "flow", "init", "open", "save", "yxdb", "alteryx"],
+        help="Component to run, project sub-command (init/open/save), convert format (yxdb) or import format (alteryx)",
+    )
+    parser.add_argument(
+        "file_path", nargs="?", help="Flow file path, project folder, version message, or file/dir to convert"
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind the server to")
     parser.add_argument("--port", type=int, default=63578, help="Port to bind the server to")
     parser.add_argument("--no-browser", action="store_true", help="Don't open a browser window")
@@ -169,8 +423,17 @@ def main():
         help="Override a flow parameter (can be used multiple times): --param input_dir=/data --param threshold=100",
     )
     parser.add_argument("--run-id", type=int, default=None, help="Pre-created run ID for scheduled runs")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Output directory for convert and import, or the file an --inspect report goes to "
+        "(default: beside the source)",
+    )
+    parser.add_argument("--inspect", action="store_true", help="Report what an import would do without writing a flow")
+    parser.add_argument("--format", default="md", choices=["md", "json"], help="Format of the --inspect report")
+    parser.add_argument("--csv", action="store_true", help="Convert to CSV instead of Parquet")
+    parser.add_argument("--overwrite", action="store_true", help="Replace existing converted files or flows")
 
-    # Parse arguments
     args = parser.parse_args()
 
     if args.command == "run" and args.component:
@@ -197,16 +460,29 @@ def main():
                 print("Usage: flowfile run flow <path-to-flow-file>", file=sys.stderr)
                 sys.exit(1)
             sys.exit(run_flow(args.file_path, param_overrides=args.params, run_id=args.run_id))
+    elif args.command == "convert":
+        sys.exit(
+            _run_convert_command(args.component, args.file_path, out=args.out, csv=args.csv, overwrite=args.overwrite)
+        )
+    elif args.command == "import":
+        sys.exit(
+            _run_import_command(
+                args.component, args.file_path, args.inspect, args.format, args.out, overwrite=args.overwrite
+            )
+        )
+    elif args.command == "project":
+        _run_project_command(args.component, args.file_path)
+    elif args.command in ("seed-demo", "remove-demo"):
+        from flowfile_core.catalog.demo_seed import remove_demo_catalog, seed_demo_catalog
+
+        if args.command == "seed-demo":
+            print(f"Demo catalog seeded: {seed_demo_catalog()}")
+        else:
+            print(f"Demo catalog removed: {remove_demo_catalog()}")
     else:
-        # Default action - show info
-        from importlib.metadata import PackageNotFoundError, version
+        from shared._version import get_version
 
-        try:
-            __version__ = version("Flowfile")
-        except PackageNotFoundError:
-            __version__ = "unknown"
-
-        print(f"FlowFile v{__version__}")
+        print(f"FlowFile v{get_version()}")
         print("A framework combining visual ETL with a Polars-like API")
         print("\nUsage:")
         print("  # Start the FlowFile web UI with integrated services")
@@ -214,6 +490,19 @@ def main():
         print("")
         print("  # Run a flow from a file")
         print("  flowfile run flow my_pipeline.yaml")
+        print("")
+        print("  # Convert Alteryx .yxdb data files to Parquet (needs: pip install 'flowfile[yxdb]')")
+        print("  flowfile convert yxdb my_data.yxdb")
+        print("  flowfile convert yxdb ./alteryx_data --out ./parquet_data")
+        print("")
+        print("  # Import Alteryx workflows, or report what the conversion would do")
+        print("  flowfile import alteryx my_workflow.yxmd")
+        print("  flowfile import alteryx ./workflows --inspect --format md --out coverage.md")
+        print("  # Alteryx is a trademark of Alteryx, Inc.; Flowfile is not affiliated with or endorsed by Alteryx.")
+        print("")
+        print("  # Load or remove the optional demo catalog")
+        print("  flowfile seed-demo")
+        print("  flowfile remove-demo")
         print("")
         print("  # Advanced: Run individual components")
         print("  flowfile run core  # Start only the core service")

@@ -6,6 +6,7 @@ runs in the spawned child, never in the FastAPI process.
 
 from __future__ import annotations
 
+import io
 import logging
 import time
 from typing import Any
@@ -25,7 +26,13 @@ def _build_sql_lazyframe_in_child(
     tables: dict[str, str] | None,
     virtual_refs: dict[str, str] | None,
 ) -> pl.LazyFrame:
+    from shared.sql_validation import validate_sql_query
+
+    # Re-validate server-side: the worker must not trust the core caller.
+    validate_sql_query(sql_query)
+
     ctx = pl.SQLContext()
+    # Cloud tables are excluded upstream (resolve_all_queryable_tables); dir_name is always local here.
     for name, dir_name in (tables or {}).items():
         ctx.register(name, open_catalog_table(dir_name))
     if virtual_refs:
@@ -47,6 +54,11 @@ def _build_viz_loader_in_child(source: models.VizWorkerSource) -> pl.LazyFrame:
         if not source.ipc_path:
             raise ValueError("ipc_path is required for ipc_path source")
         return open_virtual_result(source.ipc_path)
+    if source.kind == "plan":
+        if not source.plan_bytes:
+            raise ValueError("plan_bytes is required for plan source")
+        # Held lazily, like the physical/sql kinds — never collected here.
+        return pl.LazyFrame.deserialize(io.BytesIO(source.plan_bytes))
     raise ValueError(f"Unknown viz source kind: {source.kind}")
 
 

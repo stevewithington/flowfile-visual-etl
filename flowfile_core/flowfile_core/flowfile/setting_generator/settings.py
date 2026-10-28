@@ -3,6 +3,8 @@ from functools import wraps
 
 from pl_fuzzy_frame_match.models import FuzzyMapping
 
+from flowfile_core.flowfile.filter_expressions import build_filter_expression, resolve_filter_field_type
+from flowfile_core.flowfile.flow_data_engine.flow_file_column.main import FlowfileColumn
 from flowfile_core.flowfile.setting_generator.setting_generator import SettingGenerator, SettingUpdator
 from flowfile_core.schemas import input_schema, transform_schema
 from flowfile_core.schemas.output_model import NodeData
@@ -11,11 +13,24 @@ setting_generator = SettingGenerator()
 setting_updator = SettingUpdator()
 
 
+_NODE_FIELDS = ("description", "node_reference", "cache_results", "group_id", "pos_x", "pos_y")
+
+
+def _carry_node_fields(promise: input_schema.NodePromise, proposal) -> None:
+    """Keep what the user already set on the placeholder (e.g. its description) in the generated proposal."""
+    for field in _NODE_FIELDS:
+        if field in type(proposal).model_fields and getattr(promise, field, None) is not None:
+            setattr(proposal, field, getattr(promise, field))
+
+
 def setting_generator_method(f: callable) -> Callable:
     @wraps(f)
     def inner(node_data: NodeData) -> NodeData:
-        if node_data.setting_input is None or isinstance(node_data.setting_input, input_schema.NodePromise):
+        promise = node_data.setting_input
+        if promise is None or isinstance(promise, input_schema.NodePromise):
             f(node_data)
+            if promise is not None and node_data.setting_input is not promise:
+                _carry_node_fields(promise, node_data.setting_input)
         return node_data
 
     setting_generator.add_setting_generator_func(inner)
@@ -23,9 +38,12 @@ def setting_generator_method(f: callable) -> Callable:
 
 
 def setting_updator_method(f: callable) -> Callable:
+    """Register an updator that refreshes settings for display; it edits a copy, never the node's own settings."""
+
     @wraps(f)
     def inner(node_data: NodeData) -> NodeData:
         if node_data.setting_input is not None and not isinstance(node_data.setting_input, input_schema.NodePromise):
+            node_data.setting_input = node_data.setting_input.model_copy(deep=True)
             f(node_data)
         return node_data
 
@@ -75,7 +93,6 @@ def cross_join(node_data: "NodeData") -> NodeData:
 @setting_generator_method
 def filter(node_data: "NodeData") -> NodeData:
     if node_data.main_input:
-        # Default to basic mode with an empty basic filter
         basic_filter = transform_schema.BasicFilter(
             field="",
             operator=transform_schema.FilterOperator.EQUALS,
@@ -96,7 +113,6 @@ def join(node_data: NodeData):  # noqa: F811
         right_columns = set(node_data.right_input.columns)
         left_select = setting_input.join_input.left_select
         right_select = setting_input.join_input.right_select
-        # Update is_available based on whether column exists in input
         for ls in left_select.renames:
             ls.is_available = ls.old_name in left_columns
         for rs in right_select.renames:
@@ -127,7 +143,6 @@ def cross_join(node_data: NodeData):  # noqa: F811
         right_columns = set(node_data.right_input.columns)
         left_select = setting_input.cross_join_input.left_select
         right_select = setting_input.cross_join_input.right_select
-        # Update is_available based on whether column exists in input
         for ls in left_select.renames:
             ls.is_available = ls.old_name in left_columns
         for rs in right_select.renames:
@@ -147,6 +162,34 @@ def cross_join(node_data: NodeData):  # noqa: F811
         for mirc in missing_incoming_right_columns:
             select_input = transform_schema.SelectInput(old_name=mirc, keep=setting_input.auto_keep_right)
             setting_input.cross_join_input.add_new_select_column(select_input, "right")
+    return node_data
+
+
+@setting_updator_method
+def filter(node_data: NodeData):  # noqa: F811
+    """Show a basic filter's run-time expression as ``advanced_filter`` so the advanced editor opens pre-filled."""
+    filter_input: transform_schema.FilterInput = node_data.setting_input.filter_input
+    basic_filter = filter_input.basic_filter
+    if filter_input.is_advanced() or basic_filter is None or not basic_filter.field:
+        return node_data
+    schema = node_data.main_input.table_schema if node_data.main_input else []
+    column = next((c for c in schema if c.name == basic_filter.field), None)
+    field_type = resolve_filter_field_type(FlowfileColumn.from_input(column.name, column.data_type)) if column else None
+    try:
+        filter_input.advanced_filter = build_filter_expression(basic_filter, field_type)
+    except Exception:
+        # An incomplete basic filter (e.g. "between" without its upper bound) must not stop the drawer loading.
+        pass
+    return node_data
+
+
+@setting_updator_method
+def select(node_data: NodeData):
+    """Mark the columns the input no longer has (a run works on a copy and never flags them itself)."""
+    if node_data.main_input:
+        columns = set(node_data.main_input.columns)
+        for select_input in node_data.setting_input.select_input:
+            select_input.is_available = select_input.old_name in columns
     return node_data
 
 
@@ -170,7 +213,6 @@ def fuzzy_match(node_data: NodeData):
         right_select = setting_input.join_input.right_select
         for fuzzy_map in setting_input.join_input.join_mapping:
             fuzzy_map.valid = check_if_fuzzy_match_is_valid(left_columns, right_columns, fuzzy_map)
-        # Update is_available based on whether column exists in input
         for ls in left_select.renames:
             ls.is_available = ls.old_name in left_columns
         for rs in right_select.renames:

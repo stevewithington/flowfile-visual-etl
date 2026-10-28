@@ -1,126 +1,161 @@
-# How to Connect and Work with PostgreSQL Databases in Flowfile
+# Connect to a PostgreSQL database
 
-### ![Full overview](../../../assets/images/guides/database_connectivity/main_image.png) Full flow overview
+This tutorial connects Flowfile to a PostgreSQL database, reads a table, enriches and aggregates it, and writes the ranked result back to a new table. The default walkthrough uses a **local PostgreSQL you can spin up in one command**, so the whole flow is reproducible end to end — the same flow runs in Flowfile's CI on every change. [Connecting to Supabase](#connecting-to-supabase) at the end covers a hosted database as a special case.
 
-Flowfile's latest release introduces powerful database connectivity features that allow you to seamlessly integrate with PostgreSQL databases like Supabase. In this guide, I'll walk you through the entire process of connecting to a database, reading data, transforming it, and writing it back.
+!!! info "Not in Flowfile Lite"
+    Database connectivity requires the full desktop/server build. This tutorial does not apply to the browser-only [Flowfile Lite](../../deployment/lite.md) edition, which has no backend.
 
-## Prerequisites
+![Full flow overview](../../../assets/images/guides/database_connectivity/main_image.png)
 
-Before diving in, make sure you have:
+*The finished flow: read a table, enrich and aggregate it, rank, and write back.*
 
--   A Flowfile account (free tier works fine)
--   A Supabase account ([sign up here](https://supabase.com) if needed)
--   Sample data to work with (we're using the [Sales Forecasting Dataset](https://www.kaggle.com/datasets/rohitsahoo/sales-forecasting) from Kaggle **so you can easily follow along with the transformation examples**)
+**Flow file:** [`database_transform_write.yaml`](https://github.com/edwardvaneechoud/Flowfile/blob/main/docs/assets/flows/database_transform_write.yaml) · [download](../../../assets/flows/database_transform_write.yaml)
 
-## Step 1: Set Up Your Supabase Database
+## Set up a database to follow along
 
-1.  Create a new project in Supabase.
-2.  Download the sample dataset from Kaggle.
-3.  Create a new table in your Supabase project (e.g., `superstore_sales_data`).
-4.  Import the dataset into your table (hint: use Supabase's built-in CSV import feature via the Table Editor).
-5.  Note your database connection details (host, port, username, password).
+You need a PostgreSQL server with a table to read. Any server works; the walkthrough uses a sample **movies** table (~4,800 films with budget, revenue, and rating columns).
 
-## Step 2: Configure Your Database Connection in Flowfile
+=== "Local sample (from a checkout)"
 
-1.  Open Flowfile and navigate to the **Connections** page from the left sidebar, then select the **Database** tab.
-2.  Click **"Create New Connection"**.
-3.  Fill in your connection details:
-    *   Connection Name: `supa_base_connection` (or any name you prefer)
-    *   Database Type: PostgreSQL
-    *   Host: Your Supabase host (e.g., `aws-0-eu-central-1.pooler.supabase.com`)
-    *   Port: `5432`
-    *   Database: `postgres`
-    *   Username: Your Supabase username
-    *   Password: Your Supabase password
-    *   Enable SSL: Check if required by your database (Supabase typically requires it).
-4.  Click **"Update Connection"** to save.
+    If you have the repository checked out, one command builds a Postgres container preloaded with the movies sample:
 
-<!-- should show the new tabbed Connections page with the Database tab and a saved connection -->
-### ![db_connection](../../../assets/images/guides/database_connectivity/db_connection.png) Connection overview in Flowfile
+    ```bash
+    poetry run start_postgres
+    ```
 
-## Step 3: Create a New Data Flow
+    It listens on `localhost:5433` — database `testdb`, user `testuser`, password `testpass`. Stop it later with `poetry run stop_postgres`.
 
-1.  Click **"Create"** or **"New Flow"** to start a fresh workflow.
-2.  Navigate to the "Data actions" panel on the left sidebar.
-3.  Find the "Read from Database" node (look for the database icon).
-4.  Drag and drop this node onto your canvas.
+=== "Your own PostgreSQL"
 
-## Step 4: Configure Your Database Read Operation
+    Point the connection below at any PostgreSQL server you can reach, and substitute your own table and columns in the steps that follow.
 
-1.  Click on the "Read from Database" node to open its settings panel.
-2.  Select **"reference"** for Connection Mode (this tells Flowfile to use the connection you configured in Step 2).
-3.  Choose your `supa_base_connection` from the Connection dropdown.
-4.  Configure the table settings:
-    *   Schema: `public` (or your specific schema)
-    *   Table: `superstore_sales_data`
-5.  Click **"Validate Settings"** to ensure everything is working.
-6.  You should see a green confirmation message: "Query settings are valid".
+## Create a database connection
 
-### ![configure_read_db](../../../assets/images/guides/database_connectivity/configure_read_db.png) Node Settings panel showing database read configuration
+Save the credentials once so every flow can reference them by name — the flow file never stores the secret.
 
-## Step 5: Run Your Initial Flow
+1. Open **Settings → Connections → All connections** in the left sidebar, then select the **Database** tab.
+2. Click **Add Connection**.
+3. Fill in the fields:
+    - **Connection Name**: `analytics-postgres` (the name the flow and Python example below expect)
+    - **Database Type**: PostgreSQL
+    - **Host**: `localhost` (or your server's host)
+    - **Port**: `5433` (the local sample) or `5432` (a standard server)
+    - **Database**: `testdb`
+    - **Username** / **Password**: `testuser` / `testpass` (or your credentials)
+    - **Enable SSL**: check if your server requires it
+4. Click **Update Connection** to save.
 
-1.  Click the **"Run"** button in the top toolbar.
-2.  Watch the flow execution in the log panel at the bottom.
-3.  When completed, you'll see a success message and the number of records processed.
-4.  You can now click on the node output dot to preview the data that was read from your database.
+![Connection overview in Flowfile](../../../assets/images/guides/database_connectivity/db_connection.png)
 
-### ![initial_run_success](../../../assets/images/guides/database_connectivity/initial_run.png) Flow execution logs showing successful database read operation
-*Ensure the image `initial_run.png` shows the successful run log/node status, not the configuration panel again.*
+*A saved PostgreSQL connection on the Connections page.*
 
-## Step 6: Add Data Transformations
+See [Connections](../connections.md#database-connections) for a full field reference.
 
-Now that you've successfully read data from your database, you can add transformation steps:
+## Build the flow
 
-1.  Add transformation nodes from the "Data actions" panel to your workflow.
-    *   For example, creating time-to-ship metrics by category:
-        *   Add formula nodes to transform the `shipping_date` and `delivery_date` columns to a proper date type if needed.
-        *   Add a "Formula" node to calculate shipping time (e.g., `delivery_date - shipping_date`). Name the new column `shipping_time_days`.
-        *   Add a "Group by" node to aggregate by product category.
-        *   In the "Group by" node, calculate `min`, `max`, and `median` of the `shipping_time_days` column.
-2.  Connect these nodes in sequence by dragging from the output dot of one node to the input dot of the next.
-3.  Configure each node with the specific transformations you need (refer to the Flowfile documentation for details on specific node configurations if needed).
+The flow reads the table, derives a column, filters, aggregates several metrics per language, keeps well-sampled languages, ranks them, and writes the result back.
 
-### ![transformations](../../../assets/images/guides/database_connectivity/transformations.png) Overview of connected transformation nodes (Read -> Formula -> Group By)
+### 1. Read from the database
 
-## Step 7: Add a Write to Database Node
+1. Drag a **Read from Database** node onto the canvas.
+2. Set **Connection Mode** to **reference** and pick `analytics-postgres`.
+3. Set **Schema** to `public` and **Table** to `movies`.
+4. Click **Validate Settings**, then **Run** and click the node to preview the rows.
 
-1.  From the "Data actions" panel, find and drag the "Write to Database" node onto your canvas.
-2.  Connect it to the output of the last transformation node (e.g., the "Group by" node).
-3.  Configure the write operation in its settings panel:
-    *   Connection Mode: Select **"reference"**.
-    *   Connection: Choose your `supa_base_connection`.
-    *   Schema: `public` (or your desired schema).
-    *   Table: Enter a name for your new output table (e.g., `time_to_ship_per_category`).
-    *   Write Mode: Select how to handle the table if it already exists:
-        *   **"Append"**: Add new data to the table.
-        *   **"Replace"**: Delete the existing table and create a new one with the output data.
-        *   **"Fail"**: Abort the flow if the table already exists.
+![Database read configuration](../../../assets/images/guides/database_connectivity/configure_read_db.png)
 
-### ![configure_write_db](../../../assets/images/guides/database_connectivity/configure_write_db.png) Setup write to database node configuration panel
-*Ensure the image `configure_write_db.png` actually shows the "Write to Database" node's configuration panel.*
+*The Read from Database node configured in reference mode.*
 
-## Step 8: Run Your Complete Workflow
+![Successful database read run](../../../assets/images/guides/database_connectivity/initial_run.png)
 
-1.  Click **"Run"** to execute the full workflow from start to finish.
-2.  The system will:
-    *   Read data from your source Supabase table (`superstore_sales_data`).
-    *   Apply all the transformation steps (calculate shipping time, group by category).
-    *   Write the aggregated results to your destination Supabase table (`time_to_ship_per_category`).
-3.  Check the logs to confirm successful execution, including messages about records read and written.
-4.  Navigate to your Supabase project, open the SQL Editor or Table Editor, and check the `public.time_to_ship_per_category` table to see your newly created data!
+### 2. Enrich, filter, and aggregate
 
-### ![supabase_result_table](../../../assets/images/guides/database_connectivity/result.png) Overview of the final result table in Supabase
-*Ensure the image `result.png` shows the data in the newly created Supabase table.*
+1. Add a **Formula** node to derive `profit` as `[revenue] - [budget]`.
+2. Add a **Filter** node keeping only films with real financials: `[budget] > 0 and [revenue] > 0`.
+3. Add a **Group by** node keyed on `original_language`, aggregating:
+    - count of `title` → `films`
+    - mean of `vote_average` → `avg_score`
+    - sum of `profit` → `total_profit`
+    - median of `profit` → `median_profit`
+4. Add a second **Filter** to keep languages with `[films] >= 10`, then a **Sort** on `total_profit` descending.
 
-## Conclusion
+For per-node settings, see [Data Actions](../nodes/index.md).
 
-Flowfile's database integration capabilities make it incredibly simple to build professional-grade data pipelines without writing code. By connecting to Supabase or other PostgreSQL databases, you can easily extract, transform, and load data in a visual, intuitive environment.
+![Connected transformation nodes](../../../assets/images/guides/database_connectivity/transformations.png)
 
-Whether you're creating business dashboards, data warehousing solutions, or just exploring your data, the combination of Flowfile's visual workflow and Supabase's powerful PostgreSQL hosting gives you a robust platform for all your data needs.
+*Read → Formula → Filter → Group by → Filter → Sort.*
 
-Feel free to experiment with different transformation nodes and workflow patterns to build increasingly sophisticated data pipelines!
+### 3. Write the result back
 
----
+1. Drag a **Write to Database** node onto the canvas and connect it to the **Sort** node.
+2. In its settings panel:
+    - **Connection Mode**: **reference**
+    - **Connection**: `analytics-postgres`
+    - **Schema**: `public`
+    - **Table**: `language_profitability`
+    - **If Table Exists**: **Replace** (drop and recreate), **Append**, or **Fail**
 
-*This guide is based on Flowfile v0.2.0, which introduced database connectivity features including PostgreSQL support, secure credential storage, and flexible connection management options.*
+![Write to Database configuration](../../../assets/images/guides/database_connectivity/configure_write_db.png)
+
+*The Write to Database node in reference mode.*
+
+## Run it
+
+Click **Run** to execute the whole flow. Flowfile reads `movies`, applies the transformations, and writes the ranked result to `language_profitability`. Query the destination table to confirm — five languages remain, ranked by total profit:
+
+| original_language | films | avg_score | total_profit |
+|---|---|---|---|
+| en | 3102 | 6.287 | 257,105,728,489 |
+| ja | 13 | 7.192 | 853,264,950 |
+| zh | 13 | 6.338 | 546,289,508 |
+| fr | 25 | 6.824 | 376,482,920 |
+| es | 15 | 6.927 | 350,284,666 |
+
+![Result table in the database](../../../assets/images/guides/database_connectivity/result.png)
+
+*The destination table populated with the ranked result.*
+
+## The flow file
+
+The finished flow is committed and runs in CI against the local Postgres sample, so it can't drift from a working pipeline. Download it and open it in Flowfile from the **Home** page's **Open flow** tile, or inspect it below — it references the connection by name only, so it carries no credentials.
+
+<details markdown="1">
+<summary>See the flow YAML</summary>
+
+```yaml
+--8<-- "docs/assets/flows/database_transform_write.yaml"
+```
+
+</details>
+
+## In Python
+
+The same flow with the [`flowfile` Python API](../../python-api/index.md). Reference-mode database nodes become `ff.read_database()` / `write_database()` calls, so a flow built in the editor and one written in Python are the same graph. This snippet is included from a repository file that runs in CI against the local Postgres sample:
+
+```python
+--8<-- "docs/examples/integrations/database_transform_write.py:example"
+```
+
+## Connecting to Supabase
+
+[Supabase](https://supabase.com) is hosted PostgreSQL — the only differences from the walkthrough above are the connection details:
+
+- **Host**: your project's pooler host, e.g. `aws-0-eu-central-1.pooler.supabase.com`
+- **Port**: `5432`
+- **Database**: `postgres`
+- **Enable SSL**: on (Supabase requires it)
+
+Load a table (the Table Editor has a CSV import), then use it as the source in the read step. Everything downstream — transform, aggregate, write back — is identical.
+
+## Next steps
+
+- Reference the same connection in other flows — no need to re-enter credentials.
+- Export the flow to Python with the [Code Generator](code-generator.md).
+- Schedule the flow to refresh on a timer — see [Schedules](../catalog/schedules.md).
+
+## Related documentation
+
+- [Connections](../connections.md) — saved database, cloud, and Kafka connections
+- [Input Nodes: Database Reader](../nodes/input.md#database-reader)
+- [Output Nodes: Database Writer](../nodes/output.md#database-writer)
+- [Secrets](../catalog/secrets.md) — how credentials are encrypted

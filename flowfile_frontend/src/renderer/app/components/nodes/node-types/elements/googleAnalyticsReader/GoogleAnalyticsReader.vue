@@ -1,10 +1,23 @@
 <template>
   <div v-if="dataLoaded && nodeGaReader" class="ga-reader-container">
     <generic-node-settings
+      ref="genericSettingsRef"
       v-model="nodeGaReader"
       @update:model-value="handleGenericSettingsUpdate"
       @request-save="saveSettings"
     >
+      <div v-if="!nodeGaReader.cache_results" class="ga-reader-tip">
+        <i class="fa-solid fa-lightbulb"></i>
+        <span>
+          <strong>Tip:</strong> loading data from Google Analytics can be slow. Store the result in
+          the <strong>catalog</strong>, or
+          <button type="button" class="ga-reader-tip-link" @click="openCacheSetting">
+            cache it
+          </button>
+          on this node, for instant access and a better developer experience.
+        </span>
+      </div>
+
       <div class="listbox-wrapper">
         <div class="form-group">
           <label for="ga-connection-select">Google Analytics Connection</label>
@@ -31,12 +44,31 @@
                 </template>
               </option>
             </select>
+            <div v-if="gaConnections.length === 0" class="connection-cta">
+              <i class="fa-solid fa-circle-info"></i>
+              <div class="connection-cta-body">
+                <span>No Google Analytics connections yet — set one up to use this node.</span>
+                <button
+                  type="button"
+                  class="btn btn-primary cta-button"
+                  @click="goToConnectionSetup"
+                >
+                  <i class="fa-solid fa-up-right-from-square"></i>
+                  Set up a connection
+                </button>
+              </div>
+            </div>
             <div
-              v-if="!nodeGaReader.google_analytics_settings.ga_connection_name"
+              v-else-if="!nodeGaReader.google_analytics_settings.ga_connection_name"
               class="helper-text"
             >
               <i class="fa-solid fa-info-circle"></i>
-              <span>Create a Google Analytics connection in the Connections manager first.</span>
+              <span>
+                Select a connection above, or
+                <button type="button" class="link-button" @click="goToConnectionSetup">
+                  set up a new one</button
+                >.
+              </span>
             </div>
             <div v-else-if="connectionDefaultPropertyId" class="helper-text">
               <i class="fa-solid fa-info-circle"></i>
@@ -451,6 +483,7 @@
 //   - SortBuilder.vue: sort rows (~lines 366-441)
 import { CodeLoader } from "vue-content-loader";
 import { computed, ref } from "vue";
+import { useRouter } from "vue-router";
 import { ElMessage, ElOption, ElOptionGroup, ElSelect } from "element-plus";
 import GenericNodeSettings from "../../../baseNode/genericNodeSettings.vue";
 import { useNodeStore } from "../../../../../stores/node-store";
@@ -478,6 +511,11 @@ const nodeStore = useNodeStore();
 const dataLoaded = ref<boolean>(false);
 const nodeGaReader = ref<NodeGoogleAnalyticsReader | null>(null);
 
+// Template ref to the settings wrapper so the "cache it" tip can jump to its
+// General Settings tab (where the Cache Results toggle lives).
+const genericSettingsRef = ref<{ openCacheSetting: () => void } | null>(null);
+const openCacheSetting = () => genericSettingsRef.value?.openCacheSetting();
+
 const metricsError = computed(() => {
   if (!nodeGaReader.value) return "";
   const settings = nodeGaReader.value.google_analytics_settings;
@@ -495,6 +533,17 @@ const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSetti
     }
   },
 });
+
+const router = useRouter();
+
+// When there's no connection to pick, the node is a dead end. Save any
+// in-progress edits, then jump to the GA connection page so the user can set
+// up their credentials first (don't force-open Add Connection — without an
+// OAuth client or service account configured it's a dead end).
+const goToConnectionSetup = async () => {
+  await saveSettings();
+  router.push({ name: "connections", query: { tab: "google_analytics" } });
+};
 
 const gaConnections = ref<GoogleAnalyticsConnectionInterface[]>([]);
 const connectionsAreLoading = ref(false);
@@ -742,11 +791,51 @@ defineExpose({
   color: var(--color-text-primary);
 }
 
+.ga-reader-tip {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  padding: 0.625rem 0.75rem;
+  background: var(--color-warning-light);
+  border: 1px solid var(--color-warning);
+  border-radius: 6px;
+  font-size: 0.8125rem;
+  color: var(--color-warning-dark);
+  line-height: 1.45;
+}
+
+.ga-reader-tip > i {
+  flex-shrink: 0;
+  margin-top: 0.15rem;
+  font-size: 0.95rem;
+  color: var(--color-warning);
+}
+
+.ga-reader-tip strong {
+  font-weight: 600;
+}
+
+.ga-reader-tip-link {
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  font-weight: 600;
+  color: var(--color-warning-dark);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.ga-reader-tip-link:hover {
+  color: var(--color-warning-darker);
+}
+
 .section-subtitle {
   margin: 0 0 0.75rem 0;
   font-size: 0.95rem;
   font-weight: 600;
-  color: #4a5568;
+  color: var(--color-text-secondary);
 }
 
 .form-row {
@@ -766,7 +855,7 @@ defineExpose({
 .form-control {
   width: 100%;
   padding: 0.5rem;
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--color-border-primary);
   border-radius: 4px;
   font-size: 0.875rem;
   box-sizing: border-box;
@@ -782,12 +871,12 @@ label {
   margin-bottom: 0.25rem;
   font-size: 0.875rem;
   font-weight: 500;
-  color: #4a5568;
+  color: var(--color-text-secondary);
 }
 
 select.form-control {
   appearance: none;
-  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%234a5568' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 0.5rem center;
   background-size: 1em;
@@ -800,11 +889,11 @@ select.form-control {
   gap: 0.5rem;
   margin-top: 0.5rem;
   font-size: 0.8125rem;
-  color: #718096;
+  color: var(--color-text-tertiary);
 }
 
 .helper-text > i {
-  color: #4299e1;
+  color: var(--color-accent-dark);
   font-size: 0.875rem;
   flex-shrink: 0;
   margin-top: 0.15rem;
@@ -817,20 +906,67 @@ select.form-control {
 }
 
 .helper-text a {
-  color: #4299e1;
+  color: var(--color-accent-dark);
   text-decoration: underline;
 }
 
 .helper-text-warning {
-  color: #b7791f;
+  color: var(--color-warning-dark);
 }
 
 .helper-text-warning > i {
-  color: #d69e2e;
+  color: var(--color-warning);
+}
+
+.connection-cta {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  margin-top: 0.5rem;
+  padding: 0.75rem;
+  background: var(--color-accent-subtle);
+  border: 1px solid var(--color-accent);
+  border-radius: 6px;
+  font-size: 0.8125rem;
+  color: var(--color-accent-dark);
+}
+
+.connection-cta > i {
+  color: var(--color-accent-dark);
+  flex-shrink: 0;
+  margin-top: 0.15rem;
+}
+
+.connection-cta-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  align-items: flex-start;
+  line-height: 1.45;
+}
+
+.cta-button {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8125rem;
+}
+
+.link-button {
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--color-accent-dark);
+  text-decoration: underline;
+  font-size: inherit;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.link-button:hover {
+  color: var(--color-accent-dark-hover);
 }
 
 .required {
-  color: #c53030;
+  color: var(--color-danger-dark);
   margin-left: 0.15rem;
 }
 
@@ -840,7 +976,7 @@ select.form-control {
   gap: 0.5rem;
   margin-top: 0.4rem;
   font-size: 0.8125rem;
-  color: #c53030;
+  color: var(--color-danger-dark);
 }
 
 .error-text > i {
@@ -850,7 +986,7 @@ select.form-control {
 
 .has-error :deep(.el-select__wrapper),
 .has-error :deep(.el-input__wrapper) {
-  box-shadow: 0 0 0 1px #c53030 inset;
+  box-shadow: 0 0 0 1px var(--color-danger) inset;
 }
 
 .loading-state {
@@ -863,15 +999,15 @@ select.form-control {
 
 .loading-state p {
   margin: 0;
-  color: #718096;
+  color: var(--color-text-tertiary);
   font-size: 0.875rem;
 }
 
 .loading-spinner {
   width: 2rem;
   height: 2rem;
-  border: 2px solid #e2e8f0;
-  border-top-color: #4299e1;
+  border: 2px solid var(--color-border-primary);
+  border-top-color: var(--color-accent);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
@@ -897,7 +1033,7 @@ select.form-control {
 }
 
 .option-api-name {
-  color: #a0aec0;
+  color: var(--color-text-muted);
   font-size: 0.75rem;
   font-family: var(--font-family-mono, monospace);
 }
@@ -929,7 +1065,7 @@ select.form-control {
 }
 
 .between-sep {
-  color: #a0aec0;
+  color: var(--color-text-muted);
   font-size: 0.875rem;
 }
 
@@ -937,8 +1073,8 @@ select.form-control {
   padding: 0.4rem 0.55rem;
   font-size: 0.75rem;
   font-weight: 600;
-  border: 1px solid #e2e8f0;
-  background: #fff;
+  border: 1px solid var(--color-border-primary);
+  background: var(--color-background-primary);
   border-radius: 4px;
   cursor: pointer;
   line-height: 1;
@@ -946,9 +1082,9 @@ select.form-control {
 }
 
 .btn-icon.active {
-  background: #ebf4ff;
-  border-color: #4299e1;
-  color: #2b6cb0;
+  background: var(--color-accent-subtle);
+  border-color: var(--color-accent);
+  color: var(--color-accent-dark);
 }
 
 .btn-icon:disabled {
@@ -957,7 +1093,7 @@ select.form-control {
 }
 
 .btn-icon.btn-danger {
-  color: #c53030;
+  color: var(--color-danger-dark);
 }
 
 .btn-add-filter {
@@ -965,7 +1101,7 @@ select.form-control {
 }
 
 code {
-  background: #f7fafc;
+  background: var(--color-background-secondary);
   padding: 0 0.25rem;
   border-radius: 3px;
   font-size: 0.8em;

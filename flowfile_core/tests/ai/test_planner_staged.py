@@ -36,6 +36,7 @@ from flowfile_core.ai.providers.base import ChatResponse, ToolCall, Usage
 from flowfile_core.ai.scheduler import RateLimitScheduler
 from flowfile_core.ai.tools.meta_ops import (
     CLASSIFY_INTENT_TOOL_NAME,
+    EMIT_PLAN_TOOL_NAME,
     PICK_NODE_TYPE_TOOL_NAME,
     PICK_UPSTREAM_TOOL_NAME,
     VERIFY_COMPLETION_TOOL_NAME,
@@ -45,14 +46,12 @@ from flowfile_core.ai.tools.registry import (
     get_staged_fill_inner_field_name,
 )
 from flowfile_core.flowfile.flow_graph import FlowGraph
-from flowfile_core.schemas import input_schema, schemas
+from flowfile_core.schemas import input_schema, schemas, transform_schema
 
 
-# --------------------------------------------------------------------------- #
 # Test helpers (mirrored from test_planner.py to keep the fixture stack
 # self-contained — these tests use a different surface and a different
 # scripted-provider story, so a shared helper module would be over-engineering.)
-# --------------------------------------------------------------------------- #
 
 
 def _flow_settings(flow_id: int = 1) -> schemas.FlowSettings:
@@ -187,9 +186,7 @@ def _reset_stores() -> Iterator[None]:
     diff_module.clear_for_tests()
 
 
-# --------------------------------------------------------------------------- #
 # Stage 0 — classify_intent #
-# --------------------------------------------------------------------------- #
 
 
 def test_stage_classify_exposes_only_classify_intent_tool() -> None:
@@ -302,9 +299,7 @@ def test_stage_classify_routes_non_add_to_single_stage_op(
     assert round2_tools[0].name == expected_surface_tool
 
 
-# --------------------------------------------------------------------------- #
 # Stage 1 — pick_node_type #
-# --------------------------------------------------------------------------- #
 
 
 def test_stage_pick_type_advances_to_pick_upstream() -> None:
@@ -312,7 +307,6 @@ def test_stage_pick_type_advances_to_pick_upstream() -> None:
     sess = _make_session(flow)
     provider = _ScriptedProvider(
         [
-            # Round 1: classify add
             _Step(
                 tool_calls=[
                     ToolCall(
@@ -322,7 +316,6 @@ def test_stage_pick_type_advances_to_pick_upstream() -> None:
                     )
                 ]
             ),
-            # Round 2: pick filter
             _Step(
                 tool_calls=[
                     ToolCall(
@@ -332,7 +325,6 @@ def test_stage_pick_type_advances_to_pick_upstream() -> None:
                     )
                 ]
             ),
-            # Round 3: terminate
             _Step(content=None, finish_reason="stop"),
         ]
     )
@@ -353,9 +345,7 @@ def test_stage_pick_type_advances_to_pick_upstream() -> None:
     assert len(enum_values) >= 30, f"expected at least 30 node types in enum, got {len(enum_values)}"
 
 
-# --------------------------------------------------------------------------- #
 # Stage 2 — pick_upstream #
-# --------------------------------------------------------------------------- #
 
 
 def test_stage_pick_upstream_enum_includes_live_and_staged_ids() -> None:
@@ -421,9 +411,7 @@ def test_stage_pick_upstream_advances_to_fill_settings() -> None:
     assert sess.stage == "fill_settings"
 
 
-# --------------------------------------------------------------------------- #
 # Stage 3 — fill_settings (stripped tool spec) #
-# --------------------------------------------------------------------------- #
 
 
 def test_build_staged_fill_tool_spec_strips_planner_injected_fields() -> None:
@@ -1035,7 +1023,7 @@ def test_fill_settings_formula_bare_string_coerces_to_function_input() -> None:
     asyncio.run(_drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler())))
 
     assert len(sess.staged_results) == 1, (
-        "v1.13B: bare-string formula must auto-coerce to a valid "
+        "bare-string formula must auto-coerce to a valid "
         f"FunctionInput envelope; got {sess.staged_results}"
     )
     payload = sess.staged_results[0].staged_node_payload or {}
@@ -1087,7 +1075,7 @@ def test_fill_settings_formula_refusal_text_disambiguates_function_field() -> No
     assert "[column_name]" in text or "[col" in text, text
     # The misread-prone phrasing is gone for this branch.
     assert "JSON-encoded string" not in text, (
-        "v1.13B: FunctionInput refusal must drop the ambiguous "
+        "FunctionInput refusal must drop the ambiguous "
         f"'not as a JSON-encoded string' clause; got: {text!r}"
     )
 
@@ -1150,9 +1138,7 @@ def test_stage_fill_settings_injects_session_upstream_into_insertion_context() -
     assert any(e.payload.get("completed_op") == "flowfile.graph.add_filter" for e in advances)
 
 
-# --------------------------------------------------------------------------- #
 # Multi-node turn #
-# --------------------------------------------------------------------------- #
 
 
 def test_multi_node_turn_serializes_through_two_classify_cycles() -> None:
@@ -1164,7 +1150,6 @@ def test_multi_node_turn_serializes_through_two_classify_cycles() -> None:
 
     provider = _ScriptedProvider(
         [
-            # Cycle 1: filter
             _Step(
                 tool_calls=[
                     ToolCall(
@@ -1210,7 +1195,6 @@ def test_multi_node_turn_serializes_through_two_classify_cycles() -> None:
                     )
                 ]
             ),
-            # Cycle 2: sort
             _Step(
                 tool_calls=[
                     ToolCall(
@@ -1482,7 +1466,7 @@ def test_pick_upstream_user_message_includes_staged_session_block() -> None:
     assert cycle2_pick_up_call["tools"][0].name == PICK_UPSTREAM_TOOL_NAME
     user_msg = cycle2_pick_up_call["messages"][1].content or ""
     assert "## Staged this session" in user_msg, (
-        "v1.12A: pick_upstream user message must include the staged-this-session "
+        "pick_upstream user message must include the staged-this-session "
         f"block on cycle 2; got: {user_msg!r}"
     )
     # The staged filter (node 2) and at least one of its predicted columns
@@ -1546,13 +1530,11 @@ def test_pick_upstream_user_message_unchanged_when_no_staged_results() -> None:
     assert cycle1_pick_up_call["tools"][0].name == PICK_UPSTREAM_TOOL_NAME
     user_msg = cycle1_pick_up_call["messages"][1].content or ""
     assert "## Staged this session" not in user_msg, (
-        "v1.12A: addendum must not appear when no add_* has been staged this session"
+        "addendum must not appear when no add_* has been staged this session"
     )
 
 
-# --------------------------------------------------------------------------- #
 # AgentSession.reset_stage_state #
-# --------------------------------------------------------------------------- #
 
 
 def test_reset_stage_state_clears_picked_fields() -> None:
@@ -1573,9 +1555,7 @@ def test_reset_stage_state_clears_picked_fields() -> None:
     assert sess.picked_right_input_id is None
 
 
-# --------------------------------------------------------------------------- #
 # — agent_live REPL surface #
-# --------------------------------------------------------------------------- #
 
 
 def _make_live_session(flow: FlowGraph, *, user_id: int = 1) -> sessions.AgentSession:
@@ -1707,6 +1687,7 @@ def test_agent_live_undoes_failed_step_and_retries(monkeypatch: pytest.MonkeyPat
 
     flow = _make_flow()
     sess = _make_live_session(flow)
+    history_before = flow.get_history_state()
 
     # Three consecutive fill attempts will all observe-fail; the
     # planner should auto-undo each time and exhaust the retry
@@ -1746,6 +1727,12 @@ def test_agent_live_undoes_failed_step_and_retries(monkeypatch: pytest.MonkeyPat
     new_node_ids = sorted(n.node_id for n in flow.nodes)
     assert new_node_ids == [1], (
         f"agent_live must auto-undo the failing node; got nodes {new_node_ids!r}"
+    )
+    # Each retracted step leaves neither an undo entry nor a redo entry behind.
+    history_after = flow.get_history_state()
+    assert (history_after.undo_count, history_after.redo_count) == (
+        history_before.undo_count,
+        history_before.redo_count,
     )
     # No applied_results recorded (no successful step).
     assert sess.applied_results == []
@@ -1862,9 +1849,7 @@ def test_agent_live_does_not_use_staged_results() -> None:
     assert live_ids == [1, 2, 3], live_ids
 
 
-# --------------------------------------------------------------------------- #
 # — opt-in verify-completion gate #
-# --------------------------------------------------------------------------- #
 
 
 def test_verify_completion_stage_loops_back_to_classify() -> None:
@@ -2026,11 +2011,9 @@ def test_verify_completion_skipped_when_flag_off() -> None:
     assert sess.verify_round_consumed is False
 
 
-# --------------------------------------------------------------------------- #
 # — refuse unrequested wires from freshly-staged source nodes #
 # into pre-existing live nodes (planner audit_meta builder + executor #
 # backstop end-to-end) #
-# --------------------------------------------------------------------------- #
 
 
 def test_connect_from_staged_source_to_live_is_refused_end_to_end() -> None:
@@ -2082,7 +2065,6 @@ def test_connect_from_staged_source_to_live_is_refused_end_to_end() -> None:
 
     provider = _ScriptedProvider(
         [
-            # Round 1 — classify("connect")
             _Step(
                 tool_calls=[
                     ToolCall(
@@ -2108,7 +2090,6 @@ def test_connect_from_staged_source_to_live_is_refused_end_to_end() -> None:
                 content="Wiring the new lookup into the orders node.",
                 finish_reason="tool_calls",
             ),
-            # Round 3 — terminate
             _Step(content=None, finish_reason="stop"),
         ]
     )
@@ -2151,7 +2132,21 @@ def test_connect_from_staged_non_source_to_live_is_allowed_end_to_end() -> None:
     """
     from flowfile_core.ai.diff import StagedToolEntry
 
-    flow = _make_flow()
+    flow = _make_flow()  # node 1 = manual_input source
+    # A LIVE non-source target (node 2 = filter) so the connect actually
+    # succeeds. Wiring into node 1 (a source) would be rejected with
+    # ``target_is_source``, masking the very behaviour this test claims to
+    # check, so the target must be a transform with a free input port.
+    flow.add_filter(
+        input_schema.NodeFilter(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=transform_schema.FilterInput(
+                filter_type="advanced", advanced_filter="[region]=='EU'"
+            ),
+        )
+    )
     sess = _make_session(flow)
 
     # Simulate a prior round having staged a filter (id 7) — a
@@ -2194,11 +2189,11 @@ def test_connect_from_staged_non_source_to_live_is_allowed_end_to_end() -> None:
                         arguments={
                             "flow_id": flow.flow_id,
                             "from_node_id": 7,
-                            "to_node_id": 1,
+                            "to_node_id": 2,
                         },
                     )
                 ],
-                content="Wiring filter to orders.",
+                content="Wiring the staged filter into the live filter.",
                 finish_reason="tool_calls",
             ),
             _Step(content=None, finish_reason="stop"),
@@ -2209,14 +2204,842 @@ def test_connect_from_staged_non_source_to_live_is_allowed_end_to_end() -> None:
         _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
     )
 
-    # No unrequested_wire_to_live rejection for the connect call —
-    # the staged upstream is a transform, not a source.
-    unrequested_rejections = [
-        e for e in events
-        if e.event == "tool_call_rejected"
-        and e.payload.get("reason") == "unrequested_wire_to_live"
-    ]
-    assert unrequested_rejections == [], (
-        f"non-source staged upstream must NOT trip the refusal; "
-        f"got rejections {[r.payload for r in unrequested_rejections]}"
+    # The connect is ALLOWED end-to-end: it was staged, with no rejection of
+    # any kind (neither ``unrequested_wire_to_live`` nor ``target_is_source``
+    # nor ``target_not_found``).
+    rejections = [e for e in events if e.event == "tool_call_rejected"]
+    assert rejections == [], (
+        f"staged non-source → live non-source must NOT be rejected; "
+        f"got {[(r.payload.get('name'), r.payload.get('reason')) for r in rejections]}"
     )
+    connect_staged = [
+        e for e in events
+        if e.event == "tool_call_staged" and e.payload.get("name") == "flowfile.graph.connect"
+    ]
+    assert connect_staged, "expected the connect to be staged"
+
+
+# connect → add-join pivot (escape the single_stage_op trap) #
+
+
+def test_connect_into_missing_target_pivots_back_to_classify() -> None:
+    """The join dogfood: the model classifies ``connect`` and wires the
+    sources into a join node it never created (``connect 1 → 4``). The host
+    rejects with ``target_not_found`` and — instead of leaving the agent
+    trapped at single_stage_op retrying the same doomed wire — resets the
+    state machine to ``classify`` so it can pivot to ADDING the join, with a
+    steering host note injected."""
+    flow = _make_flow()  # node 1 = manual_input source
+    sess = _make_session(flow)
+    sess.user_prompt = "join the customer and order data on customer_id"
+    provider = _ScriptedProvider(
+        [
+            # Round 1 — classify picks the (doomed) connect.
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="t-classify-1",
+                        name=CLASSIFY_INTENT_TOOL_NAME,
+                        arguments={"op_kind": "connect", "rationale": "combine the data"},
+                    )
+                ]
+            ),
+            # Round 2 — single_stage_op: connect into a node that was never
+            # created → target_not_found → pivot.
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="t-connect-1",
+                        name="flowfile.graph.connect",
+                        arguments={"flow_id": flow.flow_id, "from_node_id": 1, "to_node_id": 4},
+                    )
+                ],
+                content="Wiring the sources into the join.",
+                finish_reason="tool_calls",
+            ),
+            # Round 3 — back at classify after the pivot; the agent ends the
+            # turn (the add-join path itself is covered by the add tests).
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="t-classify-2",
+                        name=CLASSIFY_INTENT_TOOL_NAME,
+                        arguments={"op_kind": "other", "rationale": "all set"},
+                    )
+                ]
+            ),
+            _Step(content="Done.", finish_reason="stop"),
+        ]
+    )
+
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+
+    # The connect was rejected as target_not_found.
+    rejections = [e for e in events if e.event == "tool_call_rejected"]
+    assert any(
+        r.payload.get("reason") == "target_not_found" for r in rejections
+    ), f"expected a target_not_found rejection; got {[r.payload.get('reason') for r in rejections]}"
+
+    # The pivot reset the stage back to classify (not stuck at single_stage_op).
+    pivots = [
+        e for e in events
+        if e.event == "stage_advanced"
+        and e.payload.get("op_kind_meta") == "connect_join_pivot"
+    ]
+    assert len(pivots) == 1, f"expected exactly one connect_join_pivot; got {pivots}"
+    assert pivots[0].payload["from"] == "single_stage_op"
+    assert pivots[0].payload["to"] == "classify"
+
+    # An info event explained the pivot.
+    assert any(
+        e.event == "info" and "pivot" in (e.payload.get("message") or "")
+        for e in events
+    ), "expected an info event describing the pivot"
+
+    # A steering host note was injected, telling the agent to ADD a join.
+    steer_notes = [
+        m for m in sess.messages
+        if m.role == "user"
+        and isinstance(m.content, str)
+        and "NOTE FROM HOST" in m.content
+        and "join" in m.content
+    ]
+    assert steer_notes, "expected a join-pivot steer note in the conversation"
+    assert 'op_kind="add"' in steer_notes[-1].content
+
+    # Nothing got staged (the doomed connect produced no diff entry).
+    assert sess.staged_results == []
+
+
+def test_connect_into_live_source_pivots_back_to_classify() -> None:
+    """Same pivot, triggered by ``target_is_source`` instead of
+    ``target_not_found``: the model tries to wire one source into another
+    (``connect 1 → 2`` where both are sources). The host pivots to classify
+    so the agent can add a join instead of looping on the rejected connect."""
+    flow = _make_flow()  # node 1 = manual_input source
+    _add_orders(flow, node_id=2)  # node 2 = second manual_input source
+    sess = _make_session(flow)
+    sess.user_prompt = "combine these two datasets"
+    provider = _ScriptedProvider(
+        [
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="t-classify-1",
+                        name=CLASSIFY_INTENT_TOOL_NAME,
+                        arguments={"op_kind": "connect", "rationale": "combine"},
+                    )
+                ]
+            ),
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="t-connect-1",
+                        name="flowfile.graph.connect",
+                        arguments={"flow_id": flow.flow_id, "from_node_id": 1, "to_node_id": 2},
+                    )
+                ],
+                content="Connecting the two sources.",
+                finish_reason="tool_calls",
+            ),
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="t-classify-2",
+                        name=CLASSIFY_INTENT_TOOL_NAME,
+                        arguments={"op_kind": "other", "rationale": "all set"},
+                    )
+                ]
+            ),
+            _Step(content="Done.", finish_reason="stop"),
+        ]
+    )
+
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+
+    assert any(
+        e.event == "tool_call_rejected" and e.payload.get("reason") == "target_is_source"
+        for e in events
+    )
+    pivots = [
+        e for e in events
+        if e.event == "stage_advanced"
+        and e.payload.get("op_kind_meta") == "connect_join_pivot"
+    ]
+    assert len(pivots) == 1
+    assert pivots[0].payload["from"] == "single_stage_op"
+    assert pivots[0].payload["to"] == "classify"
+
+
+def test_connect_join_pivot_is_capped() -> None:
+    """A model that never stops re-picking ``connect`` must not pivot
+    forever. After ``_MAX_CONNECT_JOIN_PIVOTS`` (6) pivots the next rejected
+    connect falls through to the normal retry budget instead of pivoting —
+    so 7 consecutive ``target_not_found`` connects yield exactly 6 pivots,
+    and the run then fails on the retry budget."""
+    flow = _make_flow()  # node 1 = source; node 4 never exists
+    sess = _make_session(flow)
+    sess.user_prompt = "combine all my data"
+
+    # 7 cycles of [classify→connect, connect 1→4 → target_not_found]. The
+    # first 6 connect rejections pivot back to classify; the 7th is past the
+    # cap and does not.
+    steps: list[_Step] = []
+    for i in range(7):
+        steps.append(
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id=f"t-classify-{i}",
+                        name=CLASSIFY_INTENT_TOOL_NAME,
+                        arguments={"op_kind": "connect", "rationale": "combine"},
+                    )
+                ]
+            )
+        )
+        steps.append(
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id=f"t-connect-{i}",
+                        name="flowfile.graph.connect",
+                        arguments={"flow_id": flow.flow_id, "from_node_id": 1, "to_node_id": 4},
+                    )
+                ],
+                content="Wiring into the join.",
+                finish_reason="tool_calls",
+            )
+        )
+
+    provider = _ScriptedProvider(steps)
+    events = asyncio.run(
+        _drain(
+            run_planner_session(
+                session=sess,
+                flow=flow,
+                provider=provider,
+                scheduler=_no_wait_scheduler(),
+                max_retries_per_step=1,
+            )
+        )
+    )
+
+    rejections = [
+        e for e in events
+        if e.event == "tool_call_rejected" and e.payload.get("reason") == "target_not_found"
+    ]
+    pivots = [
+        e for e in events
+        if e.event == "stage_advanced" and e.payload.get("op_kind_meta") == "connect_join_pivot"
+    ]
+    assert len(rejections) == 7, f"expected 7 connect rejections; got {len(rejections)}"
+    assert len(pivots) == 6, (
+        f"pivots must be capped at _MAX_CONNECT_JOIN_PIVOTS (6); got {len(pivots)} "
+        f"— the 7th rejection must fall through to the retry path, not pivot"
+    )
+    # The uncapped 7th rejection fell through to the retry budget, which (at
+    # max_retries_per_step=1) terminates the run.
+    assert sess.status == "failed"
+
+
+# — host-tracked plan ledger: multi-step continuation #
+
+
+_NUDGE_MSG = "plan has pending steps; prompting the model to continue"
+
+
+def _nudge_events(events: list[PlannerEvent]) -> list[PlannerEvent]:
+    return [
+        e for e in events
+        if e.event == "info" and e.payload.get("message") == _NUDGE_MSG
+    ]
+
+
+def _emit_plan_step(plan_md: str, *, rationale: str = "the plan") -> _Step:
+    return _Step(
+        tool_calls=[
+            ToolCall(
+                id="t-plan",
+                name=EMIT_PLAN_TOOL_NAME,
+                arguments={"plan": plan_md, "rationale": rationale},
+            )
+        ]
+    )
+
+
+def _stall(content: str = "Let me proceed with the next step.") -> _Step:
+    return _Step(content=content, finish_reason="stop")
+
+
+def _classify_other(idx: int = 0) -> _Step:
+    return _Step(
+        tool_calls=[
+            ToolCall(
+                id=f"c-other-{idx}",
+                name=CLASSIFY_INTENT_TOOL_NAME,
+                arguments={"op_kind": "other", "rationale": "wrapping up"},
+            )
+        ]
+    )
+
+
+def _filter_add_cycle(prefix: str, upstream: int) -> list[_Step]:
+    """4 scripted steps: classify(add)→pick_type(filter)→pick_upstream→add_filter."""
+    return [
+        *_filter_cycle(prefix=prefix, node_type="filter", upstream=upstream),
+        _Step(
+            tool_calls=[
+                ToolCall(
+                    id=f"{prefix}-fill",
+                    name="flowfile.graph.add_filter",
+                    arguments={
+                        "filter_input": {
+                            "filter_type": "advanced",
+                            "advanced_filter": "[region]=='EU'",
+                        }
+                    },
+                )
+            ]
+        ),
+    ]
+
+
+def _proposed_changes(*steps: str) -> str:
+    body = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, start=1))
+    return f"## Proposed changes\n\n{body}\n"
+
+
+def _run_emit_plan(
+    plan_md: str, *, start_max_steps: int | None = None, explicit: bool = False
+) -> sessions.AgentSession:
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "plan"
+    if start_max_steps is not None:
+        sess.max_steps = start_max_steps
+    sess.max_steps_explicit = explicit
+    steps = [_emit_plan_step(plan_md)] + [_stall() for _ in range(4)]
+    provider = _ScriptedProvider(steps)
+    asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    return sess
+
+
+def test_emit_plan_populates_ledger_and_scales_max_steps() -> None:
+    """A 12-step plan on ``max_steps=16`` auto-scales to 5*12+8=68 and the
+    ledger is populated with the parsed steps."""
+    plan_md = _proposed_changes(*[f"filter — step {i}" for i in range(1, 13)])
+    sess = _run_emit_plan(plan_md, start_max_steps=16)
+    assert len(sess.plan_steps) == 12
+    assert sess.plan_markdown is not None
+    assert sess.max_steps == 68
+
+
+def test_emit_plan_never_lowers_caller_max_steps() -> None:
+    """A short plan whose scaled budget is below the caller's ``max_steps``
+    must not lower it."""
+    plan_md = _proposed_changes("filter — a", "filter — b", "filter — c")
+    sess = _run_emit_plan(plan_md, start_max_steps=100)
+    assert len(sess.plan_steps) == 3
+    assert sess.max_steps == 100  # 5*3+8=23 < 100, never lowered
+
+
+def test_emit_plan_explicit_max_steps_is_hard_ceiling() -> None:
+    """A caller-supplied ``max_steps`` (``max_steps_explicit=True``) is a cost
+    cap: a long plan does NOT auto-scale past it."""
+    plan_md = _proposed_changes(*[f"filter — step {i}" for i in range(1, 13)])
+    sess = _run_emit_plan(plan_md, start_max_steps=10, explicit=True)
+    assert len(sess.plan_steps) == 12
+    assert sess.max_steps == 10  # explicit cap not raised past 10
+
+
+def test_emit_plan_default_max_steps_still_auto_scales() -> None:
+    """A default session (``max_steps_explicit=False``) with the same long plan
+    still auto-scales to 5*12+8=68."""
+    plan_md = _proposed_changes(*[f"filter — step {i}" for i in range(1, 13)])
+    sess = _run_emit_plan(plan_md, start_max_steps=10, explicit=False)
+    assert len(sess.plan_steps) == 12
+    assert sess.max_steps == 68
+
+
+def test_emit_plan_scale_clamped_to_hard_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The min() clamp must bind. 24 steps at the real constants lands on
+    exactly 128 (5*24+8), which cannot falsify a missing clamp — so inflate
+    ``_PLAN_ROUNDS_PER_STEP`` to make the unclamped value (12*50+8=608)
+    exceed the cap and assert the clamp pulls it back to 128."""
+    from flowfile_core.ai.agents.planner import MAX_STEPS_HARD_CAP
+    from flowfile_core.ai.agents.planner import loop as loop_module
+
+    monkeypatch.setattr(loop_module, "_PLAN_ROUNDS_PER_STEP", 50)
+    plan_md = _proposed_changes(*[f"filter — step {i}" for i in range(1, 13)])
+    sess = _run_emit_plan(plan_md, start_max_steps=16)
+    assert len(sess.plan_steps) == 12
+    assert sess.max_steps == MAX_STEPS_HARD_CAP == 128
+
+
+def test_cycle2_classify_carries_goal_and_progress_block() -> None:
+    """Regression for the stale-slim bug: the cycle-2 classify round's
+    ``messages[1]`` must carry the user goal + the ``## Plan progress`` block
+    with ``[done]``/``[pending]`` markers — not the leftover fill_settings
+    mini-prompt."""
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "plan"
+    plan_md = _proposed_changes("filter — keep EU rows", "filter — keep EU rows again")
+    provider = _ScriptedProvider(
+        [
+            _emit_plan_step(plan_md),
+            *_filter_add_cycle("c1", upstream=1),
+            _stall(),
+            _stall(),
+            _stall(),
+        ]
+    )
+    asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    # call index: 0 emit, 1 classify, 2 pick_type, 3 pick_up, 4 fill, 5 cycle-2 classify.
+    cycle2_classify = provider.calls[5]
+    user_msg = cycle2_classify["messages"][1].content or ""
+    assert "filter to EU rows" in user_msg, f"goal must be restored at cycle-2 classify; got: {user_msg!r}"
+    assert "## Plan progress (host-tracked)" in user_msg, user_msg
+    assert "[done]" in user_msg, user_msg
+    assert "[pending]" in user_msg, user_msg
+
+
+def test_prose_stall_mid_plan_nudges_and_continues() -> None:
+    """A prose-only stall after the first add nudges the model back into the
+    plan; the run continues to a second add and completes with 2 staged
+    results and exactly one nudge."""
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "plan"
+    plan_md = _proposed_changes("filter — first", "filter — second")
+    provider = _ScriptedProvider(
+        [
+            _emit_plan_step(plan_md),
+            *_filter_add_cycle("c1", upstream=1),
+            _stall(),  # mid-plan prose stall → nudge
+            *_filter_add_cycle("c2", upstream=2),
+            _stall(),  # plan complete → no nudge → terminate
+        ]
+    )
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    assert len(_nudge_events(events)) == 1
+    assert len(sess.staged_results) == 2
+    assert sess.status == "completed"
+
+
+def test_nudges_capped_completes_with_partial_diff() -> None:
+    """When the model keeps stalling, nudges cap at 2 and the run terminates
+    ``completed`` (not ``failed``) with the partial diff staged so far."""
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "plan"
+    plan_md = _proposed_changes("filter — a", "filter — b", "filter — c")
+    provider = _ScriptedProvider(
+        [
+            _emit_plan_step(plan_md),
+            *_filter_add_cycle("c1", upstream=1),
+            _stall(),
+            _stall(),
+            _stall(),
+        ]
+    )
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    assert len(_nudge_events(events)) == 2
+    assert sess.status == "completed"
+    assert len(sess.staged_results) == 1
+
+
+def test_nudge_rearms_after_each_completed_op() -> None:
+    """The nudge budget re-arms on every completed op: a 3-step plan with a
+    stall before each of the 3 adds needs 3 nudges (a per-session cap of 2
+    would leave only 1 staged) → 3 staged results, 3 nudges."""
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "plan"
+    plan_md = _proposed_changes("filter — a", "filter — b", "filter — c")
+    provider = _ScriptedProvider(
+        [
+            _emit_plan_step(plan_md),
+            _stall(),  # before add1 → nudge (n=1)
+            *_filter_add_cycle("c1", upstream=1),  # re-arm
+            _stall(),  # before add2 → nudge (n=1 again)
+            *_filter_add_cycle("c2", upstream=2),  # re-arm
+            _stall(),  # before add3 → nudge (n=1 again)
+            *_filter_add_cycle("c3", upstream=3),
+            _stall(),  # plan complete → terminate
+        ]
+    )
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    assert len(_nudge_events(events)) == 3
+    assert len(sess.staged_results) == 3
+    assert sess.status == "completed"
+
+
+def test_op_kind_other_mid_plan_nudged_before_terminating() -> None:
+    """A classify ``op_kind="other"`` while steps remain gets nudged (Point B)
+    instead of terminating; once all steps are done, ``other`` terminates."""
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "plan"
+    plan_md = _proposed_changes("filter — first", "filter — second")
+    provider = _ScriptedProvider(
+        [
+            _emit_plan_step(plan_md),
+            *_filter_add_cycle("c1", upstream=1),
+            _classify_other(1),  # mid-plan other → Point B nudge
+            *_filter_add_cycle("c2", upstream=2),
+            _classify_other(2),  # plan done → legacy stay-at-classify
+            _stall(),  # terminate
+        ]
+    )
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    assert len(_nudge_events(events)) == 1
+    assert len(sess.staged_results) == 2
+    assert sess.status == "completed"
+
+
+def test_verify_reached_after_nudge_budget_exhausted() -> None:
+    """When verify is enabled and the model keeps picking ``other`` with steps
+    pending, the ledger nudges twice, then routes to ``verify_completion``,
+    and after ``is_complete=True`` the run terminates with no further nudge.
+    (The nudge budget is already exhausted when verify runs here, so this
+    does NOT exercise the verify-disarm assignment — see
+    ``test_verify_is_complete_disarms_pending_nudges_cold_resume`` for the
+    scenario where the disarm itself is load-bearing.)"""
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "plan"
+    sess.verify_plan_completion = True
+    plan_md = _proposed_changes("filter — never done")
+    provider = _ScriptedProvider(
+        [
+            _emit_plan_step(plan_md),
+            _classify_other(1),  # Point B nudge (n=1)
+            _classify_other(2),  # Point B nudge (n=2)
+            _classify_other(3),  # nudges exhausted → verify_completion
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="t-verify",
+                        name=VERIFY_COMPLETION_TOOL_NAME,
+                        arguments={"is_complete": True, "rationale": "calling it done"},
+                    )
+                ]
+            ),
+            _stall("All set."),  # disarmed → no further nudge → terminate
+        ]
+    )
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    verify_advances = [
+        e for e in events
+        if e.event == "stage_advanced" and e.payload.get("to") == "verify_completion"
+    ]
+    assert len(verify_advances) == 1, "verify_completion must be reached after nudges exhaust"
+    assert len(_nudge_events(events)) == 2, "no nudge after verify certified completion"
+    assert sess.status == "completed"
+
+
+def test_question_only_plan_no_nudge_terminates() -> None:
+    """A question-only plan parses to zero steps; every ledger gate is inert
+    and the run terminates exactly as before (no nudge)."""
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "plan"
+    plan_md = "User asked a question; will respond without staging changes."
+    provider = _ScriptedProvider(
+        [
+            _emit_plan_step(plan_md),
+            _classify_other(1),
+            _stall("Here is the answer to your question."),
+        ]
+    )
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    assert sess.plan_steps == []
+    assert len(_nudge_events(events)) == 0
+    assert sess.status == "completed"
+
+
+def test_prework_clarifying_question_awaiting_no_nudge() -> None:
+    """A genuine pre-work clarifying question (nothing staged/applied yet)
+    reaches ``awaiting_user_input`` and is NOT nudged, even with pending
+    plan steps."""
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "plan"
+    plan_md = _proposed_changes("filter — first", "filter — second")
+    provider = _ScriptedProvider(
+        [
+            _emit_plan_step(plan_md),
+            _stall("Which column should I filter on?"),
+        ]
+    )
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    assert len(_nudge_events(events)) == 0
+    assert sess.status == "awaiting_user_input"
+    assert any(e.event == "awaiting_user_input" for e in events)
+
+
+def test_question_after_work_started_nudges_not_awaiting() -> None:
+    """The question-exemption sub-clause is narrow: once work has started
+    (staged_results non-empty), a question-shaped stall with pending steps is
+    NUDGED, not routed to awaiting_user_input (Point A, work-started side)."""
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "plan"
+    plan_md = _proposed_changes("filter — first", "filter — second")
+    provider = _ScriptedProvider(
+        [
+            _emit_plan_step(plan_md),
+            *_filter_add_cycle("c1", upstream=1),  # stage node 2 → work started
+            _stall("Shall I continue with the next step?"),  # question, but staged → nudge
+            *_filter_add_cycle("c2", upstream=2),
+            _stall(),  # plan complete → terminate
+        ]
+    )
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    assert len(_nudge_events(events)) == 1
+    assert not any(e.event == "awaiting_user_input" for e in events)
+    assert len(sess.staged_results) == 2
+    assert sess.status == "completed"
+
+
+def test_agent_live_plan_continuation_end_to_end() -> None:
+    """agent_live end-to-end: plan(2 steps) → apply node 1 → prose stall →
+    nudge → apply node 2 → completed with 2 applied_results, and the ledger
+    records both applied ops."""
+    flow = _make_flow()
+    sess = _make_live_session(flow)
+    sess.stage = "plan"
+    plan_md = _proposed_changes("filter — first", "filter — second")
+    provider = _ScriptedProvider(
+        [
+            _emit_plan_step(plan_md),
+            *_filter_add_cycle("c1", upstream=1),
+            _stall(),  # mid-plan stall → nudge
+            *_filter_add_cycle("c2", upstream=2),
+            _stall(),  # plan complete → terminate
+        ]
+    )
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    assert len(_nudge_events(events)) == 1
+    assert sess.status == "completed"
+    assert len(sess.applied_results) == 2
+    assert len(sess.plan_completed_ops) == 2
+    live_ids = [n.node_id for n in flow.nodes]
+    assert 2 in live_ids and 3 in live_ids, f"agent_live must apply both nodes live; got {live_ids!r}"
+
+
+def test_followup_re_entry_clears_plan_ledger() -> None:
+    """A followup is a new goal — the followup-resume preamble clears the
+    plan ledger so stale pending steps can't mis-nudge."""
+    from flowfile_core.ai.agents.planner import inject_followup_message
+
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.status = "completed"
+    sess.plan_markdown = _proposed_changes("filter — x")
+    sess.plan_steps = ["filter — x"]
+    sess.plan_completed_ops = [
+        sessions.CompletedOpEntry(tool_name="flowfile.graph.add_filter", node_id=2, summary="x")
+    ]
+    inject_followup_message(sess, action="user_message", message="please continue")
+
+    provider = _ScriptedProvider([_Step(content="acknowledged.", finish_reason="stop")])
+    asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    assert sess.plan_markdown is None
+    assert sess.plan_steps == []
+    assert sess.plan_completed_ops == []
+
+
+def test_session_max_steps_lockstep_with_default() -> None:
+    """``AgentSession().max_steps`` must equal the planner's
+    ``DEFAULT_MAX_STEPS`` (they are kept in lockstep by comment, not import)."""
+    from flowfile_core.ai.agents.planner import DEFAULT_MAX_STEPS
+
+    snapshot = sessions.GraphSnapshot(flow_id=1, node_ids=(1,), node_types={1: "manual_input"})
+    sess = sessions.AgentSession(
+        flow_id=1,
+        user_id=1,
+        user_prompt="x",
+        provider_name="fake",
+        snapshot=snapshot,
+    )
+    assert sess.max_steps == DEFAULT_MAX_STEPS
+
+
+def test_verify_is_complete_disarms_pending_nudges_cold_resume() -> None:
+    """The verify ``is_complete=True`` disarm must be load-bearing when the
+    nudge budget is NOT yet exhausted. That state is reachable via cold
+    resume: a session checkpointed at ``stage="verify_completion"`` re-enters
+    a fresh loop whose local ``plan_nudges`` restarts at 0. The model then
+    certifies completion while the ledger still shows a pending step; the
+    disarm must stop Point A from second-guessing the certification on the
+    following prose round (without the disarm, this script nudges, exhausts
+    the provider, and fails)."""
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "verify_completion"
+    sess.verify_plan_completion = True
+    sess.plan_markdown = _proposed_changes("filter — deemed unnecessary by the model")
+    sess.plan_steps = ["filter — deemed unnecessary by the model"]
+
+    provider = _ScriptedProvider(
+        [
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="t-verify-cold",
+                        name=VERIFY_COMPLETION_TOOL_NAME,
+                        arguments={"is_complete": True, "rationale": "already satisfied"},
+                    )
+                ]
+            ),
+            _stall("All set."),
+        ]
+    )
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    assert len(_nudge_events(events)) == 0, "verify is_complete=True must disarm Point A"
+    assert sess.status == "completed"
+
+
+def test_source_add_backstop_wins_over_plan_nudge() -> None:
+    """Defect regression: the source-add backstop must not be contradicted by
+    the plan ledger one round later. Plan = [source add, (re-wire)]; the
+    model stages the source, then classifies ``connect`` — the backstop
+    coerces it to ``other`` and instructs a wrap-up. The following prose
+    wrap-up must NOT be nudged as a mid-plan stall (the (re-wire) step is
+    pending forever by design here): no nudge message, no nudge info event,
+    clean completion with just the source staged."""
+    flow = _make_flow()
+    sess = _make_session(flow)
+    sess.stage = "plan"
+    plan_md = _proposed_changes(
+        "manual_input — add the city lookup data.",
+        "(re-wire) — connect the new source into the existing flow.",
+    )
+    provider = _ScriptedProvider(
+        [
+            _emit_plan_step(plan_md),
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="s1-classify",
+                        name=CLASSIFY_INTENT_TOOL_NAME,
+                        arguments={"op_kind": "add", "rationale": "add the source"},
+                    )
+                ]
+            ),
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="s1-pick-type",
+                        name=PICK_NODE_TYPE_TOOL_NAME,
+                        arguments={"node_type": "manual_input", "rationale": "source"},
+                    )
+                ]
+            ),
+            # Source type skips pick_upstream → straight to fill_settings.
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="s1-fill",
+                        name="flowfile.graph.add_manual_input",
+                        arguments={
+                            "raw_data_format": {
+                                "columns": [{"name": "city", "data_type": "String"}],
+                                "data": [["NY", "LA"]],
+                            }
+                        },
+                    )
+                ]
+            ),
+            # The model tries to wire the fresh source → backstop coerces to
+            # ``other`` (user never asked for wiring) and disarms the nudges.
+            _Step(
+                tool_calls=[
+                    ToolCall(
+                        id="s2-classify",
+                        name=CLASSIFY_INTENT_TOOL_NAME,
+                        arguments={"op_kind": "connect", "rationale": "wire it in"},
+                    )
+                ]
+            ),
+            # Prose wrap-up, exactly as the backstop's host note instructed.
+            _stall("The manual_input was added as node 2 standalone."),
+        ]
+    )
+    events = asyncio.run(
+        _drain(run_planner_session(session=sess, flow=flow, provider=provider, scheduler=_no_wait_scheduler()))
+    )
+    assert len(_nudge_events(events)) == 0, "the backstop must win — no plan nudge after forced other"
+    assert not any(
+        "your plan is NOT finished" in (m.content or "") for m in sess.messages
+    ), "no nudge message may be injected after the backstop fired"
+    assert sess.status == "completed"
+    assert len(sess.staged_results) == 1
+    assert sess.staged_results[0].tool_name == "flowfile.graph.add_manual_input"
+
+
+def test_fill_settings_formula_functions_list_survives_coercion_untouched() -> None:
+    """A correctly-shaped multi-entry payload must not be rewritten by the bare-string coercer."""
+    from flowfile_core.ai.agents.planner.coercions import _coerce_formula_bare_string_args
+    from flowfile_core.ai.tools.registry import get_staged_fill_inner_field_name
+
+    payload = {
+        "functions": [
+            {"field": {"name": "net", "data_type": "Double"}, "function": "[amount] * 0.95"},
+            {"field": {"name": "rounded", "data_type": "Double"}, "function": "round([net], 2)"},
+        ]
+    }
+    assert _coerce_formula_bare_string_args(payload, user_prompt="derive net then round it") is payload
+    # formula is a multi-field settings type, so the planner performs no inner-input wrap.
+    assert get_staged_fill_inner_field_name("formula") is None
+
+
+def test_fill_settings_formula_bare_string_coercion_emits_the_outer_envelope() -> None:
+    from flowfile_core.ai.agents.planner.coercions import _coerce_formula_bare_string_args
+
+    coerced = _coerce_formula_bare_string_args({"function": "[a] + 1"}, user_prompt="add a total column")
+    assert isinstance(coerced["function"], dict)
+    assert coerced["function"]["function"] == "[a] + 1"
+    assert coerced["function"]["field"]["name"]
+
+
+def test_stage_three_formula_tool_spec_exposes_both_shapes() -> None:
+    from flowfile_core.ai.tools.registry import build_staged_fill_tool_spec
+
+    spec = build_staged_fill_tool_spec("formula")
+    assert spec is not None
+    properties = spec.parameters["properties"]
+    assert "function" in properties and "functions" in properties
+    assert "flow_id" not in properties, "planner-injected fields stay hidden"

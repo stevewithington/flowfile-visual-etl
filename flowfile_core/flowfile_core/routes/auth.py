@@ -5,12 +5,14 @@ import os
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
+from flowfile_core.auth import sharing
 from flowfile_core.auth.jwt import (
     create_access_token,
     create_refresh_token,
     decode_refresh_token,
     get_current_active_user,
     get_current_admin_user,
+    invalidate_user_cache,
 )
 from flowfile_core.auth.models import ChangePassword, Token, User, UserCreate, UserUpdate
 from flowfile_core.auth.password import PASSWORD_REQUIREMENTS, get_password_hash, validate_password, verify_password
@@ -21,7 +23,7 @@ router = APIRouter()
 
 
 @router.post("/token", response_model=Token)
-async def login_for_access_token(
+def login_for_access_token(
     request: Request,
     db: Session = Depends(get_db),
     username: str | None = Form(None),
@@ -55,14 +57,13 @@ async def login_for_access_token(
 
 
 @router.post("/refresh", response_model=Token)
-async def refresh_access_token(
+def refresh_access_token(
     refresh_token: str = Form(...),
     db: Session = Depends(get_db),
 ):
     """Exchange a valid refresh token for a new access token and refresh token."""
     username = decode_refresh_token(refresh_token)
 
-    # Verify user still exists and is not disabled
     user = db.query(db_models.User).filter(db_models.User.username == username).first()
     if user is None:
         raise HTTPException(
@@ -82,7 +83,6 @@ async def refresh_access_token(
     return {"access_token": new_access_token, "refresh_token": new_refresh_token, "token_type": "bearer"}
 
 
-# Get current user endpoint
 @router.get("/users/me", response_model=User)
 async def read_users_me(current_user=Depends(get_current_active_user)):
     return current_user
@@ -92,7 +92,7 @@ async def read_users_me(current_user=Depends(get_current_active_user)):
 
 
 @router.get("/users", response_model=list[User])
-async def list_users(current_user: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+def list_users(current_user: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
     """List all users (admin only)"""
     users = db.query(db_models.User).all()
     return [
@@ -110,27 +110,28 @@ async def list_users(current_user: User = Depends(get_current_admin_user), db: S
 
 
 @router.post("/users", response_model=User)
-async def create_user(
+def create_user(
     user_data: UserCreate, current_user: User = Depends(get_current_admin_user), db: Session = Depends(get_db)
 ):
     """Create a new user (admin only)"""
-    # Check if username already exists
+    if user_data.username == sharing.INTERNAL_SERVICE_USERNAME:
+        # Reserved sentinel: sharing classifies principals as the synthetic kernel
+        # identity by this username, so a real user named this way would be locked
+        # out of their own resources.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username is reserved")
     existing_user = db.query(db_models.User).filter(db_models.User.username == user_data.username).first()
     if existing_user:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already exists")
 
-    # Check if email already exists (if provided)
     if user_data.email:
         existing_email = db.query(db_models.User).filter(db_models.User.email == user_data.email).first()
         if existing_email:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already exists")
 
-    # Validate password requirements
     is_valid, error_message = validate_password(user_data.password)
     if not is_valid:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error_message)
 
-    # Create new user with must_change_password=True
     hashed_password = get_password_hash(user_data.password)
     new_user = db_models.User(
         username=user_data.username,
@@ -156,7 +157,7 @@ async def create_user(
 
 
 @router.put("/users/{user_id}", response_model=User)
-async def update_user(
+def update_user(
     user_id: int,
     user_data: UserUpdate,
     current_user: User = Depends(get_current_admin_user),
@@ -166,6 +167,8 @@ async def update_user(
     user = db.query(db_models.User).filter(db_models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    # Auth cache is keyed by the pre-edit username.
+    username_before_update = user.username
 
     # Prevent admin from disabling themselves
     if user.id == current_user.id and user_data.disabled:
@@ -175,9 +178,7 @@ async def update_user(
     if user.id == current_user.id and user_data.is_admin is False:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot remove your own admin privileges")
 
-    # Update fields
     if user_data.email is not None:
-        # Check if email already exists for another user
         existing_email = (
             db.query(db_models.User)
             .filter(db_models.User.email == user_data.email, db_models.User.id != user_id)
@@ -197,12 +198,10 @@ async def update_user(
         user.is_admin = user_data.is_admin
 
     if user_data.password is not None:
-        # Validate password requirements
         is_valid, error_message = validate_password(user_data.password)
         if not is_valid:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error_message)
         user.hashed_password = get_password_hash(user_data.password)
-        # Reset must_change_password when admin sets a new password
         user.must_change_password = True
 
     if user_data.must_change_password is not None:
@@ -210,6 +209,7 @@ async def update_user(
 
     db.commit()
     db.refresh(user)
+    invalidate_user_cache(username_before_update)
 
     return User(
         username=user.username,
@@ -223,9 +223,7 @@ async def update_user(
 
 
 @router.delete("/users/{user_id}")
-async def delete_user(
-    user_id: int, current_user: User = Depends(get_current_admin_user), db: Session = Depends(get_db)
-):
+def delete_user(user_id: int, current_user: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
     """Delete a user (admin only)"""
     user = db.query(db_models.User).filter(db_models.User.id == user_id).first()
     if not user:
@@ -235,13 +233,55 @@ async def delete_user(
     if user.id == current_user.id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete your own account")
 
-    # Delete user's secrets and connections first (cascade)
-    db.query(db_models.Secret).filter(db_models.Secret.user_id == user_id).delete()
-    db.query(db_models.DatabaseConnection).filter(db_models.DatabaseConnection.user_id == user_id).delete()
-    db.query(db_models.CloudStorageConnection).filter(db_models.CloudStorageConnection.user_id == user_id).delete()
+    # Personal credential rows — everything keyed by user_id in the sharing
+    # registry: secrets + all connection types — die with the user, including any
+    # sharing grants on them: SQLite reuses rowids, so a stale grant would attach
+    # to a future resource created with the same id. Catalog content
+    # (owner_id/created_by keyed) is deliberately retained, so its grants stay
+    # meaningful. Groups the user ran persist; global admins can administer them.
+    for resource_type, spec in sharing.RESOURCE_REGISTRY.items():
+        if spec.owner_attr != "user_id":
+            continue
+        resource_ids = [row[0] for row in db.query(spec.model.id).filter(spec.model.user_id == user_id)]
+        if not resource_ids:
+            continue
+        db.query(db_models.ResourceGrant).filter(
+            db_models.ResourceGrant.resource_type == resource_type,
+            db_models.ResourceGrant.resource_id.in_(resource_ids),
+        ).delete(synchronize_session=False)
+        db.query(spec.model).filter(spec.model.id.in_(resource_ids)).delete(synchronize_session=False)
+    sharing.delete_memberships_for_user(db, user_id)
+
+    # workspace_projects is not share-registered, so plain row deletion suffices.
+    # Removing these prevents a future user receiving the same rowid from inheriting
+    # an orphan is_active=True project (rowid reuse; SQLite FK enforcement is off).
+    db.query(db_models.WorkspaceProject).filter(db_models.WorkspaceProject.owner_id == user_id).delete(
+        synchronize_session=False
+    )
+
+    # Notification channels hold an encrypted webhook credential and rules keep alerting
+    # after the owner is gone — a reused user rowid would inherit both. History rows go
+    # with the channels (that is also how history ownership is resolved).
+    channel_ids = [
+        row[0]
+        for row in db.query(db_models.NotificationChannel.id).filter(
+            db_models.NotificationChannel.owner_id == user_id
+        )
+    ]
+    if channel_ids:
+        db.query(db_models.NotificationOutbox).filter(
+            db_models.NotificationOutbox.channel_id.in_(channel_ids)
+        ).delete(synchronize_session=False)
+    db.query(db_models.NotificationRule).filter(db_models.NotificationRule.owner_id == user_id).delete(
+        synchronize_session=False
+    )
+    db.query(db_models.NotificationChannel).filter(db_models.NotificationChannel.owner_id == user_id).delete(
+        synchronize_session=False
+    )
 
     db.delete(user)
     db.commit()
+    invalidate_user_cache(user.username)
 
     return {"message": f"User '{user.username}' deleted successfully"}
 
@@ -250,7 +290,7 @@ async def delete_user(
 
 
 @router.post("/users/me/change-password", response_model=User)
-async def change_own_password(
+def change_own_password(
     password_data: ChangePassword, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)
 ):
     """Change the current user's password"""
@@ -258,20 +298,18 @@ async def change_own_password(
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    # Verify current password
     if not verify_password(password_data.current_password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
 
-    # Validate new password requirements
     is_valid, error_message = validate_password(password_data.new_password)
     if not is_valid:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error_message)
 
-    # Update password and clear must_change_password flag
     user.hashed_password = get_password_hash(password_data.new_password)
     user.must_change_password = False
     db.commit()
     db.refresh(user)
+    invalidate_user_cache(user.username)
 
     return User(
         username=user.username,

@@ -2,38 +2,67 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
+import re
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import polars as pl
+from requests.exceptions import RequestException
 
+from flowfile_core.auth import sharing
 from flowfile_core.catalog.constants import QUERY_VIRTUAL_TABLE_RECURSION_LIMIT
 from flowfile_core.catalog.delta_utils import check_source_versions_current, is_delta_table
 from flowfile_core.catalog.exceptions import (
+    CatalogError,
     FlowNotFoundError,
+    NotAuthorizedError,
+    NotAVirtualTableError,
     TableNotFoundError,
+    WorkerUnavailableError,
 )
 from flowfile_core.catalog.repository import CatalogRepository
 from flowfile_core.catalog.services._resolve import resolve_or_log
 from flowfile_core.catalog.services.namespaces import NamespaceService
 from flowfile_core.catalog.services.schedules import ScheduleService
 from flowfile_core.catalog.services.tables import TableService
+from flowfile_core.catalog.storage_backend import _is_cloud_uri, resolve_for_namespace, serialized_frame_uses_cloud
 from flowfile_core.catalog.text_utils import (
+    hash_source_versions,
     is_table_reference,
     rewrite_qualified_references,
 )
 from flowfile_core.catalog.validators import format_full_name
 from flowfile_core.configs.flow_logger import FlowLogger, NodeLogger
 from flowfile_core.database.models import CatalogTable
-from flowfile_core.schemas.catalog_schema import CatalogTableOut
+from flowfile_core.flowfile.flow_data_engine.cloud_storage_reader import CloudStorageReader
+from flowfile_core.flowfile.flow_data_engine.subprocess_operations.subprocess_operations import (
+    trigger_resolve_virtual_table,
+)
+from flowfile_core.flowfile.parameter_resolver import node_parameters_resolved
+from flowfile_core.schemas.catalog_schema import CatalogTableMaterializeResult, CatalogTableOut
+from shared.delta_utils import validate_catalog_path
+from shared.storage_config import storage
 
 if TYPE_CHECKING:
     from flowfile_core.catalog.services.sql import SqlService
 
 logger = logging.getLogger(__name__)
+
+# Explicit-clear sentinel: distinguishes "leave source_table_versions untouched"
+# (argument omitted) from "clear it" (None passed).
+_UNSET: str = "\x00unset\x00"
+
+_ABS_PATH_RE = re.compile(r"(?:/[\w.\-]+){2,}")
+
+
+def _scrub_abs_paths(text: str) -> str:
+    """Replace absolute filesystem paths in error text with their basename so callers don't learn server layout."""
+    return _ABS_PATH_RE.sub(lambda m: m.group(0).rsplit("/", 1)[-1], text)
 
 
 def _should_offload() -> bool:
@@ -41,6 +70,13 @@ def _should_offload() -> bool:
     from flowfile_core.configs.settings import OFFLOAD_TO_WORKER
 
     return OFFLOAD_TO_WORKER.value
+
+
+def _project_sync_tables(owner_id: int) -> None:
+    """Mirror a SQL-view create/update into the active project's tables.yaml (no-op when none active)."""
+    from flowfile_core.project import project_sync
+
+    project_sync.tables_changed(owner_id)
 
 
 class VirtualTableService:
@@ -119,9 +155,15 @@ class VirtualTableService:
         is_optimized: bool | None = None,
         schema_json: str | None = None,
         polars_plan: str | None = None,
-        source_table_versions: str | None = None,
+        source_table_versions: str | None = _UNSET,
     ) -> CatalogTableOut:
-        """Update a virtual flow table's metadata or producer."""
+        """Update a virtual flow table's metadata or producer.
+
+        ``source_table_versions`` uses an explicit-clear sentinel: passing None
+        clears the stored fingerprint (a write whose sources can no longer be
+        fingerprinted must not leave a stale one behind); omitting the argument
+        leaves it untouched.
+        """
         table = self.repo.get_table(table_id)
         if table is None or getattr(table, "table_type", "physical") != "virtual":
             raise TableNotFoundError(table_id=table_id)
@@ -145,7 +187,7 @@ class VirtualTableService:
             table.schema_json = schema_json
         if polars_plan is not None:
             table.polars_plan = polars_plan
-        if source_table_versions is not None:
+        if source_table_versions is not _UNSET:
             table.source_table_versions = source_table_versions
 
         table = self.repo.update_table(table)
@@ -201,6 +243,7 @@ class VirtualTableService:
             column_count=len(schema_list),
         )
         table = self.repo.create_table(table)
+        _project_sync_tables(owner_id)
         return self._tables.table_to_out(table)
 
     def update_query_virtual_table(
@@ -248,10 +291,25 @@ class VirtualTableService:
         table = self.repo.update_table(table)
 
         self._schedules.safely_fire_table_trigger_schedules(table.id, table.updated_at)
+        _project_sync_tables(table.owner_id)
 
         return self._tables.table_to_out(table)
 
     # ---- Resolution ------------------------------------------------------ #
+
+    def _table_query_aliases(self, table: CatalogTable, bare_unique: bool, path_cache: dict) -> set[str]:
+        """SQL-registerable names for a table: fully-qualified ``catalog.schema.table``,
+        the 2-part ``schema.table``, and the bare name when globally unique. ``path_cache``
+        memoizes namespace-path lookups across the table set."""
+        nid = table.namespace_id
+        if nid not in path_cache:
+            path_cache[nid] = self._namespaces.resolve_namespace_path(nid)
+        ns_path = path_cache[nid]
+        schema_name = ns_path.rsplit(".", 1)[-1] if ns_path else None
+        names = {format_full_name(schema_name, table.name), format_full_name(ns_path, table.name)}
+        if bare_unique:
+            names.add(table.name)
+        return names
 
     def resolve_query_virtual_table(
         self,
@@ -275,25 +333,37 @@ class VirtualTableService:
         if table is None or not getattr(table, "sql_query", None):
             raise TableNotFoundError(table_id=table_id)
 
+        from shared.sql_validation import validate_sql_query
+
+        # Re-validate the stored query at resolve time: a query persisted before
+        # validation existed (or written straight to the DB) must not run unchecked.
+        validate_sql_query(table.sql_query)
+
         all_tables = [t for t in self.repo.list_tables() if t.id != table_id]
         bare_counts: dict[str, int] = {}
         for t in all_tables:
             bare_counts[t.name] = bare_counts.get(t.name, 0) + 1
 
+        path_cache: dict[int | None, str | None] = {}
         aliases_by_table: dict[int, list[str]] = {}
         alias_to_table: dict[str, CatalogTable] = {}
         for t in all_tables:
-            ns_name = self._namespaces.resolve_namespace_name(t.namespace_id)
-            qualified = format_full_name(ns_name, t.name)
-            aliases = [qualified]
-            if bare_counts.get(t.name, 0) == 1 and qualified != t.name:
-                aliases.append(t.name)
-            aliases_by_table[t.id] = aliases
+            aliases = self._table_query_aliases(t, bare_counts.get(t.name, 0) == 1, path_cache)
+            aliases_by_table[t.id] = list(aliases)
             for alias in aliases:
                 alias_to_table[alias] = t
 
         rewritten_query = rewrite_qualified_references(table.sql_query, alias_to_table.keys())
         referenced_ids = {tbl.id for alias, tbl in alias_to_table.items() if is_table_reference(alias, rewritten_query)}
+
+        if sharing.sharing_enabled() and user_id is not None and referenced_ids:
+            db = getattr(self.repo, "_db", None)
+            if db is None:
+                # No session to verify grants with: fail closed.
+                raise NotAuthorizedError(user_id, "use a table referenced by this query")
+            for ref_id in referenced_ids:
+                if not sharing.user_id_can_use(db, user_id, "catalog_table", ref_id):
+                    raise NotAuthorizedError(user_id, "use a table referenced by this query")
 
         sql_context = pl.SQLContext()
         for tbl_id in referenced_ids:
@@ -326,7 +396,12 @@ class VirtualTableService:
                     kind="nested query virtual table",
                     identifier=t.name,
                 )
-            if t.is_optimized and t.serialized_lazy_frame and check_source_versions_current(t.source_table_versions):
+            if (
+                t.is_optimized
+                and t.serialized_lazy_frame
+                and not serialized_frame_uses_cloud(t.serialized_lazy_frame)
+                and check_source_versions_current(t.source_table_versions)
+            ):
                 return pl.LazyFrame.deserialize(io.BytesIO(t.serialized_lazy_frame))
             if t.producer_registration_id:
                 return resolve_or_log(
@@ -335,6 +410,12 @@ class VirtualTableService:
                     identifier=t.name,
                 )
             return None
+        if t.file_path and _is_cloud_uri(t.file_path):
+            target = resolve_for_namespace(t.namespace_id)
+            # The resolved frame is shipped to the worker, so the credentials must not sit in the plan.
+            return pl.scan_delta(
+                t.file_path, **CloudStorageReader.get_secure_scan_kwargs(target.storage_options, user_id)
+            )
         if t.file_path and is_delta_table(Path(t.file_path)):
             return pl.scan_delta(t.file_path)
         return None
@@ -364,7 +445,11 @@ class VirtualTableService:
         if table.sql_query:
             return self.resolve_query_virtual_table(table_id, user_id=user_id)
 
-        if table.is_optimized and table.serialized_lazy_frame:
+        if (
+            table.is_optimized
+            and table.serialized_lazy_frame
+            and not serialized_frame_uses_cloud(table.serialized_lazy_frame)
+        ):
             if check_source_versions_current(table.source_table_versions):
                 return pl.LazyFrame.deserialize(io.BytesIO(table.serialized_lazy_frame))
             logger.info(
@@ -386,13 +471,19 @@ class VirtualTableService:
 
         if selected_node is None:
             raise ValueError(f"No catalog_writer node for table '{table.name}' in flow '{producer.name}'")
-        selected_node.execute_node(
-            run_location=run_location,
-            reset_cache=True,
-            performance_mode=True,
-            optimize_for_downstream=False,
-            node_logger=node_logger,
-        )
+        # Running the writer directly bypasses the producer flow's run loop, so its own
+        # ${name} refs and those of the upstream nodes it pulls are still unresolved.
+        upstream = [flow.get_node(i) for i in flow._get_upstream_node_ids(selected_node.node_id)]
+        with ExitStack() as params:
+            for node in [selected_node, *upstream]:
+                params.enter_context(node_parameters_resolved(node))
+            selected_node.execute_node(
+                run_location=run_location,
+                reset_cache=True,
+                performance_mode=True,
+                optimize_for_downstream=False,
+                node_logger=node_logger,
+            )
 
         if selected_node.results.errors:
             raise ValueError(f"Flow errors for table '{table.name}': {selected_node.results.errors}")
@@ -401,13 +492,63 @@ class VirtualTableService:
         if flowframe is None or flowframe.data_frame is None:
             raise ValueError(f"No data produced for table '{table.name}'")
 
-        flowframe.lazy = True
-        return flowframe.data_frame
+        # Do not mutate the shared memoized engine; .lazy() is an identity on
+        # LazyFrames and a cheap wrap on eager frames.
+        return flowframe.data_frame.lazy()
+
+    def fresh_versions_hash(self, table_id: int) -> str:
+        """Cache key for a virtual table's worker IPC snapshot, read post-resolution.
+
+        Resolution may re-run the producer flow, whose write re-stamps
+        ``source_table_versions`` in a separate session — so this bypasses the
+        session identity map. Callers must invoke it AFTER resolution, or they
+        key the cache on the pre-resolution fingerprint and the worker serves
+        the old snapshot while the fresh compute is discarded.
+        """
+        table = self.repo.get_table_fresh(table_id)
+        return hash_source_versions(table.source_table_versions if table is not None else None)
+
+    def materialize_virtual_table(self, table_id: int, user_id: int | None = None) -> CatalogTableMaterializeResult:
+        """Resolve a virtual table and have the worker materialise it to a kernel-readable IPC file.
+
+        Every call rebuilds the snapshot: a serialised plan records table paths,
+        not data, so its sha256 stays constant when referenced data changes.
+        The plan hash therefore only names the snapshot file (the worker skips
+        its idempotency cache for the kernel_shared target).
+        """
+        table = self.repo.get_table(table_id)
+        if table is None:
+            raise TableNotFoundError(table_id=table_id)
+        if getattr(table, "table_type", "physical") != "virtual":
+            raise NotAVirtualTableError(table_id=table_id)
+
+        try:
+            plan_bytes = self.resolve_virtual_flow_table(table_id, user_id=user_id).serialize()
+        except (CatalogError, ValueError):
+            raise
+        except pl.exceptions.PolarsError as e:
+            # e.g. a circular view leaves an unregistered relation behind.
+            raise ValueError(f"Could not resolve virtual table '{table.name}': {_scrub_abs_paths(str(e))}") from e
+
+        key = hashlib.sha256(plan_bytes).hexdigest()
+        try:
+            result = trigger_resolve_virtual_table(table_id, plan_bytes, key, target="kernel_shared")
+        except (RequestException, RuntimeError) as e:
+            raise WorkerUnavailableError(_scrub_abs_paths(str(e))) from e
+        ipc_path = validate_catalog_path(result["ipc_path"], storage.shared_virtual_results_directory)
+        return CatalogTableMaterializeResult(
+            path=str(ipc_path),
+            row_count=result["row_count"],
+            mtime=result["mtime"],
+        )
 
     # ---- Discovery ------------------------------------------------------- #
 
     def resolve_all_delta_tables(self) -> dict[str, str]:
-        """Return a mapping of logical table name -> directory name for all Delta catalog tables."""
+        """Return a mapping of logical table name -> directory name for LOCAL Delta catalog tables.
+
+        Object-storage tables are excluded — the dir-name + local-root model can't address them.
+        """
         tables = self.repo.list_tables()
         return {
             table.name: Path(table.file_path).name
@@ -415,27 +556,62 @@ class VirtualTableService:
             if table.file_path and is_delta_table(Path(table.file_path))
         }
 
-    def resolve_all_queryable_tables(self) -> tuple[dict[str, str], dict[str, int]]:
-        """Return Delta + virtual name maps, keyed by qualified name and by bare name (when unique)."""
+    def resolve_all_queryable_tables(
+        self, accessible_table_ids: set[int] | None = None
+    ) -> tuple[dict[str, str], dict[str, int]]:
+        """Return Delta + virtual name maps, keyed by qualified name and by bare name (when unique).
+
+        ``accessible_table_ids`` (set in multi-user mode) restricts the registered
+        tables to the ones the requesting user may read, so SQL cannot reach a
+        table the user cannot see.
+
+        Object-storage tables are excluded from this worker-offloaded SQL path; cloud catalog SQL
+        runs through the flow_graph catalog-SQL node instead.
+        """
         tables = self.repo.list_tables()
+        if accessible_table_ids is not None:
+            tables = [t for t in tables if t.id in accessible_table_ids]
         bare_counts: dict[str, int] = {}
         for t in tables:
             if t.table_type == "virtual" or (t.file_path and is_delta_table(Path(t.file_path))):
                 bare_counts[t.name] = bare_counts.get(t.name, 0) + 1
 
+        path_cache: dict[int | None, str | None] = {}
         delta_map: dict[str, str] = {}
         virtual_map: dict[str, int] = {}
         for table in tables:
-            ns_name = self._namespaces.resolve_namespace_name(table.namespace_id)
-            qualified = format_full_name(ns_name, table.name)
-            include_bare = bare_counts.get(table.name, 0) == 1
+            aliases = self._table_query_aliases(table, bare_counts.get(table.name, 0) == 1, path_cache)
             if table.table_type == "virtual":
-                virtual_map[qualified] = table.id
-                if include_bare and qualified != table.name:
-                    virtual_map[table.name] = table.id
+                for alias in aliases:
+                    virtual_map[alias] = table.id
             elif table.file_path and is_delta_table(Path(table.file_path)):
                 dir_name = Path(table.file_path).name
-                delta_map[qualified] = dir_name
-                if include_bare and qualified != table.name:
-                    delta_map[table.name] = dir_name
+                for alias in aliases:
+                    delta_map[alias] = dir_name
         return delta_map, virtual_map
+
+    def resolve_cloud_only_table_aliases(
+        self, accessible_table_ids: set[int] | None = None, exclude: set[str] | frozenset = frozenset()
+    ) -> dict[str, str]:
+        """Map each SQL name of an object-storage-backed physical table to its fully-qualified
+        display name. These tables are excluded from the worker-offloaded SQL path (known
+        limitation), so the SQL editor uses this to return a clear error instead of a raw
+        'relation not found'. ``exclude`` drops names also served by a queryable table."""
+        tables = self.repo.list_tables()
+        if accessible_table_ids is not None:
+            tables = [t for t in tables if t.id in accessible_table_ids]
+        bare_counts: dict[str, int] = {}
+        for t in tables:
+            if t.table_type != "virtual" and t.file_path and _is_cloud_uri(t.file_path):
+                bare_counts[t.name] = bare_counts.get(t.name, 0) + 1
+        path_cache: dict[int | None, str | None] = {}
+        aliases: dict[str, str] = {}
+        for table in tables:
+            if table.table_type == "virtual" or not table.file_path or not _is_cloud_uri(table.file_path):
+                continue
+            names = self._table_query_aliases(table, bare_counts.get(table.name, 0) == 1, path_cache)
+            display = format_full_name(path_cache.get(table.namespace_id), table.name)
+            for name in names:
+                if name not in exclude:
+                    aliases[name] = display
+        return aliases

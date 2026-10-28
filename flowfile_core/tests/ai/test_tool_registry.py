@@ -17,7 +17,7 @@ Cases:
 * ``test_surface_presets_resolve_to_known_tools`` — every preset name maps
   to a tool actually present in the catalog.
 * ``test_category_presets_resolve_to_known_tools`` — same for categories.
-* ``test_cmd_k_surface_is_narrow`` — ``cmd_k`` returns ≤ 8 tools (D002 narrow
+* ``test_cmd_k_surface_is_narrow`` — ``cmd_k`` returns ≤ 8 tools (narrow
   surface budget).
 * ``test_explain_surface_is_read_only`` — ``explain`` returns only schema-ops.
 * ``test_agent_surface_first_stage_is_meta_only`` — ``agent`` returns only
@@ -36,7 +36,7 @@ Cases:
 * ``test_user_defined_node_appears_in_catalog`` — UDFs registered via the
   custom-node store show up under ``flowfile.graph.add_<udf_type>``.
 * ``test_lazy_litellm_import`` — importing the tools package does not pull
-  in litellm (mirrors W11/W12/W13 contract).
+  in litellm (mirrors the other AI modules' contract).
 * ``test_descriptions_are_non_empty`` — every tool has a non-empty
   description (the LLM uses these to disambiguate).
 """
@@ -70,9 +70,7 @@ _NODE_TOOL_RE = re.compile(r"^flowfile\.graph\.add_[a-z_][a-z0-9_]*$")
 _OPS_TOOL_RE = re.compile(r"^flowfile\.(graph|schema|codegen|meta)\.[a-z_][a-z0-9_]*$")
 
 
-# ---------------------------------------------------------------------------
 # Catalog shape
-# ---------------------------------------------------------------------------
 
 
 def test_full_catalog_min_size() -> None:
@@ -117,8 +115,8 @@ def test_w47_update_node_settings_present_in_catalog() -> None:
 
     # The universal-ops derivation auto-includes ``update_node_settings``
     # in every surface preset alongside add_node / connect / delete_node /
-    # delete_connection. (W71 — CATEGORY_PRESETS removed alongside
-    # the legacy two-stage agent surface; only SURFACE_PRESETS remains.)
+    # delete_connection. CATEGORY_PRESETS was removed alongside
+    # the legacy two-stage agent surface; only SURFACE_PRESETS remains.
     from flowfile_core.ai.tools.registry import (
         SURFACE_PRESETS,
         _UNIVERSAL_OP_NAMES,
@@ -136,9 +134,7 @@ def test_w47_update_node_settings_present_in_catalog() -> None:
         )
 
 
-# ---------------------------------------------------------------------------
 # Naming convention
-# ---------------------------------------------------------------------------
 
 
 def test_node_tool_names_follow_mcp_convention() -> None:
@@ -171,9 +167,7 @@ def test_mcp_tool_name_helper() -> None:
         mcp_tool_name("graph", "add filter")  # space in op
 
 
-# ---------------------------------------------------------------------------
 # JSON Schema dialect
-# ---------------------------------------------------------------------------
 
 
 def _validate_schema(schema: dict, *, ctx: str) -> None:
@@ -207,9 +201,7 @@ def test_ops_tool_parameters_are_valid_json_schema() -> None:
         _validate_schema(tool.parameters, ctx=tool.name)
 
 
-# ---------------------------------------------------------------------------
 # Surface / category presets
-# ---------------------------------------------------------------------------
 
 
 def test_surface_preset_keys_match_literal() -> None:
@@ -273,9 +265,7 @@ def test_unknown_surface_raises() -> None:
         build_tool_catalog(surface="nonsense")
 
 
-# ---------------------------------------------------------------------------
 # UDF integration
-# ---------------------------------------------------------------------------
 
 
 def test_user_defined_node_appears_in_catalog() -> None:
@@ -300,15 +290,13 @@ def test_user_defined_node_appears_in_catalog() -> None:
             node_store_mod.CUSTOM_NODE_STORE.update(original)
 
 
-# ---------------------------------------------------------------------------
 # Lazy-import contract
-# ---------------------------------------------------------------------------
 
 
 def test_lazy_litellm_import() -> None:
     """Importing flowfile_core.ai.tools must not pull in litellm.
 
-    Mirrors the W11/W12/W13 contract — keeps cold-start import cheap and
+    Mirrors the other AI modules' contract — keeps cold-start import cheap and
     avoids exposing module-walk tooling to vendor SDK side effects.
     """
     # Drop any cached litellm + tools modules so the re-import is honest.
@@ -322,9 +310,7 @@ def test_lazy_litellm_import() -> None:
     assert "litellm" not in sys.modules
 
 
-# ---------------------------------------------------------------------------
 # Description quality (the model uses these to disambiguate)
-# ---------------------------------------------------------------------------
 
 
 def test_descriptions_are_non_empty() -> None:
@@ -336,9 +322,7 @@ def test_descriptions_are_non_empty() -> None:
         assert len(tool.description) <= 2000, f"{tool.name} description too long: {len(tool.description)} chars"
 
 
-# ---------------------------------------------------------------------------
 # Coverage cross-check: every node-type ToolSpec round-trips
-# ---------------------------------------------------------------------------
 
 
 def test_every_node_type_in_catalog_has_corresponding_settings_class() -> None:
@@ -354,18 +338,16 @@ def test_every_node_type_in_catalog_has_corresponding_settings_class() -> None:
         )
 
 
-# ---------------------------------------------------------------------------
 # long_description coverage (per-node-type narrative docs)
-# ---------------------------------------------------------------------------
 
 
 # Sanity floor for narrative docs — short enough that placeholder strings
 # trip the test, long enough that "filters rows" alone wouldn't pass.
-_W56_LONG_DESCRIPTION_MIN_CHARS = 80
+_LONG_DESCRIPTION_MIN_CHARS = 80
 
 
 def test_w56_every_node_type_has_long_description() -> None:
-    """AC1 + AC7 — every NODE_TYPE_TO_SETTINGS_CLASS entry surfaces narrative docs.
+    """Every NODE_TYPE_TO_SETTINGS_CLASS entry surfaces narrative docs.
 
     Without this guard, a future node type can land without docs and the
     agent surface silently degrades back to JSON-Schema-only grounding.
@@ -380,11 +362,11 @@ def test_w56_every_node_type_has_long_description() -> None:
         if not text:
             missing.append(node_type)
             continue
-        if len(text) < _W56_LONG_DESCRIPTION_MIN_CHARS:
+        if len(text) < _LONG_DESCRIPTION_MIN_CHARS:
             too_short.append((node_type, len(text)))
     assert not missing, f"node types missing long_description: {missing}"
     assert not too_short, (
-        f"node types with stub-shaped long_description " f"(< {_W56_LONG_DESCRIPTION_MIN_CHARS} chars): {too_short}"
+        f"node types with stub-shaped long_description " f"(< {_LONG_DESCRIPTION_MIN_CHARS} chars): {too_short}"
     )
 
 
@@ -393,7 +375,7 @@ def test_w56_ops_tools_have_long_descriptions() -> None:
     too_short: list[tuple[str, int]] = []
     for tool in (*GRAPH_OPS_TOOLS, *SCHEMA_OPS_TOOLS, *CODEGEN_OPS_TOOLS, *META_OPS_TOOLS):
         text = (tool.long_description or "").strip()
-        if len(text) < _W56_LONG_DESCRIPTION_MIN_CHARS:
+        if len(text) < _LONG_DESCRIPTION_MIN_CHARS:
             too_short.append((tool.name, len(text)))
     assert not too_short, f"ops tools with missing/short long_description: {too_short}"
 
@@ -420,12 +402,10 @@ def test_w56_long_description_does_not_duplicate_short_description() -> None:
         )
 
 
-# ---------------------------------------------------------------------------
 # v2 — user_instructions field (chat / advisory surfaces)
-# ---------------------------------------------------------------------------
 
 
-_W56_USER_INSTRUCTIONS_MIN_CHARS = 200  # higher than long_description floor —
+_USER_INSTRUCTIONS_MIN_CHARS = 200  # higher than long_description floor —
 # user_instructions has more required content (settings + worked example +
 # pitfall) and should always be substantive.
 
@@ -447,11 +427,11 @@ def test_w56v2_every_node_type_has_user_instructions() -> None:
         if not text:
             missing.append(node_type)
             continue
-        if len(text) < _W56_USER_INSTRUCTIONS_MIN_CHARS:
+        if len(text) < _USER_INSTRUCTIONS_MIN_CHARS:
             too_short.append((node_type, len(text)))
     assert not missing, f"node types missing user_instructions: {missing}"
     assert not too_short, (
-        f"node types with stub-shaped user_instructions " f"(< {_W56_USER_INSTRUCTIONS_MIN_CHARS} chars): {too_short}"
+        f"node types with stub-shaped user_instructions " f"(< {_USER_INSTRUCTIONS_MIN_CHARS} chars): {too_short}"
     )
 
 
@@ -535,9 +515,7 @@ def test_w56v2_palette_labels_match_node_store() -> None:
     assert palette_label_for("filter") == "Filter data"
 
 
-# ---------------------------------------------------------------------------
 # v2 — agent_payload_example field (Pydantic-shape drift guard)
-# ---------------------------------------------------------------------------
 
 
 def test_w56v2_agent_payload_examples_validate() -> None:
@@ -623,7 +601,7 @@ def test_w56v2_agent_payload_examples_surface_on_agent_only() -> None:
     user_instructions, not agent payloads. cmd_k / ghost_node get the
     agent-shaped catalog but their preset filters out group_by / pivot /
     fuzzy_match / etc. (they only carry a narrow set of common transforms).
-    (W71 — legacy ``"agent"`` surface removed; ``agent_complex``
+    (The legacy ``"agent"`` surface has been removed; ``agent_complex``
     is the only full-catalog surface left.)
     """
     from flowfile_core.ai.context.builder import assemble_system_prompt
@@ -647,14 +625,12 @@ def test_w56v2_agent_payload_examples_surface_on_agent_only() -> None:
     assert user_marker in explain_prompt.lower(), "explain surface missing user-instructions worked example"
 
 
-# ---------------------------------------------------------------------------
 # v2 — frontend sidebar label cross-check
-# ---------------------------------------------------------------------------
 
 
 def test_w56v2_sidebar_labels_match_frontend() -> None:
     """v2 — every NODE_GROUP_TO_SIDEBAR_LABEL value appears verbatim
-    in the frontend's NodeList.vue.
+    in the frontend's usePaletteGroups.ts (BUILTIN_GROUPS, extracted from NodeList.vue).
 
     Brittle by design: a frontend rename must propagate to the catalog,
     or this test fails. Catches drift like "Aggregations" → "Group / Pivot"
@@ -666,27 +642,32 @@ def test_w56v2_sidebar_labels_match_frontend() -> None:
 
     # Walk up from this test file to the repo root, then to the frontend.
     repo_root = Path(__file__).resolve().parents[3]
-    nodelist_path = (
-        repo_root / "flowfile_frontend" / "src" / "renderer" / "app" / "views" / "DesignerView" / "NodeList.vue"
+    palette_groups_path = (
+        repo_root
+        / "flowfile_frontend"
+        / "src"
+        / "renderer"
+        / "app"
+        / "views"
+        / "DesignerView"
+        / "usePaletteGroups.ts"
     )
-    if not nodelist_path.is_file():
-        pytest.skip(f"frontend NodeList.vue not found at {nodelist_path}")
-    nodelist_text = nodelist_path.read_text(encoding="utf-8")
+    if not palette_groups_path.is_file():
+        pytest.skip(f"frontend usePaletteGroups.ts not found at {palette_groups_path}")
+    palette_groups_text = palette_groups_path.read_text(encoding="utf-8")
 
     drift: list[tuple[str, str]] = []
     for node_group, sidebar_label in NODE_GROUP_TO_SIDEBAR_LABEL.items():
-        if sidebar_label not in nodelist_text:
+        if sidebar_label not in palette_groups_text:
             drift.append((node_group, sidebar_label))
     assert not drift, (
-        "NODE_GROUP_TO_SIDEBAR_LABEL drifted from frontend NodeList.vue:\n"
+        "NODE_GROUP_TO_SIDEBAR_LABEL drifted from frontend usePaletteGroups.ts:\n"
         + "\n".join(f"  - node_group={ng!r} → label={label!r} not found" for ng, label in drift)
-        + f"\n(checked against {nodelist_path})"
+        + f"\n(checked against {palette_groups_path})"
     )
 
 
-# ---------------------------------------------------------------------------
 # nested-Pydantic shape pass-through (inline $ref)
-# ---------------------------------------------------------------------------
 
 
 def _walk_for_refs_and_defs(node: object, path: str = "") -> list[tuple[str, str]]:
@@ -720,7 +701,7 @@ def test_w67_nested_pydantic_field_inlined_at_property_site() -> None:
     raw_data_format = spec.parameters["properties"]["raw_data_format"]
 
     assert "$ref" not in raw_data_format, (
-        f"raw_data_format still emits $ref: {raw_data_format!r}. " "W67 inliner regressed."
+        f"raw_data_format still emits $ref: {raw_data_format!r}. " "The $ref inliner regressed."
     )
     assert (
         raw_data_format.get("type") == "object"
@@ -829,7 +810,7 @@ def test_w67_audit_known_nested_pydantic_fields_render_as_object() -> None:
                     f"{node_type}.{field_name}: array items expected type='object', got {items.get('type')!r}"
                 )
 
-    assert not failures, "W67 audit failures:\n" + "\n".join(f"  - {f}" for f in failures)
+    assert not failures, "$ref audit failures:\n" + "\n".join(f"  - {f}" for f in failures)
 
 
 def test_resolve_inner_input_field_handles_list_generic_alias() -> None:

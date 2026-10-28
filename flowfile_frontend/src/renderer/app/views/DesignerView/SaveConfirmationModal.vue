@@ -9,7 +9,10 @@
     :close-on-press-escape="false"
     @closed="handleDialogClosed"
   >
-    <span>Do you want to save changes to this flow before closing?</span>
+    <span v-if="currentFlowName">
+      Do you want to save changes to "{{ currentFlowName }}" before closing?
+    </span>
+    <span v-else>Do you want to save changes to this flow before closing?</span>
     <template #footer>
       <div class="dialog-footer">
         <el-button @click="handleDontSave">No</el-button>
@@ -22,27 +25,25 @@
 <script setup lang="ts">
 import { ref } from "vue";
 
-const emit = defineEmits(["save", "dont-save"]);
+const emit = defineEmits(["save", "dont-save", "cancelled"]);
 
-// Local state
 const isOpen = ref(false);
 const currentFlowId = ref<number | null>(null);
+const currentFlowName = ref<string | null>(null);
 const pendingAction = ref<"save" | "dont-save" | null>(null);
 
-// Open the modal with a specific flow ID
-const open = (flowId: number) => {
+const open = (flowId: number, flowName: string | null = null) => {
   currentFlowId.value = flowId;
+  currentFlowName.value = flowName;
   pendingAction.value = null;
   isOpen.value = true;
-  return flowId; // Return flowId for chaining if needed
+  return flowId;
 };
 
-// Close the modal
 const close = () => {
   isOpen.value = false;
 };
 
-// Handle save button click
 const handleSave = () => {
   if (currentFlowId.value !== null) {
     pendingAction.value = "save";
@@ -50,7 +51,6 @@ const handleSave = () => {
   }
 };
 
-// Handle don't save button click
 const handleDontSave = () => {
   if (currentFlowId.value !== null) {
     pendingAction.value = "dont-save";
@@ -58,7 +58,6 @@ const handleDontSave = () => {
   }
 };
 
-// After dialog has fully closed, emit the appropriate event
 const handleDialogClosed = () => {
   if (currentFlowId.value === null) return;
 
@@ -66,13 +65,14 @@ const handleDialogClosed = () => {
     emit("save", currentFlowId.value);
   } else if (pendingAction.value === "dont-save") {
     emit("dont-save", currentFlowId.value);
+  } else {
+    // Closed via the dialog X — no decision made.
+    emit("cancelled", currentFlowId.value);
   }
 
-  // Reset state
   pendingAction.value = null;
 };
 
-// Expose methods to parent component
 defineExpose({
   open,
   close,

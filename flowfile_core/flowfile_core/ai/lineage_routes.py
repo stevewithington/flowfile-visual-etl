@@ -48,10 +48,11 @@ from flowfile_core import flow_file_handler
 from flowfile_core.ai.byok import ProviderNotConfiguredError, get_configured_provider
 from flowfile_core.ai.context import render_prompt_context
 from flowfile_core.ai.providers import (
-    PROVIDERS,
+    LOCAL_PROVIDER_ID,
     Message,
     UnknownProviderError,
-    list_supported_providers,
+    is_resolvable_provider,
+    resolvable_provider_names,
 )
 from flowfile_core.ai.streaming import make_streaming_response, sse_stream
 from flowfile_core.auth.jwt import get_current_active_user
@@ -147,10 +148,10 @@ class _LineageWindow:
 
 
 def _ensure_known_provider(name: str) -> None:
-    if name not in PROVIDERS:
+    if not is_resolvable_provider(name):
         raise HTTPException(
             status_code=404,
-            detail=f"Unknown provider {name!r}; supported: {list_supported_providers()}",
+            detail=f"Unknown provider {name!r}; supported: {resolvable_provider_names()}",
         )
 
 
@@ -226,7 +227,12 @@ def _aggregate_node_results(
             success = raw.get("success")
             error = raw.get("error") or ""
             run_time_ms = raw.get("run_time_ms")
-            if success is True:
+            if raw.get("skipped") is True:
+                # Deliberate (gated-off) skip: success=True on the wire so the
+                # run stays green, but it is not an execution — keep it out of
+                # the success count and the 0ms out of the run-time median.
+                agg.skip_count += 1
+            elif success is True:
                 agg.success_count += 1
                 if isinstance(run_time_ms, int) and run_time_ms >= 0:
                     agg.run_times_ms.append(run_time_ms)
@@ -579,7 +585,7 @@ async def lineage_question(
 
     _ensure_known_provider(body.provider)
 
-    flow = flow_file_handler.get_flow(body.flow_id)
+    flow = flow_file_handler.get_flow(body.flow_id, current_user.id)
     if flow is None:
         raise HTTPException(status_code=422, detail=f"Flow {body.flow_id} not found")
 
@@ -611,6 +617,11 @@ async def lineage_question(
         pinned_node_ids,
         surface="lineage",
         samples_mode=body.samples_mode,
+        # Local model: shrink verbose settings + cap columns to fit its window,
+        # and take the on-device system prompt.
+        compact_settings=body.provider == LOCAL_PROVIDER_ID,
+        max_columns_per_node=12 if body.provider == LOCAL_PROVIDER_ID else None,
+        local=body.provider == LOCAL_PROVIDER_ID,
     )
 
     catalog_service = _build_catalog_service(db)

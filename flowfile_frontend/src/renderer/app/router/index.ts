@@ -1,8 +1,11 @@
+import { ElMessage } from "element-plus";
 import { createRouter, createWebHashHistory, RouteRecordRaw } from "vue-router";
 import AppLayout from "../layouts/AppLayout.vue";
 import authService from "../services/auth.service";
 import setupService from "../services/setup.service";
 import { useAuthStore } from "../stores/auth-store";
+import { rememberCatalogLocation } from "../views/CatalogView/catalogLastLocation";
+import { CHUNK_RELOAD_KEY, decideChunkRecovery } from "./chunkReload";
 
 const routes: Array<RouteRecordRaw> = [
   {
@@ -22,14 +25,41 @@ const routes: Array<RouteRecordRaw> = [
     meta: { requiresAuth: false },
   },
   {
+    // One flow's canvas notebook in its own window (the code dock's pop-out): outside AppLayout, so
+    // no sidebar, no app-wide modals, no update check.
+    path: "/notebook",
+    name: "notebookWindow",
+    component: () => import("../views/PopoutWindow/NotebookWindowView.vue"),
+    meta: { requiresAuth: true },
+  },
+  {
+    // The bottom dock's pop-outs: one flow's data preview or run logs, outside AppLayout like the notebook.
+    path: "/popout/table",
+    name: "tableWindow",
+    component: () => import("../views/PopoutWindow/TableWindowView.vue"),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: "/popout/logs",
+    name: "logsWindow",
+    component: () => import("../views/PopoutWindow/LogsWindowView.vue"),
+    meta: { requiresAuth: true },
+  },
+  {
     path: "/main",
     component: AppLayout,
     meta: { requiresAuth: true },
     children: [
       {
+        // App entry always lands in the designer; with no session active it
+        // shows an in-canvas empty state (Home stays on the sidebar).
         path: "",
-        name: "main",
         redirect: { name: "designer" },
+      },
+      {
+        path: "home",
+        name: "home",
+        component: () => import("../views/HomeView/HomeView.vue"),
       },
       {
         path: "designer",
@@ -42,14 +72,18 @@ const routes: Array<RouteRecordRaw> = [
         component: () => import("../features/designer/editor/fullEditor.vue"),
       },
       {
-        name: "documentation",
-        path: "documentation",
-        component: () => import("../views/DocumentationView/DocumentationView.vue"),
-      },
-      {
         name: "connections",
         path: "connections",
         component: () => import("../views/ConnectionsView/ConnectionsView.vue"),
+        // AI providers used to be a Connections tab; old bookmarks and docs
+        // links land on the AI settings page instead.
+        beforeEnter: (to) =>
+          to.query.tab === "ai" ? { name: "ai", query: { tab: "providers" } } : true,
+      },
+      {
+        name: "project",
+        path: "project",
+        component: () => import("../views/ProjectView/ProjectView.vue"),
       },
       {
         path: "databaseManager",
@@ -68,13 +102,27 @@ const routes: Array<RouteRecordRaw> = [
         redirect: { name: "connections", query: { tab: "secrets" } },
       },
       {
-        path: "aiProviders",
-        redirect: { name: "connections", query: { tab: "ai" } },
+        name: "ai",
+        path: "ai",
+        component: () => import("../views/AiSettingsView/AiSettingsView.vue"),
       },
       {
+        // Legacy alias: AI providers used to be a Connections tab.
+        name: "aiProviders",
+        path: "aiProviders",
+        redirect: { name: "ai", query: { tab: "providers" } },
+      },
+      {
+        name: "compute",
+        path: "compute",
+        component: () => import("../views/ComputeView/ComputeView.vue"),
+      },
+      {
+        // Legacy alias: old #/main/kernelManager bookmarks and any missed
+        // { name: "kernelManager" } caller land on the kernels tab.
         name: "kernelManager",
         path: "kernelManager",
-        component: () => import("../views/KernelManagerView/KernelManagerView.vue"),
+        redirect: { name: "compute", query: { tab: "kernels" } },
       },
       {
         name: "templates",
@@ -87,21 +135,30 @@ const routes: Array<RouteRecordRaw> = [
         component: () => import("../views/CatalogView/CatalogView.vue"),
       },
       {
-        name: "dashboard-new",
-        path: "dashboards/new",
-        component: () => import("../views/DashboardsView/DashboardEditorView.vue"),
-      },
-      {
-        name: "dashboard-edit",
-        path: "dashboards/:id/edit",
-        component: () => import("../views/DashboardsView/DashboardEditorView.vue"),
-        props: true,
-      },
-      {
-        name: "dashboard-view",
-        path: "dashboards/:id",
-        component: () => import("../views/DashboardsView/DashboardViewerView.vue"),
-        props: true,
+        // Dashboards are catalog pages: CatalogView keeps its tab bar (pinned to
+        // meta.catalogTab) and mounts the viewer/editor in its nested <router-view>.
+        path: "dashboards",
+        component: () => import("../views/CatalogView/CatalogView.vue"),
+        meta: { catalogTab: "visuals" },
+        children: [
+          {
+            name: "dashboard-new",
+            path: "new",
+            component: () => import("../views/DashboardsView/DashboardEditorView.vue"),
+          },
+          {
+            name: "dashboard-edit",
+            path: ":id/edit",
+            component: () => import("../views/DashboardsView/DashboardEditorView.vue"),
+            props: true,
+          },
+          {
+            name: "dashboard-view",
+            path: ":id",
+            component: () => import("../views/DashboardsView/DashboardViewerView.vue"),
+            props: true,
+          },
+        ],
       },
       {
         name: "nodeDesigner",
@@ -120,6 +177,12 @@ const routes: Array<RouteRecordRaw> = [
         component: () => import("../views/AdminView/AdminView.vue"),
         meta: { requiresAdmin: true, hideInElectron: true },
       },
+      {
+        name: "groups",
+        path: "groups",
+        component: () => import("../views/GroupsView/GroupsView.vue"),
+        meta: { dockerOnly: true },
+      },
     ],
   },
   {
@@ -131,6 +194,34 @@ const routes: Array<RouteRecordRaw> = [
 const router = createRouter({
   history: createWebHashHistory(import.meta.env.BASE_URL as string),
   routes,
+});
+
+router.onError((error, to) => {
+  const decision = decideChunkRecovery(
+    error,
+    to.fullPath,
+    sessionStorage.getItem(CHUNK_RELOAD_KEY),
+  );
+
+  if (decision === "not-a-chunk-error") {
+    console.error("[router] navigation failed", error);
+    return;
+  }
+
+  if (decision === "give-up") {
+    sessionStorage.removeItem(CHUNK_RELOAD_KEY);
+    console.error("[router] chunk still unavailable after reload", error);
+    ElMessage.error(
+      import.meta.env.DEV
+        ? "Could not load this page's code. Restart the dev server (npm run dev:web) and try again."
+        : "Could not load this page. Please reload the app.",
+    );
+    return;
+  }
+
+  sessionStorage.setItem(CHUNK_RELOAD_KEY, to.fullPath);
+  window.location.hash = to.fullPath;
+  window.location.reload();
 });
 
 let setupChecked = false;
@@ -147,7 +238,7 @@ router.beforeEach(async (to, _from, next) => {
     try {
       const status = await setupService.getSetupStatus(isSetupPage);
       // Update auth service with backend mode - this handles "flowfile run ui"
-      // where electronAPI doesn't exist but backend is in electron mode
+      // where the desktop runtime isn't present but the backend is in desktop mode
       authService.setModeFromBackend(status.mode);
       setupRequired = status.setup_required;
       setupChecked = status.mode !== "unknown";
@@ -157,7 +248,7 @@ router.beforeEach(async (to, _from, next) => {
     }
   }
 
-  if (!authService.isInElectronMode()) {
+  if (!authService.isInDesktopMode()) {
     if (setupRequired && !isSetupPage) {
       next({ name: "setup" });
       return;
@@ -169,7 +260,7 @@ router.beforeEach(async (to, _from, next) => {
     }
   } else {
     if (isSetupPage) {
-      next({ name: "designer" });
+      next({ name: "home" });
       return;
     }
   }
@@ -178,19 +269,19 @@ router.beforeEach(async (to, _from, next) => {
     await authStore.initialize();
   }
 
-  if (hideInElectron && authService.isInElectronMode()) {
-    next({ name: "designer" });
+  if (hideInElectron && authService.isInDesktopMode()) {
+    next({ name: "home" });
     return;
   }
 
   const dockerOnly = to.matched.some((record) => record.meta.dockerOnly);
-  if (dockerOnly && authService.isInElectronMode()) {
-    next({ name: "designer" });
+  if (dockerOnly && authService.isInDesktopMode()) {
+    next({ name: "home" });
     return;
   }
 
   if (requiresAuth) {
-    if (authService.isInElectronMode()) {
+    if (authService.isInDesktopMode()) {
       next();
       return;
     }
@@ -200,12 +291,22 @@ router.beforeEach(async (to, _from, next) => {
       next({ name: "login" });
     }
   } else {
-    if (to.name === "login" && (authService.isInElectronMode() || authService.isAuthenticated())) {
-      next({ name: "designer" });
+    if (to.name === "login" && (authService.isInDesktopMode() || authService.isAuthenticated())) {
+      next({ name: "home" });
     } else {
       next();
     }
   }
+});
+
+router.afterEach(() => {
+  sessionStorage.removeItem(CHUNK_RELOAD_KEY);
+});
+
+// Recorded here rather than in CatalogView so a navigation away mid-mount (its onMounted
+// awaits catalogStore.initialize()) can't record the destination's query instead.
+router.afterEach((to) => {
+  if (to.name === "catalog") rememberCatalogLocation(to.query);
 });
 
 export default router;

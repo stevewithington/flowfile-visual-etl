@@ -1,10 +1,23 @@
+import datetime
+from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
-from flowfile_core.flowfile.analytics.analytics_processor import AnalyticsProcessor
+import polars as pl
+import polars_gw
+import pytest
+
+from flowfile_core.flowfile.analytics.analytics_processor import (
+    AnalyticsProcessor,
+    validate_spec_list_with_data_model_types,
+)
+from flowfile_core.flowfile.analytics.graphic_walker import convert_ff_columns_to_gw_fields
+from flowfile_core.flowfile.analytics.node_viz import has_result_to_visualize
 from flowfile_core.flowfile.flow_data_engine.flow_data_engine import FlowDataEngine
 from flowfile_core.flowfile.flow_graph import FlowGraph, add_connection, delete_connection
 from flowfile_core.flowfile.handler import FlowfileHandler
 from flowfile_core.schemas import input_schema, schemas
+from flowfile_core.schemas.analysis_schemas.graphic_walker_schemas import DataModel
 
 
 def find_parent_directory(target_dir_name, start_path=None):
@@ -364,8 +377,8 @@ def create_big_flow():
     graph.add_formula(field_with_date)
     graph.add_formula(field_with_boolean)
     graph.add_explore_data(explore_data_settings)
-    add_manual_input(graph, data=input_schema.RawData.from_pylist([{'Column 1': 'edward', 'Column 2': 'test'}, {'Column 1': 'eduward', 'Column 2': 'xre'}]), node_id=4)  # add another manual input with different data types
-    add_manual_input(graph, data=input_schema.RawData.from_pylist([{'Column 3': 'edward', 'Column 4': 'test'}, {'Column 3': 'eduward', 'Column 4': 'xre'}]), node_id=5)  # add another manual input with different columns
+    add_manual_input(graph, data=input_schema.RawData.from_pylist([{'Column 1': 'edward', 'Column 2': 'test'}, {'Column 1': 'eduward', 'Column 2': 'xre'}]), node_id=4)
+    add_manual_input(graph, data=input_schema.RawData.from_pylist([{'Column 3': 'edward', 'Column 4': 'test'}, {'Column 3': 'eduward', 'Column 4': 'xre'}]), node_id=5)
     return graph
 
 
@@ -382,7 +395,8 @@ def expected_graphic_walker_data_not_run():
     return expected_data
 
 
-def test_analytics_data_generator_when_run_development_no_settings():
+def test_analytics_ships_no_rows_after_run():
+    """Rows never reach the browser: GraphicWalker aggregates on the worker."""
     graph = create_graph()
     graph.flow_settings.execution_mode = "Development"
     input_data = (FlowDataEngine.create_random(1000)
@@ -394,7 +408,8 @@ def test_analytics_data_generator_when_run_development_no_settings():
     graph.run_graph()
     node = graph.get_node(2)
     graphic_walker_input = AnalyticsProcessor.create_graphic_walker_input(node)
-    assert len(graphic_walker_input.dataModel.data) == 1_000, "Expected a data length of 1000"
+    assert graphic_walker_input.dataModel.data == [], "The setup payload must carry no rows"
+    assert [f.fid for f in graphic_walker_input.dataModel.fields] == ['groups', 'Country', 'Work']
 
 
 def test_analytics_processor_create_graphic_walker_input_not_run():
@@ -449,19 +464,15 @@ def test_analytics_processor_existing_specs_run():
     node = graph.get_node(2)
     graph.run_graph()
     graphic_walker_input = AnalyticsProcessor.create_graphic_walker_input(node, node.setting_input.graphic_walker_input)
-    expected_data = expected_graphic_walker_data_not_run()
-    expected_data['dataModel']['data'] = data.to_pylist()
-    assert graphic_walker_input.model_dump() == expected_data
+    # A run changes nothing about the setup payload — it is fields + specs either way.
+    assert graphic_walker_input.model_dump() == expected_graphic_walker_data_not_run()
 
 
 def test_analytics_changing_data_processor_existing_specs_run():
-    # In this scenario, we want to reset the data types of the columns in the graphic walker settings
     graph = create_big_flow()
 
     graph.get_node(2).get_predicted_schema()
-    # We want to run the graph in development mode
     graph.flow_settings.execution_mode = "Performance"
-    # Shuffle things up by changing the data type input. Instead of float, we get string as input
     delete_connection(graph, input_schema.NodeConnection.create_from_simple_input(2, 3))
     add_connection(graph, input_schema.NodeConnection.create_from_simple_input(8, 3))
 
@@ -479,7 +490,6 @@ def test_analytics_no_data_when_not_run_development():
     graph.flow_settings.execution_mode = "Development"
     node_step = graph.get_node(3)
     output = AnalyticsProcessor.process_graphic_walker_input(node_step)
-    assert not node_step.results.analysis_data_generator, 'The node should not have to run'
     assert not output.graphic_walker_input.dataModel.data, 'There should be no data in the graphic walker input'
 
 
@@ -488,50 +498,51 @@ def test_analytics_no_data_when_not_run_performance():
     graph.flow_settings.execution_mode = "Performance"
     node_step = graph.get_node(3)
     output = AnalyticsProcessor.process_graphic_walker_input(node_step)
-    assert not node_step.results.analysis_data_generator, 'The node should not have to run'
     assert not output.graphic_walker_input.dataModel.data, 'There should be no data in the graphic walker input'
 
 
-def test_analytics_data_generator_when_run_development():
+def test_analytics_no_data_when_run_development():
     graph = create_big_flow()
     graph.flow_settings.execution_mode = "Development"
     graph.run_graph()
     node_step = graph.get_node(3)
     output = AnalyticsProcessor.process_graphic_walker_input(node_step)
-    assert node_step.results.analysis_data_generator, 'The node should have to run'
-    assert output.graphic_walker_input.dataModel.data
+    assert not output.graphic_walker_input.dataModel.data
+    assert output.graphic_walker_input.dataModel.fields
 
 
-def test_analytics_data_generator_when_run_performance():
+def test_analytics_no_data_when_run_performance():
     graph = create_big_flow()
     graph.flow_settings.execution_mode = "Performance"
     graph.run_graph()
     node_step = graph.get_node(3)
     output = AnalyticsProcessor.process_graphic_walker_input(node_step)
-    assert node_step.results.analysis_data_generator, 'The node should have to run'
-    assert output.graphic_walker_input.dataModel.data
+    assert not output.graphic_walker_input.dataModel.data
+    assert output.graphic_walker_input.dataModel.fields
 
 
-def test_analytics_processor_from_parquet_file_run_performance():
+def test_explore_data_node_is_pass_through():
+    """The node no longer samples at run time; it forwards its input unchanged."""
     graph = create_graph()
     graph.flow_settings.execution_mode = "Performance"
 
     add_node_promise_on_type(graph, 'read', 1, 1)
-
     received_table = input_schema.ReceivedTable(file_type='parquet', name='table.parquet',
                                                 path='flowfile_core/tests/support_files/data/table.parquet')
     node_read = input_schema.NodeRead(flow_id=1, node_id=1, cache_data=False, received_file=received_table)
     graph.add_read(node_read)
     add_node_promise_on_type(graph, 'explore_data', 2, 1)
-    connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
-    add_connection(graph, connection)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
     graph.run_graph()
+
     node_step = graph.get_node(2)
-    assert node_step.results.analysis_data_generator, 'The node should have to run'
-    assert node_step.results.analysis_data_generator().__len__() == 1000, 'There should be 1000 rows in the data'
+    assert has_result_to_visualize(node_step)
+    # Full fidelity: every row is still there, where the old path sampled to 10k.
+    assert node_step.get_resulting_data().data_frame.select(pl.len()).collect().item() == 1000
+    assert node_step.get_resulting_data().columns == graph.get_node(1).get_resulting_data().columns
 
 
-def test_analytics_processor_from_parquet_file_run_in_one_local_process():
+def test_explore_data_node_is_pass_through_local_execution():
     graph = create_graph()
     graph.flow_settings.execution_location = "local"
     add_node_promise_on_type(graph, 'read', 1, 1)
@@ -541,9 +552,259 @@ def test_analytics_processor_from_parquet_file_run_in_one_local_process():
     node_read = input_schema.NodeRead(flow_id=1, node_id=1, received_file=received_table)
     graph.add_read(node_read)
     add_node_promise_on_type(graph, 'explore_data', 2, 1)
-    connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
-    add_connection(graph, connection)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
     node_step = graph.get_node(2)
     graph.run_graph()
-    assert node_step.results.analysis_data_generator, 'The node should have to run'
-    assert node_step.results.analysis_data_generator().__len__() == 10_000, 'There should be 1000 rows in the data'
+    assert has_result_to_visualize(node_step)
+    n_rows = node_step.get_resulting_data().data_frame.select(pl.len()).collect().item()
+    assert n_rows == graph.get_node(1).get_resulting_data().data_frame.select(pl.len()).collect().item()
+    assert n_rows > 10_000, 'The 10k sample cap is gone; the full result must survive the node'
+
+
+@pytest.mark.parametrize("execution_mode", ["Development", "Performance"])
+@pytest.mark.parametrize("execution_location", ["local", "remote"])
+def test_readiness_signal_holds_in_every_execution_mode(execution_mode, execution_location):
+    """The 422 gate must clear after a run in all four mode/location combinations.
+
+    `node_stats.has_completed_last_run` does not: it is skipped in performance
+    mode, so a Performance + local run would leave the explorer permanently
+    reporting "not run".
+    """
+    graph = create_graph()
+    graph.flow_settings.execution_mode = execution_mode
+    graph.flow_settings.execution_location = execution_location
+    add_manual_input(graph, data=FlowDataEngine.create_random(50).to_raw_data())
+    add_node_promise_on_type(graph, 'explore_data', 2)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    node_step = graph.get_node(2)
+    assert not has_result_to_visualize(node_step), 'Must report not-run before the flow runs'
+
+    # Opening the drawer on an un-run node must not flip the gate by itself.
+    AnalyticsProcessor.process_graphic_walker_input(node_step)
+    assert not has_result_to_visualize(node_step), 'The setup route must not count as a run'
+
+    graph.run_graph()
+    assert has_result_to_visualize(graph.get_node(2)), (
+        f'{execution_mode}/{execution_location} left the explorer gated after a successful run'
+    )
+
+
+def _explore_flow_for_fetch():
+    graph = create_graph()
+    graph.flow_settings.execution_location = "remote"
+    add_manual_input(graph, data=FlowDataEngine.create_random(50).to_raw_data())
+    add_node_promise_on_type(graph, 'explore_data', 2)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    return graph
+
+
+def _fetch_recording_stores(graph, **fetch_kwargs) -> list:
+    """Run a node fetch, recording every attempt to store the node's result.
+
+    Asserting on the attempt rather than on the resulting file keeps this
+    independent of whether a worker happens to be running: what changed is
+    whether the store is *reached*, and that is what must stay pinned.
+    """
+    from flowfile_core.flowfile.flow_node import flow_node as flow_node_module
+
+    attempts = []
+    real = flow_node_module.ExternalDfFetcher
+
+    def spy(*args, **kwargs):
+        attempts.append(kwargs.get("file_ref"))
+        return real(*args, **kwargs)
+
+    with patch.object(flow_node_module, "ExternalDfFetcher", side_effect=spy):
+        graph.trigger_fetch_node(2, **fetch_kwargs)
+    return attempts
+
+
+def test_fetch_in_performance_mode_stores_nothing():
+    """The Explore drawer's fetch must not materialise the node.
+
+    The default (preview) fetch stores the whole result so the 100-row example
+    grid has something to read. The chart builder charts through the worker and
+    never reads those rows, so it pays that cost for nothing — on a 294 MB
+    Parquet source the store was 4.9 GB.
+    """
+    graph = _explore_flow_for_fetch()
+
+    attempts = _fetch_recording_stores(graph, performance_mode=True, reset_cache=False)
+
+    assert attempts == [], 'a performance-mode fetch must never reach the store'
+    assert has_result_to_visualize(graph.get_node(2)), 'the plan must still be built, so the drawer opens'
+
+
+def test_default_fetch_still_stores_for_the_preview_grid():
+    """Regression guard: the data-preview contract is unchanged."""
+    graph = _explore_flow_for_fetch()
+
+    attempts = _fetch_recording_stores(graph)
+
+    assert attempts, 'the default fetch must still store the result for the preview grid'
+
+
+def _spec_field(fid: str, semantic_type: str = 'nominal', analytic_type: str = 'dimension') -> dict:
+    return {
+        'fid': fid,
+        'name': fid,
+        'basename': fid,
+        'semanticType': semantic_type,
+        'analyticType': analytic_type,
+        'offset': None,
+    }
+
+
+def _all_encoded_fids(encodings: dict) -> set[str]:
+    fids = set()
+    for channel in encodings.values():
+        for field in channel:
+            fids.add(field['fid'])
+    return fids
+
+
+def _find_field(encodings: dict, channel: str, fid: str) -> dict | None:
+    return next((f for f in encodings[channel] if f['fid'] == fid), None)
+
+
+def test_saved_spec_follows_a_changed_upstream_schema():
+    """A saved chart spec must track the data: retyped, dropped and added columns.
+
+    The explorer shows `currentVis.encodings`, not the fresh field list, so a
+    spec that keeps stale entries is exactly what the user ends up looking at.
+    """
+    graph = create_graph()
+    graph.flow_settings.execution_location = "local"
+    gw_node_settings = get_starting_gw_node_settings()
+    encodings = gw_node_settings.graphic_walker_input.specList[0]['encodings']
+    encodings['dimensions'].insert(1, _spec_field('Old'))
+    encodings['color'].append(_spec_field('Old'))
+
+    add_manual_input(
+        graph,
+        data=input_schema.RawData.from_pylist(
+            [{'Column 1': 'edward', 'Old': 'x'}, {'Column 1': 'eduward', 'Old': 'y'}]
+        ),
+    )
+    add_node_promise_on_type(graph, 'explore_data', 2)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    graph.add_explore_data(gw_node_settings)
+    node = graph.get_node(2)
+
+    graph.run_graph()
+    AnalyticsProcessor.process_graphic_walker_input(node)
+
+    graph.add_manual_input(
+        input_schema.NodeManualInput(
+            flow_id=1,
+            node_id=1,
+            raw_data_format=input_schema.RawData.from_pylist(
+                [{'Column 1': 1, 'New': 'a'}, {'Column 1': 2, 'New': 'b'}]
+            ),
+        )
+    )
+    graph.run_graph()
+    node_explore_data = AnalyticsProcessor.process_graphic_walker_input(node)
+    encodings = node_explore_data.graphic_walker_input.specList[0]['encodings']
+
+    retyped = _find_field(encodings, 'measures', 'Column 1')
+    assert retyped is not None, 'Column 1 became an integer, so it must live in measures'
+    assert retyped['semanticType'] == 'quantitative'
+    assert retyped['analyticType'] == 'measure'
+    assert _find_field(encodings, 'dimensions', 'Column 1') is None, 'the stale dimension entry must be gone'
+
+    row_field = _find_field(encodings, 'rows', 'Column 1')
+    assert row_field is not None, 'the placed field must survive the retype'
+    assert row_field['semanticType'] == 'quantitative'
+    assert row_field['analyticType'] == 'measure'
+
+    assert 'Old' not in _all_encoded_fids(encodings), 'a dropped column must vanish from every encoding list'
+    assert _find_field(encodings, 'dimensions', 'New') is not None, 'a new string column must show up as a dimension'
+
+    pseudo_fields = {'gw_count_fid', 'gw_mea_key_fid', 'gw_mea_val_fid'}
+    assert pseudo_fields <= _all_encoded_fids(encodings), 'GW pseudo-fields must survive reconciliation'
+
+
+def test_unchanged_data_leaves_the_users_own_choices_alone():
+    """Reconciliation runs on every drawer open, so it must not undo GW field-menu edits.
+
+    Moving a numeric field to Dimensions ('to_dim') rewrites only analyticType, and
+    setting a semantic type rewrites only semanticType — neither is a schema change.
+    """
+    spec_list = {
+        'encodings': {
+            'dimensions': [_spec_field('year', 'quantitative', 'dimension'), _spec_field('gw_mea_key_fid')],
+            'measures': [_spec_field('score', 'ordinal', 'measure')],
+            'rows': [_spec_field('year', 'quantitative', 'dimension')],
+        }
+    }
+    data_model = DataModel(
+        data=[],
+        fields=convert_ff_columns_to_gw_fields(
+            FlowDataEngine(pl.DataFrame({'year': [2024], 'score': [1]})).schema
+        ),
+    )
+
+    validate_spec_list_with_data_model_types(spec_list, data_model)
+
+    encodings = spec_list['encodings']
+    assert _find_field(encodings, 'dimensions', 'year') is not None, "the user's shelf choice must survive"
+    assert _find_field(encodings, 'measures', 'year') is None
+    assert _find_field(encodings, 'rows', 'year')['analyticType'] == 'dimension'
+    assert 'aggName' not in _find_field(encodings, 'rows', 'year')
+    assert _find_field(encodings, 'measures', 'score')['semanticType'] == 'ordinal', 'manual override must survive'
+
+
+_PARITY_FRAME = pl.DataFrame(
+    {
+        'text': ['a'],
+        'tiny_int': [1],
+        'unsigned_int': [1],
+        'big_int': [1],
+        'float': [1.0],
+        'decimal': [1.0],
+        'date': [datetime.date(2024, 1, 1)],
+        'datetime': [datetime.datetime(2024, 1, 1)],
+        'duration': [1],
+        'time': [1],
+        'boolean': [True],
+        'categorical': ['x'],
+        'list': [[1, 2]],
+    },
+    schema_overrides={
+        'tiny_int': pl.Int8,
+        'unsigned_int': pl.UInt32,
+        'float': pl.Float32,
+        'decimal': pl.Decimal(10, 2),
+        'duration': pl.Duration('us'),
+        'time': pl.Time,
+        'categorical': pl.Categorical,
+        'list': pl.List(pl.Int64),
+    },
+)
+
+
+def test_semantic_types_agree_with_polars_gw():
+    """The backend classifier must agree with polars_gw, which owns the browser's field schema.
+
+    Reconciliation compares a saved spec entry (built from polars_gw's fields) against a
+    backend-derived field, so any disagreement retypes columns on every drawer open.
+    """
+    core_fields = convert_ff_columns_to_gw_fields(FlowDataEngine(_PARITY_FRAME).schema)
+    gw_fields = polars_gw.get_fields(_PARITY_FRAME, classify_integers='measure')
+
+    assert [(f.fid, f.semanticType) for f in core_fields] == [(f['fid'], f['semanticType']) for f in gw_fields]
+
+    spec_fields = deepcopy(gw_fields)
+    spec_list = {
+        'encodings': {
+            'dimensions': [f for f in spec_fields if f['analyticType'] != 'measure'],
+            'measures': [f for f in spec_fields if f['analyticType'] == 'measure'],
+        }
+    }
+    untouched = deepcopy(spec_list)
+
+    validate_spec_list_with_data_model_types(spec_list, DataModel(data=[], fields=core_fields))
+
+    assert spec_list == untouched, 'a spec built from polars_gw fields must survive reconciliation unchanged'

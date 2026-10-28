@@ -1,16 +1,22 @@
 <template>
   <div class="sidebar">
     <div class="center-container">
-      <Logo width="50px" :app-name="''" position-app-name="left" />
+      <Logo width="50px" :app-name="''" position-app-name="left" :click-action="goHome" />
     </div>
     <div class="sidebar-container">
       <menu-accordion :items="items" :is-collapse="true" />
     </div>
     <div class="sidebar-footer">
-      <div class="footer-btn-wrapper" data-tooltip="More & help">
+      <div v-if="currentPageHelp" class="footer-btn-wrapper" data-tooltip="Page info">
+        <button class="info-button" @click="showHelp = true">
+          <i class="fa-solid fa-circle-info"></i>
+        </button>
+      </div>
+      <div class="footer-btn-wrapper" data-tooltip="Help &amp; more">
         <el-popover
+          ref="morePopover"
           placement="right-end"
-          :width="200"
+          :width="220"
           trigger="click"
           popper-class="sidebar-more-popover"
           :show-arrow="true"
@@ -21,6 +27,10 @@
             </button>
           </template>
           <div class="sidebar-more-menu">
+            <button class="sidebar-more-item" @click="handleStartTutorial">
+              <span class="material-icons">school</span>
+              <span>Interactive tutorial</span>
+            </button>
             <button class="sidebar-more-item" @click="handleOpenTemplates">
               <i class="fa-solid fa-layer-group"></i>
               <span>Templates</span>
@@ -29,25 +39,36 @@
               <i class="fa-solid fa-book"></i>
               <span>Documentation</span>
             </button>
-            <button class="sidebar-more-item" @click="handleStartTutorial">
-              <span class="material-icons">school</span>
-              <span>Interactive tutorial</span>
+            <button class="sidebar-more-item" @click="handleRequestNode">
+              <i class="fa-solid fa-lightbulb"></i>
+              <span>Request a node</span>
             </button>
+            <button class="sidebar-more-item" @click="handleOpenPrivacy">
+              <i class="fa-solid fa-shield-halved"></i>
+              <span>Privacy &amp; data collection</span>
+            </button>
+            <div class="sidebar-more-divider" aria-hidden="true"></div>
+            <button class="sidebar-more-item" @click="openReleaseNotes">
+              <i class="fa-solid fa-arrow-up-right-from-square"></i>
+              <span>Release notes</span>
+            </button>
+            <button class="sidebar-more-item" :disabled="checking" @click="handleCheckForUpdates">
+              <i class="fa-solid fa-rotate"></i>
+              <span>Check for updates</span>
+            </button>
+            <p v-if="updateStatus" class="sidebar-more-status">{{ updateStatus }}</p>
+            <div class="sidebar-more-divider" aria-hidden="true"></div>
+            <button class="sidebar-more-item" @click="toggleTheme">
+              <i :class="isDark ? 'fa-solid fa-sun' : 'fa-solid fa-moon'"></i>
+              <span>{{ isDark ? "Light mode" : "Dark mode" }}</span>
+            </button>
+            <button v-if="showLogout" class="sidebar-more-item is-danger" @click="handleLogout">
+              <i class="fa-solid fa-right-from-bracket"></i>
+              <span>Sign out</span>
+            </button>
+            <p v-if="version" class="sidebar-more-version">Flowfile v{{ version }}</p>
           </div>
         </el-popover>
-      </div>
-      <div class="footer-btn-wrapper" data-tooltip="Toggle theme">
-        <ThemeToggle />
-      </div>
-      <div v-if="currentPageHelp" class="footer-btn-wrapper" data-tooltip="Page info">
-        <button class="info-button" @click="showHelp = true">
-          <i class="fa-solid fa-circle-info"></i>
-        </button>
-      </div>
-      <div v-if="showLogout" class="footer-btn-wrapper" data-tooltip="Sign out">
-        <button class="logout-button" @click="handleLogout">
-          <i class="fa-solid fa-right-from-bracket"></i>
-        </button>
       </div>
     </div>
     <PageHelpModal
@@ -56,30 +77,39 @@
       v-bind="currentPageHelp"
       @close="showHelp = false"
     />
+    <NodeRequestDialog v-model:visible="showNodeRequest" />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRouter, useRoute } from "vue-router";
-import NavigationRoutes from "./NavigationRoutes";
+import NavigationRoutes, { type INavigationRoute } from "./NavigationRoutes";
 import MenuAccordion from "./menu/MenuAccordion.vue";
 import Logo from "../Logo/Logo.vue";
-import ThemeToggle from "../ThemeToggle/ThemeToggle.vue";
-import { PageHelpModal } from "../../common";
+import { NodeRequestDialog, PageHelpModal } from "../../common";
 import type { PageHelpContent } from "../../common/PageHelpModal/types";
 import authService from "../../../services/auth.service";
+import { desktop } from "../../../../lib/desktop";
+import { DOCS_BASE_URL } from "../../../lib/docsLinks";
 import { useAuthStore } from "../../../stores/auth-store";
+import { useMultiUser } from "../../../composables/useMultiUser";
+import { useTheme } from "../../../composables/useTheme";
+import { useAppUpdate } from "../../../composables/useAppUpdate";
+import { useProjectStore } from "../../../stores/project-store";
 import { useTutorialStore } from "../../../stores/tutorial-store";
 import { gettingStartedTutorial } from "../../tutorial/tutorials";
 import { designerHelp } from "../../../views/DesignerView/designerHelp";
 import { catalogHelp } from "../../../views/CatalogView/catalogHelp";
+import { lastCatalogQuery } from "../../../views/CatalogView/catalogLastLocation";
+import { catalogSectionOfTab } from "../../../views/CatalogView/catalogTabs";
 import { connectionsHelp } from "../../../views/ConnectionsView/connectionsHelp";
+import { aiSettingsHelp } from "../../../views/AiSettingsView/aiSettingsHelp";
 import { templatesHelp } from "../../../views/TemplatesView/templatesHelp";
-import { kernelHelp } from "../../../views/KernelManagerView/kernelHelp";
+import { computeHelp } from "../../../views/ComputeView/computeHelp";
 import { dashboardHelp } from "../../../views/DashboardsView/dashboardHelp";
+import { projectHelp } from "../../../views/ProjectView/projectHelp";
 
-// Define the isCollapse prop
 defineProps({
   isCollapse: {
     type: Boolean,
@@ -87,13 +117,15 @@ defineProps({
   },
 });
 
-// Define the toggle-collapse emit
 defineEmits(["toggle-collapse"]);
 
 const router = useRouter();
 const route = useRoute();
 const authStore = useAuthStore();
+const projectStore = useProjectStore();
 const tutorialStore = useTutorialStore();
+const { isMultiUser } = useMultiUser();
+const { isDark, toggleTheme } = useTheme();
 
 // Page help
 const showHelp = ref(false);
@@ -102,8 +134,10 @@ const helpByRoute: Record<string, PageHelpContent> = {
   designer: designerHelp,
   catalog: catalogHelp,
   connections: connectionsHelp,
+  ai: aiSettingsHelp,
+  project: projectHelp,
   templates: templatesHelp,
-  kernelManager: kernelHelp,
+  compute: computeHelp,
   "dashboard-new": dashboardHelp,
   "dashboard-edit": dashboardHelp,
   "dashboard-view": dashboardHelp,
@@ -115,7 +149,6 @@ const currentPageHelp = computed(() => {
   return helpByRoute[name] ?? null;
 });
 
-// Close help modal on route change
 watch(
   () => route.name,
   () => {
@@ -123,22 +156,41 @@ watch(
   },
 );
 
-// Filter routes based on admin status and Electron mode
 const items = computed(() => {
   const isAdmin = authStore.isAdmin;
-  const isElectron = authService.isInElectronMode();
-  return NavigationRoutes.routes.filter((route) => {
-    // Hide routes marked as hideInElectron when in Electron mode
-    if (route.hideInElectron && isElectron) return false;
-    // Hide routes marked as dockerOnly when in Electron mode
-    if (route.dockerOnly && isElectron) return false;
-    // Show route if it doesn't require admin, or if user is admin
-    return !route.requiresAdmin || isAdmin;
+  const isDesktopShell = authService.isInDesktopMode();
+  const projectDot = projectStore.isActive ? projectStore.status : undefined;
+
+  const visible = (entry: INavigationRoute) => {
+    if ((entry.hideInElectron || entry.dockerOnly) && isDesktopShell) return false;
+    // Projects are admin-only in docker; admins keep it even when disabled (to reach the how-to page).
+    if (entry.name === "project" && isMultiUser.value && !isAdmin) return false;
+    return !entry.requiresAdmin || isAdmin;
+  };
+  const decorate = (entry: INavigationRoute): INavigationRoute =>
+    entry.name === "project" ? { ...entry, statusDot: projectDot } : entry;
+
+  return NavigationRoutes.routes.filter(visible).map((route) => {
+    if (!route.children) return decorate(route);
+    const children = route.children.filter(visible).map(decorate);
+    const parent: INavigationRoute = { ...route };
+    // A child's status dot (project sync state) also shows on the collapsed rail icon.
+    const statusDot = children.find((c) => c.statusDot)?.statusDot;
+    if (statusDot) parent.statusDot = statusDot;
+    // The catalog icon resumes the last sub-page, unless that page lives under Settings.
+    const last = lastCatalogQuery.value;
+    if (route.name === "catalog" && last && catalogSectionOfTab(last.tab) === "catalog") {
+      parent.query = last;
+    }
+    // A one-child sub-menu is noise — flatten to a plain item (the page
+    // defaults to the surviving tab anyway).
+    return children.length > 1 ? { ...parent, children } : { ...parent, children: undefined };
   });
 });
 
-// Only show logout button in Docker/web mode
-const showLogout = computed(() => !authService.isInElectronMode());
+const showLogout = computed(() => !authService.isInDesktopMode());
+
+const goHome = () => router.push({ name: "home" });
 
 const handleStartTutorial = async () => {
   if (router.currentRoute.value.name !== "designer") {
@@ -151,12 +203,45 @@ const handleOpenTemplates = () => {
   router.push({ name: "templates" });
 };
 
-const handleOpenDocumentation = () => {
-  router.push({ name: "documentation" });
+const handleOpenPrivacy = () => {
+  router.push({ name: "compute", query: { tab: "privacy" } });
 };
 
+const handleOpenDocumentation = () => {
+  void desktop.openExternal(DOCS_BASE_URL);
+};
+
+const morePopover = ref<{ hide: () => void } | null>(null);
+
+const {
+  version,
+  checking,
+  statusText: updateStatus,
+  checkForUpdates,
+  openReleaseNotes,
+} = useAppUpdate();
+
+async function handleCheckForUpdates() {
+  // An offered release opens the prompt modal in AppLayout; get out of its way.
+  if (await checkForUpdates()) morePopover.value?.hide();
+}
+
+const showNodeRequest = ref(false);
+const handleRequestNode = () => {
+  morePopover.value?.hide();
+  showNodeRequest.value = true;
+};
+
+// The native Help menu forwards its "Request a Node" item here (see menu.rs).
+let stopHelpRequestNode: (() => void) | null = null;
+onMounted(async () => {
+  stopHelpRequestNode = await desktop.onHelpRequestNode(handleRequestNode);
+});
+onBeforeUnmount(() => stopHelpRequestNode?.());
+
 const handleLogout = () => {
-  authService.logout();
+  // Store logout, not authService: per-user store state must be torn down too.
+  authStore.logout();
   router.push({ name: "login" });
 };
 </script>
@@ -170,7 +255,6 @@ const handleLogout = () => {
 }
 
 .sidebar-container {
-  border-top: 1px solid var(--color-border-primary);
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -227,37 +311,6 @@ const handleLogout = () => {
 
 .tutorial-button .material-icons {
   font-size: 20px;
-}
-
-.logout-button {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 36px;
-  height: 36px;
-  padding: 0;
-  border: 1px solid var(--color-border-primary);
-  border-radius: var(--border-radius-md);
-  background-color: var(--color-background-primary);
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  transition: all var(--transition-base) var(--transition-timing);
-}
-
-.logout-button:hover {
-  background-color: var(--color-danger-light);
-  color: var(--color-danger);
-  border-color: var(--color-danger);
-}
-
-.logout-button:focus {
-  outline: none;
-  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.2);
-  border-color: var(--color-danger);
-}
-
-.logout-button i {
-  font-size: var(--font-size-lg);
 }
 
 .info-button {
@@ -328,5 +381,45 @@ const handleLogout = () => {
 .sidebar-more-item:hover i,
 .sidebar-more-item:hover .material-icons {
   color: var(--color-accent);
+}
+
+.sidebar-more-item.is-danger:hover {
+  background-color: var(--color-danger-light);
+  color: var(--color-danger);
+}
+
+.sidebar-more-item.is-danger:hover i {
+  color: var(--color-danger);
+}
+
+.sidebar-more-item:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.sidebar-more-item:disabled:hover {
+  background-color: transparent;
+  color: var(--color-text-primary);
+}
+
+.sidebar-more-divider {
+  height: 1px;
+  margin: var(--spacing-1) var(--spacing-2);
+  background-color: var(--color-border-primary);
+}
+
+.sidebar-more-status {
+  margin: 0;
+  padding: 0 var(--spacing-3) var(--spacing-1);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.sidebar-more-version {
+  margin: var(--spacing-1) 0 0;
+  padding: var(--spacing-1) var(--spacing-3) 0;
+  border-top: 1px solid var(--color-border-primary);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
 }
 </style>

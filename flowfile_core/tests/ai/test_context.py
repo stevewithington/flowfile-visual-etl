@@ -9,7 +9,7 @@ Covers the public surface of :mod:`flowfile_core.ai.context`:
 * mention parsing + resolution (``parse_mentions``, ``resolve_mentions``)
 * end-to-end ``render_prompt_context`` over a real :class:`FlowGraph`
 
-The lazy-import contract follows W11/W13's pattern: importing
+The lazy-import contract follows the other AI modules' pattern: importing
 ``flowfile_core.ai.context.builder`` must not pull ``litellm`` itself.
 """
 
@@ -43,9 +43,7 @@ from flowfile_core.ai.context import (
 from flowfile_core.flowfile.flow_graph import FlowGraph, add_connection
 from flowfile_core.schemas import input_schema, schemas, transform_schema
 
-# --------------------------------------------------------------------------- #
-# Test fixtures #
-# --------------------------------------------------------------------------- #
+# Test fixtures
 
 
 def _flow_settings(flow_id: int = 1) -> schemas.FlowSettings:
@@ -188,9 +186,7 @@ def cold_dynamic_flow() -> FlowGraph:
     return flow
 
 
-# --------------------------------------------------------------------------- #
-# 1. Subgraph extraction #
-# --------------------------------------------------------------------------- #
+# 1. Subgraph extraction
 
 
 def test_extract_subgraph_pinned_only(linear_flow: FlowGraph) -> None:
@@ -228,9 +224,7 @@ def test_extract_subgraph_unknown_pin_returns_empty(linear_flow: FlowGraph) -> N
     assert snapshot.edges == []
 
 
-# --------------------------------------------------------------------------- #
-# 2. Node projection #
-# --------------------------------------------------------------------------- #
+# 2. Node projection
 
 
 def test_snapshot_node_known_schema(linear_flow: FlowGraph) -> None:
@@ -265,9 +259,7 @@ def test_snapshot_node_samples_off_by_default(linear_flow: FlowGraph) -> None:
     assert all(c.sample is None for c in (snap.schema_columns or []))
 
 
-# --------------------------------------------------------------------------- #
-# 3. Layered system-prompt assembly #
-# --------------------------------------------------------------------------- #
+# 3. Layered system-prompt assembly
 
 
 @pytest.mark.parametrize("surface", list(get_args(SurfaceLiteral)))
@@ -279,7 +271,6 @@ def test_assemble_system_prompt_per_surface(surface: SurfaceLiteral) -> None:
 
 def test_assemble_system_prompt_concatenates_base_and_suffix() -> None:
     text = assemble_system_prompt("explain")
-    # Base claims should appear plus the assist suffix.
     assert "Schema-grounded" in text
     assert "Assist mode" in text
 
@@ -297,9 +288,7 @@ def test_surface_to_level_covers_every_surface() -> None:
         assert SURFACE_TO_LEVEL[surface] in levels, surface
 
 
-# --------------------------------------------------------------------------- #
-# 4. Token estimator + budget #
-# --------------------------------------------------------------------------- #
+# 4. Token estimator + budget
 
 
 def test_estimate_tokens_within_tolerance() -> None:
@@ -509,9 +498,7 @@ def test_apply_budget_truncation_step_order() -> None:
         assert report.columns_truncated > 0
 
 
-# --------------------------------------------------------------------------- #
-# 5. Mentions #
-# --------------------------------------------------------------------------- #
+# 5. Mentions
 
 
 def test_parse_mentions_single_node() -> None:
@@ -589,9 +576,7 @@ def test_resolve_mentions_by_id_string(linear_flow: FlowGraph) -> None:
     assert resolved.node_ids == (2,)
 
 
-# --------------------------------------------------------------------------- #
-# 6. End-to-end render_prompt_context #
-# --------------------------------------------------------------------------- #
+# 6. End-to-end render_prompt_context
 
 
 def test_render_prompt_context_produces_messages(linear_flow: FlowGraph) -> None:
@@ -645,9 +630,7 @@ def test_render_user_message_handles_empty_subgraph() -> None:
     assert "(empty)" in text
 
 
-# --------------------------------------------------------------------------- #
-# 6b. — prospective schema resolution in #
-# --------------------------------------------------------------------------- #
+# 6b. — prospective schema resolution in
 
 
 def test_render_prompt_context_resolves_static_upstream_via_callback(
@@ -766,7 +749,7 @@ def test_render_prompt_context_d012_clean(
     import polars as pl
 
     def _refuse_collect(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("D012 violation — render_prompt_context invoked LazyFrame.collect")
+        raise AssertionError("render_prompt_context must not invoke LazyFrame.collect")
 
     monkeypatch.setattr(pl.LazyFrame, "collect", _refuse_collect)
 
@@ -778,9 +761,7 @@ def test_render_prompt_context_d012_clean(
     assert filter_snap.schema_status == "known"
 
 
-# --------------------------------------------------------------------------- #
-# 7. Lazy-import contract #
-# --------------------------------------------------------------------------- #
+# 7. Lazy-import contract
 
 
 def test_lazy_litellm_import_for_context() -> None:
@@ -811,9 +792,7 @@ def test_lazy_litellm_import_for_context() -> None:
             sys.modules[mod_name] = mod
 
 
-# --------------------------------------------------------------------------- #
-# 8. BudgetReport dataclass defaults #
-# --------------------------------------------------------------------------- #
+# 8. BudgetReport dataclass defaults
 
 
 def test_budget_report_dataclass_defaults() -> None:
@@ -829,17 +808,15 @@ def test_budget_report_dataclass_defaults() -> None:
     assert report.columns_truncated == 0
 
 
-# --------------------------------------------------------------------------- #
-# per-node-type catalog block in assemble_system_prompt #
-# --------------------------------------------------------------------------- #
+# per-node-type catalog block in assemble_system_prompt
 
 
-_W56_CATALOG_HEADER = "## Tool catalog"
+_CATALOG_HEADER = "## Tool catalog"
 
 # Three representative node-type tool headings the agent surface must show
-# (AC2). Picked across categories so a regression in one category doesn't
+# Picked across categories so a regression in one category doesn't
 # silently pass.
-_W56_REPRESENTATIVE_NODE_TOOLS = (
+_REPRESENTATIVE_NODE_TOOLS = (
     "### flowfile.graph.add_filter",
     "### flowfile.graph.add_join",
     "### flowfile.graph.add_group_by",
@@ -848,23 +825,23 @@ _W56_REPRESENTATIVE_NODE_TOOLS = (
 
 @pytest.mark.parametrize("surface", ["agent_complex"])
 def test_w56_agent_surfaces_include_catalog_block(surface: SurfaceLiteral) -> None:
-    """AC2 — agent_complex prompt includes the catalog header plus
+    """agent_complex prompt includes the catalog header plus
     several representative node-type sections so the model sees
-    narrative grounding for each tool. (W71 — legacy ``"agent"``
-    surface removed; ``agent_staged`` only renders the catalog at the
+    narrative grounding for each tool. (The legacy ``"agent"``
+    surface has been removed; ``agent_staged`` only renders the catalog at the
     ``pick_type`` stage, which is exercised by ``test_planner_staged.py``.)"""
     text = assemble_system_prompt(surface)
-    assert _W56_CATALOG_HEADER in text, f"catalog header missing for {surface}"
-    for heading in _W56_REPRESENTATIVE_NODE_TOOLS:
+    assert _CATALOG_HEADER in text, f"catalog header missing for {surface}"
+    for heading in _REPRESENTATIVE_NODE_TOOLS:
         assert heading in text, f"{heading} missing from {surface} prompt"
 
 
 def test_w56_cmd_k_only_includes_preset_tools_in_catalog() -> None:
-    """AC3 — cmd_k narrows the catalog to its preset's tools."""
+    """cmd_k narrows the catalog to its preset's tools."""
     from flowfile_core.ai.tools.registry import SURFACE_PRESETS
 
     text = assemble_system_prompt("cmd_k")
-    assert _W56_CATALOG_HEADER in text
+    assert _CATALOG_HEADER in text
 
     cmd_k_preset = SURFACE_PRESETS["cmd_k"]
     # Tools in the preset must appear; tools outside it must not.
@@ -877,11 +854,11 @@ def test_w56_cmd_k_only_includes_preset_tools_in_catalog() -> None:
 
 
 def test_w56_ghost_node_only_includes_preset_tools_in_catalog() -> None:
-    """AC3 — ghost_node narrows the catalog to its preset's tools."""
+    """ghost_node narrows the catalog to its preset's tools."""
     from flowfile_core.ai.tools.registry import SURFACE_PRESETS
 
     text = assemble_system_prompt("ghost_node")
-    assert _W56_CATALOG_HEADER in text
+    assert _CATALOG_HEADER in text
 
     ghost_preset = SURFACE_PRESETS["ghost_node"]
     for tool_name in ghost_preset:
@@ -894,15 +871,13 @@ def test_w56_ghost_node_only_includes_preset_tools_in_catalog() -> None:
 
 @pytest.mark.parametrize("surface", ["explain", "lineage", "docgen", "settings_autocomplete"])
 def test_w56_read_only_surfaces_do_not_get_tool_catalog(surface: SurfaceLiteral) -> None:
-    """AC4 — read-only surfaces never see the agent-shaped Tool catalog
+    """Read-only surfaces never see the agent-shaped Tool catalog
     block (it'd be misleading — they can't call tools)."""
     text = assemble_system_prompt(surface)
-    assert _W56_CATALOG_HEADER not in text, f"{surface} should not include the agent-shaped Tool catalog block"
+    assert _CATALOG_HEADER not in text, f"{surface} should not include the agent-shaped Tool catalog block"
 
 
-# --------------------------------------------------------------------------- #
-# v2 — node-reference block on read-only / advisory surfaces #
-# --------------------------------------------------------------------------- #
+# v2 — node-reference block on read-only / advisory surfaces
 #
 # Motivated by the live transcript where the chat surface (uses
 # surface="explain" → assist level) hallucinated a non-existent
@@ -912,7 +887,7 @@ def test_w56_read_only_surfaces_do_not_get_tool_catalog(surface: SurfaceLiteral)
 # from each ToolSpec.user_instructions so the chat answer cites real
 # palette labels and settings field names.
 
-_W56_NODE_REFERENCE_HEADER = "## Flowfile node reference"
+_NODE_REFERENCE_HEADER = "## Flowfile node reference"
 
 
 @pytest.mark.parametrize("surface", ["explain", "lineage", "docgen"])
@@ -925,7 +900,7 @@ def test_w56_advisory_surfaces_include_node_reference_block(surface: SurfaceLite
     field names so the model can answer "how do I X" correctly.
     """
     text = assemble_system_prompt(surface)
-    assert _W56_NODE_REFERENCE_HEADER in text, f"{surface} should include the user-shaped node reference block"
+    assert _NODE_REFERENCE_HEADER in text, f"{surface} should include the user-shaped node reference block"
 
 
 @pytest.mark.parametrize("surface", ["explain", "lineage", "docgen"])
@@ -989,14 +964,14 @@ def test_w56_settings_autocomplete_skips_both_blocks() -> None:
     """v2 — settings_autocomplete is constrained-JSON output only;
     it doesn't need either narrative block."""
     text = assemble_system_prompt("settings_autocomplete")
-    assert _W56_CATALOG_HEADER not in text
-    assert _W56_NODE_REFERENCE_HEADER not in text
+    assert _CATALOG_HEADER not in text
+    assert _NODE_REFERENCE_HEADER not in text
 
 
 def test_w56_node_reference_sorted_for_cache_stability() -> None:
     """v2 — node-reference headings are alphabetical (cache hygiene)."""
     text = assemble_system_prompt("explain")
-    block_start = text.find(_W56_NODE_REFERENCE_HEADER)
+    block_start = text.find(_NODE_REFERENCE_HEADER)
     assert block_start >= 0
     block = text[block_start:]
     # Headings are bare node_type names (e.g. "### group_by"), not the
@@ -1023,7 +998,9 @@ def test_w56_explain_surface_token_budget_reasonable() -> None:
 
 
 def test_w56_agent_surface_token_budget_under_70_pct_of_agent_budget() -> None:
-    """AC6 — full-catalog agent prompt fits inside the per-call budget. — legacy ``"agent"`` surface removed; the equivalent
+    """Full-catalog agent prompt fits inside the per-call budget.
+
+    The legacy ``"agent"`` surface has been removed; the equivalent
     full-catalog prompt now lives on ``agent_complex`` (96K budget).
     The static prompt has to carry the catalog plus the layered base +
     planner suffix and still leave room for the per-call user message
@@ -1036,7 +1013,7 @@ def test_w56_agent_surface_token_budget_under_70_pct_of_agent_budget() -> None:
     cap = int(96_000 * 0.7)
     assert estimated_tokens <= cap, (
         f"agent_complex system prompt is {estimated_tokens} tokens (chars/4); "
-        f"AC6 caps it at {cap} (70% of 96K)"
+        f"the cap is {cap} (70% of 96K)"
     )
 
 
@@ -1065,9 +1042,7 @@ def test_w56_catalog_block_renders_descriptions_in_stable_order() -> None:
     assert headings == sorted(headings), "catalog headings out of order — prompt cache will thrash"
 
 
-# --------------------------------------------------------------------------- #
-# sample fetch must use cached endpoint, not _predicted_data_getter #
-# --------------------------------------------------------------------------- #
+# sample fetch must use cached endpoint, not _predicted_data_getter
 
 
 def test_render_prompt_context_default_samples_mode_is_off(linear_flow: FlowGraph) -> None:
@@ -1205,7 +1180,7 @@ def test_render_prompt_context_no_lazyframe_collect_on_random_split_upstream(
         node.get_predicted_schema()
 
     def _refuse_collect(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("D012 violation — render_prompt_context invoked LazyFrame.collect")
+        raise AssertionError("render_prompt_context must not invoke LazyFrame.collect")
 
     monkeypatch.setattr(pl.LazyFrame, "collect", _refuse_collect)
 
@@ -1216,9 +1191,7 @@ def test_render_prompt_context_no_lazyframe_collect_on_random_split_upstream(
     assert snapshot_ids == [1, 2]
 
 
-# --------------------------------------------------------------------------- #
-# — palette label vs node_type disambiguation #
-# --------------------------------------------------------------------------- #
+# — palette label vs node_type disambiguation
 
 
 def test_pick_type_prompt_warns_against_palette_labels() -> None:
@@ -1231,7 +1204,7 @@ def test_pick_type_prompt_warns_against_palette_labels() -> None:
     """
     text = assemble_system_prompt("agent_staged", stage="pick_type")
     assert "## Important: enum is" in text, (
-        "v1.12B disambiguation block missing from pick_type system prompt"
+        "disambiguation block missing from pick_type system prompt"
     )
     # Two of the failure modes the user dogfooded — must be listed.
     assert "sort_data" in text and "``sort``" in text
@@ -1248,7 +1221,7 @@ def test_classify_stage_includes_multi_step_discipline_section() -> None:
     """
     text = assemble_system_prompt("agent_staged", stage="classify")
     assert "## Multi-step discipline" in text, (
-        "v2.9B: classify prompt missing the multi-step discipline section"
+        "classify prompt missing the multi-step discipline section"
     )
     text_lower = text.lower()
     # The "don't pick `other` until all steps done" rule.
@@ -1288,15 +1261,13 @@ def test_classify_stage_now_includes_palette_disambiguation() -> None:
     """
     text = assemble_system_prompt("agent_staged", stage="classify")
     assert "## Important: enum is" in text, (
-        "v1.14A.3: classify stage system prompt must include the "
+        "classify stage system prompt must include the "
         "palette-label disambiguation block (bypass-path defense)"
     )
     assert "sort_data" in text and "``sort``" in text
 
 
-# --------------------------------------------------------------------------- #
-# — formula description + on-demand function list #
-# --------------------------------------------------------------------------- #
+# — formula description + on-demand function list
 
 
 def test_formula_node_docs_uses_flowfile_expression_syntax() -> None:
@@ -1426,14 +1397,14 @@ def test_pick_type_prompt_includes_tool_selection_rules() -> None:
     """
     text = assemble_system_prompt("agent_staged", stage="pick_type")
     assert "## Tool selection rules" in text, (
-        "v1.13A: pick_type system prompt missing the tool-selection-rules block"
+        "pick_type system prompt missing the tool-selection-rules block"
     )
     for label in ("record_count", "group_by", "formula", "polars_code"):
-        assert label in text, f"v1.13A rules block missing reference to {label!r}"
+        assert label in text, f"rules block missing reference to {label!r}"
     # The "row-wise only" assertion must appear AGAIN here (the rules
     # block reinforces the long_description's lead constraint).
     assert "row-wise" in text.lower(), (
-        "v1.13A rules block must reiterate that formula is row-wise only"
+        "rules block must reiterate that formula is row-wise only"
     )
 
 
@@ -1454,7 +1425,7 @@ def test_pick_node_type_spec_description_carries_disambiguation() -> None:
     spec = next(s for s in META_OPS_TOOLS if s.name == PICK_NODE_TYPE_TOOL_NAME)
     # Headline disambiguation note in the tool description.
     assert "snake-case the palette label" in spec.description.lower() or "palette label" in spec.description.lower(), (
-        f"v1.14A.1: pick_node_type description missing palette-label warning; got: {spec.description!r}"
+        f"pick_node_type description missing palette-label warning; got: {spec.description!r}"
     )
     # Detailed do/don't list inside the node_type parameter description.
     nt_desc = spec.parameters["properties"]["node_type"]["description"]
@@ -1475,7 +1446,7 @@ def test_catalog_headers_inline_node_type_for_add_tools() -> None:
     for nt in ("sort", "select", "unique", "sample"):
         marker = f"### flowfile.graph.add_{nt}  (node_type: `{nt}`)"
         assert marker in text, (
-            f"v1.14A.2: catalog header for {nt!r} missing inline node_type marker. "
+            f"catalog header for {nt!r} missing inline node_type marker. "
             f"Expected to find: {marker!r}"
         )
 
@@ -1505,12 +1476,12 @@ def test_pick_upstream_spec_requires_right_input_for_join_shaped_types() -> None
         )
         required = spec.parameters.get("required", [])
         assert "right_input_node_id" in required, (
-            f"v1.14B: right_input_node_id must be required for {nt!r}; "
+            f"right_input_node_id must be required for {nt!r}; "
             f"got required={required}"
         )
         rfield = spec.parameters["properties"]["right_input_node_id"]
         assert rfield["type"] == "integer", (
-            f"v1.14B: right_input_node_id type for {nt!r} must be plain "
+            f"right_input_node_id type for {nt!r} must be plain "
             f"integer (no null); got {rfield['type']!r}"
         )
 
@@ -1712,7 +1683,7 @@ def test_pick_type_prompt_includes_join_vs_cross_join_section() -> None:
     """
     text = assemble_system_prompt("agent_staged", stage="pick_type")
     assert "## Join vs cross_join" in text, (
-        "v2.2: pick_type prompt missing the dedicated join-vs-cross_join section"
+        "pick_type prompt missing the dedicated join-vs-cross_join section"
     )
     # Both node types named.
     assert "`join`" in text and "`cross_join`" in text
@@ -1755,7 +1726,7 @@ def test_pick_upstream_prompt_includes_worked_example_for_joins() -> None:
     """
     text = assemble_system_prompt("agent_staged", stage="pick_upstream")
     assert "## Worked examples for join-shaped types" in text, (
-        "v1.15C: pick_upstream prompt missing the worked-examples section"
+        "pick_upstream prompt missing the worked-examples section"
     )
     # Both the asymmetric (join) and symmetric (cross_join) examples
     # must be present and use the new field names.
@@ -1776,19 +1747,19 @@ def test_formula_fill_settings_prompt_includes_function_reference() -> None:
         "agent_staged", stage="fill_settings", picked_node_type="formula"
     )
     assert "Formula functions" in formula_prompt, (
-        "v1.12C: formula fill_settings prompt missing the function reference block"
+        "formula fill_settings prompt missing the function reference block"
     )
 
     group_by_prompt = assemble_system_prompt(
         "agent_staged", stage="fill_settings", picked_node_type="group_by"
     )
     assert "Formula functions" not in group_by_prompt, (
-        "v1.12C: function reference block leaked into a non-formula fill_settings prompt"
+        "function reference block leaked into a non-formula fill_settings prompt"
     )
 
     pick_type_prompt = assemble_system_prompt("agent_staged", stage="pick_type")
     assert "Formula functions" not in pick_type_prompt, (
-        "v1.12C: function reference must not appear in the pick_type catalog "
+        "function reference must not appear in the pick_type catalog "
         "(it would cost tokens on every pick_type round)"
     )
 
@@ -1856,21 +1827,18 @@ def test_verify_completion_stage_prompt_renders() -> None:
     # tool-catalog separation).
     classify_prompt = assemble_system_prompt("agent_staged", stage="classify")
     assert "verify plan completion" not in classify_prompt.lower(), (
-        "v2.12: verify_completion prompt content leaked into the classify "
+        "verify_completion prompt content leaked into the classify "
         "stage system prompt"
     )
 
 
-# --------------------------------------------------------------------------- #
-# Honest runtime-failure reporting — direct response to the 2026-05-09 #
-# dogfood where the agent hit ``UnpredictableSchema`` on sql_query, #
-# hallucinated *"the kernel couldn't be found"* (not in the error text), #
-# and falsely told the user *"I added a sql_query node"* after the host had #
-# already auto-undone it. The fix has two pieces: (1) generic guidance in #
-# stage_fill_settings.md teaching the LLM to read the ``✗`` observation #
-# block honestly, and (2) a conditional Development-mode caveat for #
-# sql_query / polars_code that pre-warns the LLM before the failure. #
-# --------------------------------------------------------------------------- #
+# Honest runtime-failure reporting — direct response to the 2026-05-09
+# dogfood where the agent hit ``UnpredictableSchema`` on a dynamic node,
+# hallucinated a cause not in the error text, and falsely told the user it
+# had added the node after the host had already auto-undone it. The worked
+# example uses ``python_script`` (a genuinely kernel-dependent node that
+# can't predict its schema in Development mode); sql_query now predicts via
+# its schema_callback, so it no longer triggers this path.
 
 
 def test_fill_settings_prompt_includes_runtime_feedback_section() -> None:
@@ -1895,7 +1863,7 @@ def test_fill_settings_prompt_includes_runtime_feedback_section() -> None:
     )
     # The negative example is explicitly there so the LLM sees the exact
     # hallucination pattern it must avoid (transcript 2026-05-09).
-    assert "kernel couldn't be found" in text_lower, (
+    assert "upstream data was empty" in text_lower, (
         "missing the negative example — the worked-example contrast is "
         "what trains the LLM not to fabricate plausible causes"
     )
@@ -1904,11 +1872,12 @@ def test_fill_settings_prompt_includes_runtime_feedback_section() -> None:
 def test_fill_settings_renders_sql_query_caveat_when_picked() -> None:
     """The sql_query caveat block is gated like the formula function
     reference: it renders ONLY at fill_settings + when the picked
-    node type is sql_query. Carries two pieces the LLM needs at the
-    moment of staging — (a) upstream table-name convention
-    (``input_1``/``input_2``/..., NEVER node-id-based) so the agent
-    doesn't write ``FROM join_5`` and hit ``relation '...' was not
-    found``, and (b) the Development-mode auto-undo warning.
+    node type is sql_query. It carries the upstream table-name
+    convention (``input_1``/``input_2``/..., NEVER node-id-based) so
+    the agent doesn't write ``FROM join_5`` and hit ``relation '...'
+    was not found``. (The old Development-mode auto-undo warning was
+    dropped: sql_query now predicts its schema via a schema_callback,
+    so it no longer auto-undoes.)
     """
     text = assemble_system_prompt(
         "agent_live", stage="fill_settings", picked_node_type="sql_query"
@@ -1932,15 +1901,6 @@ def test_fill_settings_renders_sql_query_caveat_when_picked() -> None:
         "explicitly (otherwise the LLM repeats the chat-mode "
         "hallucination)"
     )
-
-    # Development-mode auto-undo guidance.
-    assert "UnpredictableSchema" in text
-    assert "Performance" in text, (
-        "missing the Performance-mode remediation — without it the "
-        "LLM can't tell the user what to do"
-    )
-    text_lower = text.lower()
-    assert "auto-undo" in text_lower or "auto undo" in text_lower
 
 
 def test_pick_type_does_NOT_render_sql_query_caveat() -> None:
@@ -2008,3 +1968,50 @@ def test_sql_query_user_instruction_uses_input_1_in_example() -> None:
     # as table names. Make sure those don't reappear.
     assert "FROM orders" not in instruction
     assert "FROM customers" not in instruction
+
+
+
+# 9. On-device (``local=True``) prompt variant
+
+
+_ASSIST_SURFACES = ("explain", "docgen", "lineage")
+
+
+@pytest.mark.parametrize("surface", _ASSIST_SURFACES)
+def test_local_assist_prompt_is_small_and_footer_free(surface: SurfaceLiteral) -> None:
+    """The on-device variant has to fit a 16k window next to the flow and
+    the conversation: ~3k tokens, no agent-mode footer, one line per node."""
+    text = assemble_system_prompt(surface, local=True)
+    assert estimate_tokens(text) <= 3000, estimate_tokens(text)
+    assert "agent mode" not in text.lower()
+    assert "Assist mode" in text
+    assert "Simple build" in text
+    assert "## Flowfile node reference" in text
+    assert "- Filter data (Transformations):" in text
+    assert "### filter" not in text
+
+
+@pytest.mark.parametrize("surface", _ASSIST_SURFACES)
+def test_cloud_assist_prompt_is_unchanged_by_the_local_flag(surface: SurfaceLiteral) -> None:
+    """``local=False`` (the default) is the cloud prompt byte for byte:
+    the assist.md footer and the full per-node reference stay."""
+    text = assemble_system_prompt(surface)
+    assert text == assemble_system_prompt(surface, local=False)
+    assert "auto-switch to agent mode" in text
+    assert "### filter" in text
+    assert "Simple build" not in text
+    assert "local_assist" not in text
+
+
+@pytest.mark.parametrize("surface", ("cmd_k", "agent_complex", "agent_staged"))
+def test_local_flag_only_affects_assist_level_surfaces(surface: SurfaceLiteral) -> None:
+    assert assemble_system_prompt(surface, local=True) == assemble_system_prompt(surface)
+
+
+def test_first_sentence_keeps_abbreviations_and_caps_length() -> None:
+    from flowfile_core.ai.context.builder import _first_sentence
+
+    assert _first_sentence("**Row-wise only.** Use it for X. More.") == "Row-wise only."
+    assert _first_sentence("Rename with a rule, e.g. `[name]`. Second sentence.") == "Rename with a rule, e.g. `[name]`."
+    assert _first_sentence("A " * 200).endswith("…")
+    assert len(_first_sentence("A " * 200)) <= 160

@@ -12,6 +12,7 @@
           <div class="form-group">
             <label class="field-label">Table name</label>
             <input v-model="name" class="input-field" placeholder="Table name" />
+            <p v-if="nameError" class="field-error">{{ nameError }}</p>
           </div>
           <div class="form-group">
             <label class="field-label">Description</label>
@@ -20,11 +21,11 @@
           <div class="form-group">
             <label class="field-label">Catalog / Schema</label>
             <select v-model="selectedNamespaceId" class="input-field">
-              <option v-for="ns in schemaNamespaces" :key="ns.id" :value="ns.id">
+              <option v-for="ns in writableSchemaNamespaces" :key="ns.id" :value="ns.id">
                 {{ ns.label }}
               </option>
             </select>
-            <p v-if="schemaNamespaces.length === 0" class="ns-hint">
+            <p v-if="writableSchemaNamespaces.length === 0" class="ns-hint">
               No schemas available. Create a catalog and schema first.
             </p>
           </div>
@@ -61,7 +62,7 @@
         <button class="btn-secondary" @click="$emit('close')">Cancel</button>
         <button
           class="btn-primary"
-          :disabled="!name.trim() || !path.trim() || submitting"
+          :disabled="!name.trim() || !!nameError || !path.trim() || submitting"
           @click="submit"
         >
           {{ submitting ? "Registering..." : "Register" }}
@@ -76,6 +77,9 @@ import { computed, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
 import { CatalogApi } from "../../api/catalog.api";
 import { useCatalogStore } from "../../stores/catalog-store";
+import { validateCatalogName, sanitizeCatalogName } from "../../composables/catalogNameValidation";
+import { useWritableNamespaces } from "../../composables/useWritableNamespaces";
+import { catalogSaveErrorMessage } from "../../composables/saveError";
 import FileBrowser from "../../components/common/FileBrowser/fileBrowser.vue";
 
 const props = defineProps<{
@@ -87,26 +91,19 @@ const props = defineProps<{
 const emit = defineEmits(["close"]);
 
 const catalogStore = useCatalogStore();
+const { writableSchemaNamespaces } = useWritableNamespaces();
 const name = ref("");
 const path = ref("");
 const description = ref("");
 const selectedNamespaceId = ref<number | null>(null);
 const submitting = ref(false);
 
+const nameError = computed(() => validateCatalogName(name.value, "Table"));
+
 const fileName = computed(() => {
   if (!path.value) return "";
   const parts = path.value.replace(/\\/g, "/").split("/");
   return parts[parts.length - 1] || path.value;
-});
-
-const schemaNamespaces = computed(() => {
-  const result: { id: number; label: string }[] = [];
-  for (const catalog of catalogStore.tree) {
-    for (const schema of catalog.children) {
-      result.push({ id: schema.id, label: `${catalog.name} / ${schema.name}` });
-    }
-  }
-  return result;
 });
 
 watch(
@@ -125,7 +122,7 @@ function handleFileSelected(fileInfo: { name: string; path: string }) {
   path.value = fileInfo.path;
   if (!name.value.trim()) {
     const baseName = fileInfo.name.replace(/\.parquet$/i, "");
-    name.value = baseName;
+    name.value = sanitizeCatalogName(baseName);
   }
 }
 
@@ -136,7 +133,7 @@ function handleFileUpdate(file: { name: string; path: string; is_directory: bool
 }
 
 async function submit() {
-  if (!name.value.trim() || !path.value.trim()) return;
+  if (!name.value.trim() || nameError.value || !path.value.trim()) return;
   submitting.value = true;
   try {
     const nsId = selectedNamespaceId.value ?? props.defaultNamespaceId;
@@ -154,7 +151,7 @@ async function submit() {
       catalogStore.loadStats(),
     ]);
   } catch (e: any) {
-    ElMessage.error(e?.response?.data?.detail ?? "Failed to register table");
+    ElMessage.error(catalogSaveErrorMessage(e, "Failed to register table"));
   } finally {
     submitting.value = false;
   }
@@ -268,6 +265,12 @@ async function submit() {
   outline: none;
   border-color: var(--color-primary);
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
+}
+
+.field-error {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  color: var(--el-color-danger);
 }
 
 select.input-field {

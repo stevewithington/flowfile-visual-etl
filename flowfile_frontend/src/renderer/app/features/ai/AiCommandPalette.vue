@@ -17,18 +17,16 @@ import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { useAiCommandPaletteStore } from "../../stores/ai-command-palette-store";
 import { useAiStore } from "../../stores/ai-store";
 import { useFlowStore } from "../../stores/flow-store";
-import { AiDisabledError } from "../../views/AiProvidersView/api";
 
 const palette = useAiCommandPaletteStore();
 const aiStore = useAiStore();
 const flowStore = useFlowStore();
 
 const inputEl = ref<HTMLInputElement | null>(null);
-const providersLoadFailedDisabled = ref(false);
 
 const placeholder = computed(() => {
-  if (palette.aiDisabled) return "AI features are disabled.";
-  if (!aiStore.hasConfiguredProvider) return "Configure a provider in Settings → AI Providers.";
+  if (_disabled.value) return "AI features are disabled.";
+  if (!aiStore.hasConfiguredProvider) return "Configure a provider in Settings → AI.";
   return "Type an action — e.g. 'filter to last 30 days'";
 });
 
@@ -40,28 +38,13 @@ const canSubmit = computed(
     palette.prompt.trim().length > 0,
 );
 
-// Model picker. Mirrors the chat drawer's pattern (AiAssistant.vue):
-// prefer the curated `credential.models` list, fall back to the
-// singleton `defaultModel`, and only render the <select> when there
-// are 2+ options. Existing behaviour is preserved verbatim for users
-// with a single default model: the picker just doesn't render. The
-// picker writes to the same `aiStore.selectedModel` that the palette
-// already forwards on each request, so changing it routes the next
-// call to the picked model and survives across surfaces.
-const selectedProviderMeta = computed(() => {
-  const name = aiStore.selectedProvider;
-  if (!name) return null;
-  return aiStore.providers.find((p) => p.provider === name) ?? null;
-});
-
-const availableModels = computed<string[]>(() => {
-  const meta = selectedProviderMeta.value;
-  if (!meta) return [];
-  const curated = meta.credential?.models;
-  if (curated && curated.length > 0) return curated;
-  const singleton = meta.credential?.defaultModel ?? meta.defaultModel ?? null;
-  return singleton ? [singleton] : [];
-});
+// Model picker. Same list the Settings → AI page and the chat drawer offer
+// (``aiStore.modelsForProvider``); only rendered when there is a real choice.
+// It writes the same device-wide ``aiStore.selectedModel`` the palette
+// forwards on each request, so a pick here applies everywhere.
+const availableModels = computed<string[]>(() =>
+  aiStore.modelsForProvider(aiStore.selectedProvider),
+);
 
 const showModelPicker = computed(() => availableModels.value.length > 1);
 
@@ -87,13 +70,9 @@ onMounted(async () => {
   // Pre-load the provider list once so the first cmd+k press
   // doesn't race the BYOK fetch. The chat drawer already does this
   // on its own mount, but the palette may be the first AI surface
-  // a user opens.
+  // a user opens. A 503 lands in ``aiStore.aiDisabled``.
   if (aiStore.providers.length === 0) {
-    try {
-      await aiStore.loadProviders();
-    } catch (err) {
-      if (err instanceof AiDisabledError) providersLoadFailedDisabled.value = true;
-    }
+    await aiStore.loadProviders();
   }
 });
 
@@ -149,7 +128,7 @@ const handleClose = (): void => {
   if (!palette.loading) palette.close();
 };
 
-const _disabled = computed(() => palette.aiDisabled || providersLoadFailedDisabled.value);
+const _disabled = computed(() => palette.aiDisabled || aiStore.aiDisabled);
 </script>
 
 <template>
@@ -227,7 +206,7 @@ const _disabled = computed(() => palette.aiDisabled || providersLoadFailedDisabl
           {{ palette.error }}
         </div>
         <div v-else-if="!aiStore.hasConfiguredProvider && !_disabled" class="ai-cmdk__hint">
-          No AI provider configured. Open Settings → AI Providers to add a key.
+          No AI provider configured. Open Settings → AI to add a key.
         </div>
         <div v-else class="ai-cmdk__hint">
           Press <kbd>Enter</kbd> to run · <kbd>Esc</kbd> to close
@@ -260,7 +239,7 @@ const _disabled = computed(() => palette.aiDisabled || providersLoadFailedDisabl
 
 .ai-cmdk__panel {
   width: min(640px, 92vw);
-  background: #ffffff;
+  background: var(--color-background-primary);
   border-radius: 12px;
   box-shadow: 0 24px 64px rgba(15, 20, 30, 0.28);
   padding: 14px 14px 10px 14px;
@@ -275,24 +254,24 @@ const _disabled = computed(() => palette.aiDisabled || providersLoadFailedDisabl
   align-items: center;
   gap: 8px;
   padding-bottom: 6px;
-  border-bottom: 1px solid #f3f4f6;
+  border-bottom: 1px solid var(--color-border-light);
 }
 
 .ai-cmdk__model-label {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: #6b7280;
+  color: var(--color-text-secondary);
   font-weight: 600;
 }
 
 .ai-cmdk__model-select {
   font-size: 12px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--color-border-primary);
   border-radius: 4px;
   padding: 2px 6px;
-  background: #ffffff;
-  color: #1f2937;
+  background: var(--color-background-primary);
+  color: var(--color-text-primary);
   cursor: pointer;
   max-width: 320px;
   text-overflow: ellipsis;
@@ -310,7 +289,7 @@ const _disabled = computed(() => palette.aiDisabled || providersLoadFailedDisabl
 .ai-cmdk__close {
   border: none;
   background: transparent;
-  color: #6b7280;
+  color: var(--color-text-secondary);
   font-size: 14px;
   line-height: 1;
   padding: 4px 8px;
@@ -319,8 +298,8 @@ const _disabled = computed(() => palette.aiDisabled || providersLoadFailedDisabl
 }
 
 .ai-cmdk__close:hover:not(:disabled) {
-  background: #f3f4f6;
-  color: #1f2937;
+  background: var(--color-background-hover);
+  color: var(--color-text-primary);
 }
 
 .ai-cmdk__close:disabled {
@@ -346,32 +325,32 @@ const _disabled = computed(() => palette.aiDisabled || providersLoadFailedDisabl
   font-size: 16px;
   background: transparent;
   padding: 6px 4px;
-  color: #1f2937;
+  color: var(--color-text-primary);
 }
 
 .ai-cmdk__input::placeholder {
-  color: #9ca3af;
+  color: var(--color-text-muted);
 }
 
 .ai-cmdk__input:disabled {
-  color: #9ca3af;
+  color: var(--color-text-muted);
   cursor: not-allowed;
 }
 
 .ai-cmdk__submit,
 .ai-cmdk__cancel {
-  border: 1px solid #d1d5db;
-  background: #f9fafb;
+  border: 1px solid var(--color-border-primary);
+  background: var(--color-background-secondary);
   border-radius: 6px;
   padding: 4px 12px;
   font-size: 13px;
   cursor: pointer;
-  color: #1f2937;
+  color: var(--color-text-primary);
 }
 
 .ai-cmdk__submit:hover:not(:disabled),
 .ai-cmdk__cancel:hover {
-  background: #f3f4f6;
+  background: var(--color-background-hover);
 }
 
 .ai-cmdk__submit:disabled {
@@ -381,12 +360,12 @@ const _disabled = computed(() => palette.aiDisabled || providersLoadFailedDisabl
 
 .ai-cmdk__hint {
   font-size: 12px;
-  color: #6b7280;
+  color: var(--color-text-secondary);
 }
 
 .ai-cmdk__hint kbd {
-  background: #f3f4f6;
-  border: 1px solid #d1d5db;
+  background: var(--color-background-hover);
+  border: 1px solid var(--color-border-primary);
   border-radius: 3px;
   padding: 0 4px;
   font-family: ui-monospace, SFMono-Regular, "SF Mono", monospace;
@@ -395,14 +374,14 @@ const _disabled = computed(() => palette.aiDisabled || providersLoadFailedDisabl
 
 .ai-cmdk__error {
   font-size: 12px;
-  color: #b91c1c;
+  color: var(--color-danger-dark);
 }
 
 .ai-cmdk__refused {
   font-size: 12px;
-  color: #92400e;
-  background: #fffbeb;
-  border: 1px solid #fde68a;
+  color: var(--color-warning-dark);
+  background: var(--color-warning-light);
+  border: 1px solid var(--color-warning);
   border-radius: 6px;
   padding: 6px 8px;
 }

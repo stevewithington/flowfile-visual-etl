@@ -7,14 +7,17 @@ each piece independently testable.
 import logging
 import os
 import re
+import uuid
+from collections.abc import Iterable
 
 import polars as pl
 
-from flowfile_core.configs.settings import OFFLOAD_TO_WORKER, SERVER_PORT
+from flowfile_core.configs.settings import OFFLOAD_TO_WORKER
 from flowfile_core.flowfile.flow_data_engine.flow_data_engine import FlowDataEngine
 from flowfile_core.flowfile.flow_data_engine.subprocess_operations.subprocess_operations import ExternalDfFetcher
 from flowfile_core.kernel.manager import KernelManager
 from flowfile_core.kernel.models import ExecuteRequest, ExecuteResult
+from flowfile_core.kernel.urls import core_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +25,29 @@ _SAFE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 def _assert_safe_name(name: str) -> None:
-    """Raise if *name* is not a safe filesystem identifier."""
+    """Raise if *name* is not a safe filesystem identifier or is the reserved ``"main"`` alias."""
     if not _SAFE_NAME_RE.match(name):
         raise ValueError(f"Unsafe input/output name rejected: {name!r}")
+    if name == "main":
+        raise ValueError(
+            "Input name 'main' is reserved: read_inputs()['main'] holds every input in wiring order. "
+            "Set a different node_reference on the upstream node."
+        )
+
+
+def clear_stale_parquets(dir_path: str) -> None:
+    """Remove leftover ``*.parquet`` files from a prior run in *dir_path*.
+
+    Stale outputs would mask missing publishes in read_kernel_outputs; stale
+    inputs would be picked up as ghost inputs by resolve_node_paths (the
+    interactive /execute and /execute_cell routes scan the whole input dir).
+    No-op when the directory does not exist.
+    """
+    if not os.path.isdir(dir_path):
+        return
+    for stale in os.listdir(dir_path):
+        if stale.endswith(".parquet"):
+            os.remove(os.path.join(dir_path, stale))
 
 
 def _write_parquet_locally(lf: pl.LazyFrame | pl.DataFrame, output_path: str) -> None:
@@ -42,8 +65,33 @@ def _write_parquet_locally(lf: pl.LazyFrame | pl.DataFrame, output_path: str) ->
         except Exception:
             df = lf.collect()
     df.write_parquet(output_path)
-    with open(output_path, "rb") as f:
+    # "rb+" — os.fsync needs a writable fd on Windows (EBADF on read-only handles)
+    with open(output_path, "rb+") as f:
         os.fsync(f.fileno())
+
+
+def write_parquet_for_kernel(
+    lf: pl.LazyFrame | pl.DataFrame, path: str, *, flow_id: int, node_id: int, local: bool, what: str
+) -> None:
+    """Write *lf* as parquet at *path* for a kernel to read.
+
+    In-process when *local* (a graph whose ``execution_location`` is ``"local"``) or worker offload is off,
+    else through the worker so core never collects it; a worker failure raises ``RuntimeError`` naming *what*.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if local or not OFFLOAD_TO_WORKER:
+        _write_parquet_locally(lf, path)
+        return
+    fetcher = ExternalDfFetcher(
+        flow_id=flow_id,
+        node_id=node_id,
+        lf=lf,
+        wait_on_completion=True,
+        operation_type="write_parquet",
+        kwargs={"output_path": path},
+    )
+    if fetcher.has_error:
+        raise RuntimeError(f"Failed to write parquet for {what}: {fetcher.error_description}")
 
 
 def write_inputs_to_parquet(
@@ -53,70 +101,79 @@ def write_inputs_to_parquet(
     flow_id: int,
     node_id: int,
     input_names: list[str] | None = None,
+    *,
+    local: bool = False,
 ) -> dict[str, list[str]]:
     """Serialize input tables to parquet on the shared volume.
 
     When *input_names* is provided, each table gets its own named key in the
     returned dict (e.g. ``{"orders": [...], "customers": [...]}``).  A
-    ``"main"`` key is always included pointing to **all** input files so that
-    ``flowfile.read_input("main")`` continues to work.
+    ``"main"`` key is always included pointing to **all** input files in wiring
+    order, so ``flowfile_ctx.read_inputs()["main"][i]`` is input *i*; no input
+    may itself be named ``"main"``.
 
     When *input_names* is ``None``, falls back to the original behaviour
     where every input is grouped under ``"main"``.
 
+    With *local* set (a graph whose ``execution_location`` is ``"local"``) the
+    files are written in-process even when worker offload is on.
+
     Returns the ``input_paths`` dict expected by :class:`ExecuteRequest`.
     """
-    use_local = not OFFLOAD_TO_WORKER
-
     if input_names is None:
-        # Original behaviour: all inputs under "main"
         main_paths: list[str] = []
         for idx, ft in enumerate(flowfile_tables):
             local_path = os.path.join(input_dir, f"main_{idx}.parquet")
-            if use_local:
-                _write_parquet_locally(ft.data_frame, local_path)
-            else:
-                fetcher = ExternalDfFetcher(
-                    flow_id=flow_id,
-                    node_id=node_id,
-                    lf=ft.data_frame,
-                    wait_on_completion=True,
-                    operation_type="write_parquet",
-                    kwargs={"output_path": local_path},
-                )
-                if fetcher.has_error:
-                    raise RuntimeError(f"Failed to write parquet for input {idx}: {fetcher.error_description}")
+            write_parquet_for_kernel(
+                ft.data_frame, local_path, flow_id=flow_id, node_id=node_id, local=local, what=f"input {idx}"
+            )
             main_paths.append(manager.to_kernel_path(local_path))
         return {"main": main_paths}
 
-    # Named inputs: each table gets its own key
     result: dict[str, list[str]] = {}
     all_paths: list[str] = []
     for idx, (ft, name) in enumerate(zip(flowfile_tables, input_names, strict=True)):
         _assert_safe_name(name)
         local_path = os.path.join(input_dir, f"{name}_{idx}.parquet")
-        if use_local:
-            _write_parquet_locally(ft.data_frame, local_path)
-        else:
-            fetcher = ExternalDfFetcher(
-                flow_id=flow_id,
-                node_id=node_id,
-                lf=ft.data_frame,
-                wait_on_completion=True,
-                operation_type="write_parquet",
-                kwargs={"output_path": local_path},
-            )
-            if fetcher.has_error:
-                raise RuntimeError(f"Failed to write parquet for input {idx} ({name}): {fetcher.error_description}")
+        write_parquet_for_kernel(
+            ft.data_frame, local_path, flow_id=flow_id, node_id=node_id, local=local, what=f"input {idx} ({name})"
+        )
         kernel_path = manager.to_kernel_path(local_path)
         result.setdefault(name, []).append(kernel_path)
         all_paths.append(kernel_path)
 
-    # Always include "main" as a backward-compatible alias for all inputs
-    if "main" not in result:
-        result["main"] = all_paths
-
+    result["main"] = all_paths
     return result
+
+
+class KernelBusyError(RuntimeError):
+    """A kernel node refused because the caller of its run holds the kernel's execution lock (:class:`KernelHold`)."""
+
+    def __init__(self, node_id: int, kernel_id: str) -> None:
+        super().__init__(
+            f"Kernel '{kernel_id}' is busy with the notebook cell waiting on this run, so node {node_id} cannot run "
+            "on it now"
+        )
+
+
+class KernelHold:
+    """The kernels whose execution lock the caller of a run holds while it waits on that run.
+
+    A notebook session's canvas fallback is such a caller: its kernel call holds the kernel while the kernel
+    waits on the run, so a node of the run executing on that kernel would wait forever. The run
+    (``FlowGraph.run_graph(kernel_hold=...)``, its subflows included) refuses it at once instead, through
+    :meth:`check`, which records ``(flow_id, node_id)`` in ``refusals``.
+    """
+
+    def __init__(self, kernel_ids: Iterable[str]) -> None:
+        self.kernel_ids = frozenset(kernel_ids)
+        self.refusals: list[tuple[int, int]] = []
+
+    def check(self, flow_id: int, node_id: int, kernel_id: str) -> None:
+        """Raise :class:`KernelBusyError` when *kernel_id* is held, recording the node."""
+        if kernel_id in self.kernel_ids:
+            self.refusals.append((flow_id, node_id))
+            raise KernelBusyError(node_id, kernel_id)
 
 
 def build_execute_request(
@@ -128,12 +185,14 @@ def build_execute_request(
     flow_id: int,
     manager: KernelManager,
     source_registration_id: int | None,
+    available_artifacts: dict[str, int] | None = None,
 ) -> ExecuteRequest:
     """Assemble the kernel ExecuteRequest with log callback URL and auth token."""
-    if manager._kernel_volume:
-        log_callback_url = f"http://flowfile-core:{SERVER_PORT}/raw_logs"
-    else:
-        log_callback_url = f"http://host.docker.internal:{SERVER_PORT}/raw_logs"
+    # Keyed on the network, not the volume: the kernel can only resolve core by
+    # service name when it was actually joined to core's network. The two used
+    # to disagree, so a Docker setup with one but not the other sent the log
+    # callback somewhere the API callbacks did not go.
+    log_callback_url = f"{core_base_url(bool(manager._docker_network))}/raw_logs"
 
     internal_token: str | None = None
     try:
@@ -152,7 +211,57 @@ def build_execute_request(
         source_registration_id=source_registration_id,
         log_callback_url=log_callback_url,
         internal_token=internal_token,
+        available_artifacts=available_artifacts,
+        # Minted here, not in execute_sync: the node stores it as its cancel
+        # address before the call, so a cancel can only hit this one cell.
+        exec_token=uuid.uuid4().hex,
     )
+
+
+def read_kernel_outputs(
+    *,
+    output_dir: str,
+    output_names: list[str],
+    result: ExecuteResult,
+    node,
+) -> FlowDataEngine | None:
+    """Read the parquet outputs the kernel wrote to *output_dir*.
+
+    Registers each found output on ``node._named_outputs`` and returns the
+    primary (index-0) output, or None when the kernel published nothing
+    (caller falls back to input passthrough — intentional).
+
+    Raises when the kernel reported published outputs but none of the expected
+    files exist locally — either the published names don't match the node's
+    output_names, or a host/container path-translation / shared-volume mount
+    mismatch that would otherwise silently feed ghost data downstream.
+    """
+    primary: FlowDataEngine | None = None
+    found = False
+    for i, name in enumerate(output_names):
+        output_path = os.path.join(output_dir, f"{name}.parquet")
+        if os.path.exists(output_path):
+            found = True
+            fde = FlowDataEngine(pl.scan_parquet(output_path))
+            if node is not None:
+                node._named_outputs[f"output-{i}"] = fde
+            if i == 0:
+                primary = fde
+    if result.output_paths and not found:
+        published = [p.replace("\\", "/").rsplit("/", 1)[-1] for p in result.output_paths]
+        expected = [f"{name}.parquet" for name in output_names]
+        if not set(published) & set(expected):
+            raise RuntimeError(
+                f"Kernel published {published} but the node expects outputs named {expected}. "
+                "Match the name passed to flowfile_ctx.publish_output(df, name=...) with the "
+                "node's output names."
+            )
+        raise RuntimeError(
+            f"Kernel reported {len(result.output_paths)} published output file(s) but none were "
+            f"found under {output_dir!r} — host/container path-translation or shared-volume "
+            f"mount mismatch. Kernel paths: {result.output_paths}"
+        )
+    return primary
 
 
 def forward_kernel_logs(result: ExecuteResult, node_logger) -> None:

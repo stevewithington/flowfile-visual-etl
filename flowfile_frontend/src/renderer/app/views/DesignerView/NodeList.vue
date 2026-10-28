@@ -4,117 +4,128 @@
     <input v-model="searchQuery" type="text" placeholder="Search nodes..." class="search-input" />
 
     <div
-      v-for="(categoryInfo, category) in categories"
-      :key="category"
+      v-for="group in filteredGroups"
+      :key="group.key"
       class="category-container"
-      :data-tutorial-category="category"
+      :data-tutorial-category="group.key"
     >
       <!-- Category Header -->
-      <button class="category-header" @click="toggleCategory(category as CategoryKey)">
-        <span class="category-title">{{ categoryInfo.name }}</span>
+      <button class="category-header" @click="toggleGroup(group.key)">
+        <span class="category-title">{{ group.label }}</span>
+        <span v-if="group.isDynamic" class="category-chip" title="Custom category">custom</span>
         <el-icon class="category-icon">
-          <ArrowDown v-if="openCategories[category as CategoryKey]" />
+          <ArrowDown v-if="isGroupOpen(group.key)" />
           <ArrowRight v-else />
         </el-icon>
       </button>
 
       <!-- Category Content -->
-      <div
-        v-if="openCategories[category as CategoryKey] && filteredNodes[category]"
-        class="category-content"
-      >
-        <div
-          v-for="node in filteredNodes[category]"
+      <div v-if="isGroupOpen(group.key)" class="category-content">
+        <NodeListItem
+          v-for="node in group.nodes"
           :key="node.item"
-          class="node-item"
-          :data-tutorial-node="node.item"
-          draggable="true"
-          @dragstart="$emit('dragstart', $event, node)"
-        >
-          <img :src="getImageUrl(node.image)" :alt="node.name" class="node-image" />
-          <span class="node-name">{{ node.name }}</span>
-        </div>
+          :node="node"
+          :favorite="isFavorite(node.item)"
+          :hidden-node="group.key === HIDDEN_GROUP_KEY"
+          :tutorial-target="group.key !== FAVORITES_GROUP_KEY"
+          :suppress-tooltip="nodeMenu !== null"
+          @dragstart="onDragStart"
+          @contextmenu="openNodeMenu"
+        />
       </div>
     </div>
+
+    <Teleport to="body">
+      <ContextMenu
+        v-if="nodeMenu"
+        :position="{ x: nodeMenu.x, y: nodeMenu.y }"
+        :options="menuOptions"
+        @select="onMenuSelect"
+        @close="nodeMenu = null"
+      />
+    </Teleport>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
 import { ArrowDown, ArrowRight } from "@element-plus/icons-vue";
-import { getImageUrl } from "../../features/designer/utils";
 import { useNodes } from "./useNodes";
-import { NodeTemplate } from "../../types";
+import { FAVORITES_GROUP_KEY, HIDDEN_GROUP_KEY, usePaletteGroups } from "./usePaletteGroups";
+import { readinessKey, useKernelReadiness } from "../../composables/useKernelReadiness";
+import NodeListItem from "./NodeListItem.vue";
+import ContextMenu from "../../components/common/ContextMenu/ContextMenu.vue";
+import { nodeDocsMenuOptions, nodeDocsUrl, READ_MORE_ACTION } from "./nodeDocsLinks";
+import { desktop } from "../../../lib/desktop";
+import type { NodeTemplate } from "../../types";
+import type { ContextMenuOption } from "../../components/common/ContextMenu/types";
 
 const { nodes } = useNodes();
+const {
+  searchQuery,
+  filteredGroups,
+  isGroupOpen,
+  toggleGroup,
+  isFavorite,
+  isHidden,
+  toggleFavorite,
+  toggleHidden,
+} = usePaletteGroups(nodes);
 
-type CategoryKey = "input" | "transform" | "combine" | "aggregate" | "ml" | "output" | "custom";
-
-interface CategoryInfo {
-  name: string;
-  isOpen: boolean;
-}
-
-type Categories = {
-  [K in CategoryKey]: CategoryInfo;
-};
-
-const categories: Categories = {
-  input: { name: "Input Sources", isOpen: true },
-  transform: { name: "Transformations", isOpen: true },
-  combine: { name: "Combine Operations", isOpen: true },
-  aggregate: { name: "Aggregations", isOpen: true },
-  ml: { name: "Machine Learning", isOpen: true },
-  output: { name: "Output Operations", isOpen: true },
-  custom: { name: "User Defined Operations", isOpen: true },
-};
-
-const openCategories = ref<{ [K in CategoryKey]: boolean }>(
-  Object.fromEntries(
-    Object.keys(categories).map((key) => [key, categories[key as CategoryKey].isOpen]),
-  ) as { [K in CategoryKey]: boolean },
-);
-
-const groupedNodes = computed(() => {
-  return nodes.value.reduce(
-    (acc, node) => {
-      const group = node.node_group as CategoryKey;
-      if (!acc[group]) {
-        acc[group] = [];
-      }
-      acc[group].push(node);
-      return acc;
-    },
-    {} as Record<CategoryKey, NodeTemplate[]>,
-  );
-});
-
-// Reactive search query
-const searchQuery = ref("");
-
-// Compute filtered nodes based on the search query
-const filteredNodes = computed(() => {
-  // If no search query, return all grouped nodes
-  if (!searchQuery.value) return groupedNodes.value;
-
-  const query = searchQuery.value.toLowerCase();
-  const filtered = {} as Record<CategoryKey, NodeTemplate[]>;
-  // Loop through each category and filter nodes
-  for (const category in groupedNodes.value) {
-    const nodesArray = groupedNodes.value[category as CategoryKey];
-    const filteredArray = nodesArray.filter((node) => node.name.toLowerCase().includes(query));
-    if (filteredArray.length) {
-      filtered[category as CategoryKey] = filteredArray;
+// One batch readiness fetch for every kernel-env template with deps; the rows
+// (NodeListItem) read the shared cache keyed by their own dependency set.
+const { ensureReadiness } = useKernelReadiness();
+watch(nodes, (all) => {
+  const items: Record<string, string[]> = {};
+  for (const node of all) {
+    if (node.execution_environment === "kernel" && node.dependencies?.length) {
+      items[readinessKey(node.dependencies)] = node.dependencies;
     }
   }
-  return filtered;
+  if (Object.keys(items).length) void ensureReadiness(items);
 });
 
-const toggleCategory = (category: CategoryKey) => {
-  openCategories.value[category] = !openCategories.value[category];
+const emit = defineEmits<{
+  (e: "dragstart", event: DragEvent, node: NodeTemplate): void;
+}>();
+
+// One menu for the whole palette — only one can be open, and per-row menus would
+// each register document-level listeners for all ~45 rows.
+const nodeMenu = ref<{ node: NodeTemplate; x: number; y: number } | null>(null);
+
+const FAVORITE_ACTION = "favorite";
+const HIDE_ACTION = "hide";
+
+const menuOptions = computed<ContextMenuOption[]>(() => {
+  const item = nodeMenu.value?.node.item ?? "";
+  return [
+    {
+      label: isFavorite(item) ? "Remove from favorites" : "Add to favorites",
+      action: FAVORITE_ACTION,
+    },
+    { label: isHidden(item) ? "Unhide node" : "Hide node", action: HIDE_ACTION },
+    ...nodeDocsMenuOptions(),
+  ];
+});
+
+const openNodeMenu = (event: MouseEvent, node: NodeTemplate) => {
+  nodeMenu.value = { node, x: event.clientX, y: event.clientY };
 };
 
-defineEmits(["dragstart"]);
+const onDragStart = (event: DragEvent, node: NodeTemplate) => {
+  nodeMenu.value = null;
+  emit("dragstart", event, node);
+};
+
+const onMenuSelect = (action: string) => {
+  if (!nodeMenu.value) return;
+  const node = nodeMenu.value.node;
+  if (action === FAVORITE_ACTION) toggleFavorite(node.item);
+  else if (action === HIDE_ACTION) toggleHidden(node.item);
+  // Synchronous: in web mode this is window.open, which needs the click's
+  // user-gesture attribution to survive the popup blocker.
+  else if (action === READ_MORE_ACTION) void desktop.openExternal(nodeDocsUrl(node));
+};
 </script>
 
 <style scoped>
@@ -174,9 +185,23 @@ defineEmits(["dragstart"]);
   text-align: left;
 }
 
+/* Subtle marker distinguishing dynamic user-defined category groups. */
+.category-chip {
+  margin-left: var(--spacing-2);
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--color-accent, #0891b2);
+  background-color: var(--color-accent-soft, rgba(8, 145, 178, 0.12));
+  border-radius: var(--border-radius-full, 999px);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
 .category-icon {
   font-size: var(--font-size-sm);
   color: var(--color-text-secondary);
+  margin-left: auto;
 }
 
 .category-content {
@@ -185,34 +210,8 @@ defineEmits(["dragstart"]);
   background-color: var(--color-background-primary);
 }
 
-.node-item {
-  display: flex;
-  align-items: center;
-  padding: var(--spacing-2) var(--spacing-4);
-  cursor: pointer;
-  user-select: none;
-  transition: background-color var(--transition-fast);
-  border-bottom: 1px solid var(--color-border-light);
-  height: 32px;
-}
-
-.node-item:last-child {
+.category-content :deep(.node-item):last-child {
   border-bottom: none;
-}
-
-.node-item:hover {
-  background-color: var(--color-background-tertiary);
-}
-
-.node-image {
-  width: 24px;
-  height: 24px;
-  margin-right: var(--spacing-2-5);
-}
-
-.node-name {
-  font-size: var(--font-size-sm);
-  color: var(--color-text-primary);
 }
 
 /* Custom scrollbar */

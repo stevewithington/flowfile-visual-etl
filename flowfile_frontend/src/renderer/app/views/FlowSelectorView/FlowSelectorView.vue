@@ -1,12 +1,25 @@
 <template>
   <div class="flow-tabs-container">
-    <div class="flow-tabs">
+    <button
+      v-if="canScrollLeft"
+      type="button"
+      class="tab-scroll-btn left"
+      aria-label="Scroll tabs left"
+      title="More tabs"
+      @click="scrollStrip(-1)"
+    >
+      <span class="material-icons">chevron_left</span>
+    </button>
+    <div ref="tabStrip" class="flow-tabs" @wheel="onTabStripWheel" @scroll.passive="updateOverflow">
+      <!-- trigger-keys=[] : the trigger's default keys include Space, and its keydown
+           handler preventDefaults it — swallowing spaces typed in the rename input. -->
       <el-tooltip
         v-for="flow in flows"
         :key="flow.flow_id"
         placement="bottom"
         :show-after="400"
         :hide-after="0"
+        :trigger-keys="[]"
       >
         <template #content>
           <div>{{ flow.display_name || flow.name }}</div>
@@ -16,12 +29,28 @@
           class="flow-tab"
           :class="{ active: selectedFlowId === flow.flow_id, dirty: isDirty(flow.flow_id) }"
           @click="selectFlow(flow.flow_id)"
+          @dblclick="startRename(flow.flow_id)"
+          @contextmenu.prevent="openTabMenu($event, flow.flow_id)"
         >
           <div class="tab-content">
             <span class="material-icons tab-icon">account_tree</span>
-            <span class="tab-name">{{ flow.display_name || flow.name }}</span>
+            <!-- keydown.stop: typing must not reach the tooltip trigger or the
+                 canvas/undo global shortcut handlers. -->
+            <input
+              v-if="renamingFlowId === flow.flow_id"
+              :ref="setRenameInput"
+              v-model="renameValue"
+              class="tab-rename-input"
+              @keydown.stop
+              @keydown.enter.prevent="commitRename"
+              @keydown.escape="cancelRename"
+              @blur="commitRename"
+              @click.stop
+              @dblclick.stop
+            />
+            <span v-else class="tab-name">{{ flow.display_name || flow.name }}</span>
           </div>
-          <span class="tab-indicator">
+          <span class="tab-indicator" @dblclick.stop>
             <span
               v-if="isDirty(flow.flow_id)"
               class="dirty-dot"
@@ -33,7 +62,26 @@
           </span>
         </div>
       </el-tooltip>
+      <button
+        type="button"
+        class="new-flow-tab"
+        aria-label="New flow"
+        title="New flow"
+        @click="emit('create-flow')"
+      >
+        <span class="material-icons">add</span>
+      </button>
     </div>
+    <button
+      v-if="canScrollRight"
+      type="button"
+      class="tab-scroll-btn right"
+      aria-label="Scroll tabs right"
+      title="More tabs"
+      @click="scrollStrip(1)"
+    >
+      <span class="material-icons">chevron_right</span>
+    </button>
   </div>
 
   <!-- Save Confirmation Modal -->
@@ -41,6 +89,7 @@
     ref="saveConfirmationModal"
     @save="handleSaveAndClose"
     @dont-save="handleCloseWithoutSaving"
+    @cancelled="handleCloseCancelled"
   />
 
   <!-- Save Dialog -->
@@ -51,16 +100,34 @@
     @save-complete="handleSaveComplete"
     @save-cancelled="handleSaveCancelled"
   />
+
+  <!-- Right-click context menu for flow tabs -->
+  <Teleport to="body">
+    <ContextMenu
+      v-if="tabMenu"
+      :position="{ x: tabMenu.x, y: tabMenu.y }"
+      :options="tabMenuOptionsComputed"
+      @select="onTabMenuSelect"
+      @close="tabMenu = null"
+    />
+  </Teleport>
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted, computed } from "vue";
+import { ref, watch, onMounted, onBeforeUnmount, computed, nextTick } from "vue";
+import { ElMessage } from "element-plus";
 import { useNodeStore } from "../../stores/column-store";
 import { useEditorStore } from "../../stores/editor-store";
+import { useFlowSyncStore } from "../../stores/flow-sync-store";
+import { useCatalogStore } from "../../stores/catalog-store";
+import { useRecentFlows } from "../../composables/useRecentFlows";
 import { FlowApi } from "../../api";
 import type { FlowSettings } from "../../types";
 import SaveDialog from "../../features/designer/components/SaveDialog.vue";
 import SaveConfirmationModal from "../DesignerView/SaveConfirmationModal.vue";
+import ContextMenu from "../../components/common/ContextMenu/ContextMenu.vue";
+import { computeCloseTargets, tabMenuOptions, type TabCloseAction } from "./flowTabActions";
+import { overflowState, stripMetrics, wheelScrollDelta } from "./flowTabScroll";
 
 const getAllFlows = FlowApi.getAllFlows;
 
@@ -72,16 +139,86 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(["flow-changed", "close-tab", "create-flow"]);
+const emit = defineEmits([
+  "flow-changed",
+  "close-tab",
+  "close-tabs",
+  "flow-renamed",
+  "create-flow",
+]);
 
 // State
 const flows = ref<FlowSettings[]>([]);
 const selectedFlowId = ref<number | null>(null);
 const nodeStore = useNodeStore();
 const editorStore = useEditorStore();
+const catalogStore = useCatalogStore();
+const { renameFlow: renameRecentFlow, reconcileWithCatalog } = useRecentFlows();
 const saveDialogVisible = ref(false);
 const pendingCloseFlowId = ref<number | null>(null);
 const isLoading = ref(false);
+
+// Inline rename
+const renamingFlowId = ref<number | null>(null);
+const renameValue = ref("");
+const renameSeed = ref("");
+const renameInput = ref<HTMLInputElement | null>(null);
+// Function ref: template refs inside v-for collect into arrays; only one rename
+// input exists at a time, so capture it directly.
+const setRenameInput = (el: unknown) => {
+  renameInput.value = (el as HTMLInputElement) ?? null;
+};
+
+// Tab context menu
+const tabMenu = ref<{ flowId: number; x: number; y: number } | null>(null);
+
+// Overflow scrolling: the strip hides its scrollbar, so translate vertical
+// wheel deltas into horizontal scroll, keep the active tab in view, and show
+// edge arrows whenever tabs are clipped on that side.
+const tabStrip = ref<HTMLElement | null>(null);
+const canScrollLeft = ref(false);
+const canScrollRight = ref(false);
+let stripObserver: ResizeObserver | null = null;
+
+const updateOverflow = () => {
+  const strip = tabStrip.value;
+  if (!strip) return;
+  const state = overflowState(stripMetrics(strip));
+  canScrollLeft.value = state.left;
+  canScrollRight.value = state.right;
+};
+
+const scrollStrip = (direction: -1 | 1) => {
+  const strip = tabStrip.value;
+  if (!strip) return;
+  strip.scrollBy({ left: direction * strip.clientWidth * 0.6, behavior: "smooth" });
+};
+
+const onTabStripWheel = (event: WheelEvent) => {
+  const strip = tabStrip.value;
+  if (!strip) return;
+  const delta = wheelScrollDelta(event, stripMetrics(strip));
+  if (delta === null) return;
+  event.preventDefault();
+  strip.scrollLeft += delta;
+};
+
+const scrollActiveTabIntoView = () => {
+  nextTick(() => {
+    const strip = tabStrip.value;
+    const tabs = strip?.querySelectorAll<HTMLElement>(".flow-tab");
+    const active = strip?.querySelector<HTMLElement>(".flow-tab.active");
+    if (!strip || !tabs || !active) return;
+    // The last tab also reveals the trailing "+" button.
+    if (active === tabs[tabs.length - 1]) strip.scrollLeft = strip.scrollWidth;
+    else active.scrollIntoView({ block: "nearest", inline: "nearest" });
+  });
+};
+
+// Bulk close (Close Others / All / Left / Right)
+const bulkQueue = ref<number[]>([]);
+const decidedCloseIds = ref<number[]>([]);
+const bulkActive = ref(false);
 
 const isDirty = (flowId: number): boolean => {
   const flow = flows.value.find((f) => f.flow_id === flowId);
@@ -117,37 +254,48 @@ const scheduleDirtyRefresh = () => {
   }, 400);
 };
 
-// Component references
 const saveConfirmationModal = ref<InstanceType<typeof SaveConfirmationModal> | null>(null);
 const saveDialog = ref<InstanceType<typeof SaveDialog> | null>(null);
 
-// Computed properties
 const selectedFlow = computed(
   () => flows.value.find((flow) => flow.flow_id === selectedFlowId.value) || null,
 );
 
-// Load all flows from backend
-const loadFlows = async () => {
-  if (isLoading.value) return;
+let flowsLoad: Promise<void> | null = null;
+let flowsReload = false;
 
+// A load asked for during a load runs once more after it: a `closed` mid-load needs the newer list.
+const loadFlows = (): Promise<void> => {
+  if (flowsLoad) {
+    flowsReload = true;
+    return flowsLoad;
+  }
+  flowsLoad = (async () => {
+    do {
+      flowsReload = false;
+      await fetchFlows();
+    } while (flowsReload);
+  })().finally(() => {
+    flowsLoad = null;
+  });
+  return flowsLoad;
+};
+
+const fetchFlows = async () => {
   try {
     isLoading.value = true;
     const flowsData = await getAllFlows();
     flows.value = flowsData;
 
-    // Check for stored flow ID in store
     if (nodeStore.flow_id && nodeStore.flow_id !== -1) {
-      // Verify the flow still exists
       const flowExists = flowsData.some((flow) => flow.flow_id === nodeStore.flow_id);
       if (flowExists) {
         selectedFlowId.value = nodeStore.flow_id;
       } else if (flowsData.length > 0) {
-        // Fall back to first flow if stored ID doesn't exist
         selectedFlowId.value = flowsData[0].flow_id;
         nodeStore.setFlowId(flowsData[0].flow_id);
       }
     } else if (flowsData.length > 0) {
-      // If no selected flow, default to the first one
       selectedFlowId.value = flowsData[0].flow_id;
       nodeStore.setFlowId(flowsData[0].flow_id);
     }
@@ -158,7 +306,6 @@ const loadFlows = async () => {
   }
 };
 
-// Select a flow and make it the active tab
 const selectFlow = (flowId: number) => {
   if (flowId === selectedFlowId.value) return;
 
@@ -174,9 +321,141 @@ const selectFlow = (flowId: number) => {
   refreshDirtyState(flowId);
 };
 
+const tabLabelFor = (flowId: number): string | null => {
+  const flow = flows.value.find((f) => f.flow_id === flowId);
+  return flow ? flow.display_name || flow.name : null;
+};
+
+// ---- Inline rename ----
+
+const startRename = (flowId: number) => {
+  const label = tabLabelFor(flowId);
+  if (label === null) return;
+  renameSeed.value = label;
+  renameValue.value = renameSeed.value;
+  renamingFlowId.value = flowId;
+  nextTick(() => {
+    renameInput.value?.focus();
+    renameInput.value?.select();
+  });
+};
+
+const commitRename = async () => {
+  // Cleared first: Enter unmounts the input, whose blur re-enters this handler.
+  if (renamingFlowId.value === null) return;
+  const flowId = renamingFlowId.value;
+  renamingFlowId.value = null;
+  const trimmed = renameValue.value.trim();
+  if (!trimmed || trimmed === renameSeed.value) return;
+  try {
+    const settings = await FlowApi.renameFlow(flowId, trimmed);
+    await loadFlows();
+    emit("flow-renamed", flowId);
+    // The rename never moves the file, so the path-keyed recents entry only needs
+    // its label updated.
+    if (settings?.path) renameRecentFlow(settings.path, trimmed);
+    void reconcileWithCatalog();
+    // Keep the catalog views in sync, but don't force-load the catalog from here.
+    if (catalogStore.tree.length) catalogStore.loadTree();
+    if (catalogStore.allFlows.length) catalogStore.loadAllFlows();
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.detail ?? "Failed to rename flow");
+  }
+};
+
+const cancelRename = () => {
+  renamingFlowId.value = null;
+};
+
+// ---- Tab context menu ----
+
+const openTabMenu = (event: MouseEvent, flowId: number) => {
+  tabMenu.value = {
+    flowId,
+    // The menu doesn't self-clamp; keep it on-screen for right-edge tabs.
+    x: Math.min(event.clientX, window.innerWidth - 200),
+    y: event.clientY,
+  };
+};
+
+const tabMenuOptionsComputed = computed(() =>
+  tabMenu.value
+    ? tabMenuOptions(
+        flows.value.map((f) => f.flow_id),
+        tabMenu.value.flowId,
+      )
+    : [],
+);
+
+const onTabMenuSelect = (action: string) => {
+  const target = tabMenu.value?.flowId;
+  if (target === undefined) return;
+  if (action === "rename") {
+    startRename(target);
+  } else if (action === "close") {
+    confirmCloseTab(target);
+  } else {
+    startBulkClose(
+      computeCloseTargets(
+        flows.value.map((f) => f.flow_id),
+        target,
+        action as TabCloseAction,
+      ),
+    );
+  }
+};
+
+// ---- Bulk close queue ----
+// Walks the targets sequentially: clean flows are marked for closing, dirty ones
+// get the save-confirmation modal. Cancel (dialog X or backing out of the save
+// dialog) aborts the rest; decisions already made still close (VS Code semantics).
+
+const startBulkClose = (targets: number[]) => {
+  if (bulkActive.value || targets.length === 0) return;
+  bulkActive.value = true;
+  bulkQueue.value = [...targets];
+  decidedCloseIds.value = [];
+  processNextBulkClose();
+};
+
+const processNextBulkClose = async () => {
+  const next = bulkQueue.value.shift();
+  if (next === undefined) {
+    flushBulkClose();
+    return;
+  }
+  const settings = await FlowApi.getFlowSettings(next);
+  // Gone sessions (null) close as a no-op — close_flow is idempotent.
+  if (settings === null || settings.has_unsaved_changes === false) {
+    decidedCloseIds.value.push(next);
+    processNextBulkClose();
+    return;
+  }
+  pendingCloseFlowId.value = next;
+  if (saveConfirmationModal.value) {
+    saveConfirmationModal.value.open(next, tabLabelFor(next));
+  } else {
+    // Modal unavailable — leave the flow open rather than dropping unsaved work.
+    pendingCloseFlowId.value = null;
+    processNextBulkClose();
+  }
+};
+
+const flushBulkClose = () => {
+  const ids = decidedCloseIds.value;
+  bulkActive.value = false;
+  bulkQueue.value = [];
+  decidedCloseIds.value = [];
+  pendingCloseFlowId.value = null;
+  if (ids.length === 1) {
+    emit("close-tab", ids[0]);
+  } else if (ids.length > 1) {
+    emit("close-tabs", ids);
+  }
+};
+
 // Show confirmation dialog before closing tab — only if the flow has unsaved changes
 const confirmCloseTab = async (flowId: number) => {
-  // Check backend for dirty state; fall back to prompting if the check fails
   try {
     const settings = await FlowApi.getFlowSettings(flowId);
     if (settings && settings.has_unsaved_changes === false) {
@@ -190,15 +469,13 @@ const confirmCloseTab = async (flowId: number) => {
   pendingCloseFlowId.value = flowId;
 
   if (saveConfirmationModal.value) {
-    saveConfirmationModal.value.open(flowId);
+    saveConfirmationModal.value.open(flowId, tabLabelFor(flowId));
   } else {
     console.error("Save confirmation modal reference not available");
   }
 };
 
-// Handle saving flow before closing
 const handleSaveAndClose = async () => {
-  // Show save dialog
   if (saveDialog.value) {
     saveDialog.value.open();
   } else {
@@ -206,32 +483,47 @@ const handleSaveAndClose = async () => {
   }
 };
 
-// After successful save, close the tab
 const handleSaveComplete = (flowId: number) => {
   saveDialogVisible.value = false;
+  if (bulkActive.value) {
+    // Save-As during a close can rekey the flow — flowId is the current id.
+    decidedCloseIds.value.push(flowId);
+    pendingCloseFlowId.value = null;
+    processNextBulkClose();
+    return;
+  }
   emit("close-tab", flowId);
   pendingCloseFlowId.value = null;
   // The saved flow is now clean; refresh its dirty state so the dot clears.
   refreshDirtyState(flowId);
 };
 
-// If save is cancelled, keep the tab open
 const handleSaveCancelled = () => {
   pendingCloseFlowId.value = null;
+  // Backing out of the save dialog aborts the rest; the undecided flow stays open.
+  if (bulkActive.value) flushBulkClose();
 };
 
-// Close without saving
 const handleCloseWithoutSaving = (flowId: number) => {
+  if (bulkActive.value) {
+    decidedCloseIds.value.push(flowId);
+    pendingCloseFlowId.value = null;
+    processNextBulkClose();
+    return;
+  }
   emit("close-tab", flowId);
   pendingCloseFlowId.value = null;
 };
 
-// Watch for changes to the flow ID in the store
+const handleCloseCancelled = () => {
+  pendingCloseFlowId.value = null;
+  if (bulkActive.value) flushBulkClose();
+};
+
 watch(
   () => nodeStore.flow_id,
   (newFlowId) => {
     if (newFlowId && newFlowId !== -1 && newFlowId !== selectedFlowId.value) {
-      // Verify the flow exists in our list
       const flowExists = flows.value.some((flow) => flow.flow_id === newFlowId);
       if (flowExists) {
         selectedFlowId.value = newFlowId;
@@ -249,17 +541,17 @@ watch(
   },
 );
 
-// Watch for changes to the flows array
+watch(selectedFlowId, scrollActiveTabIntoView);
+watch(flows, () => nextTick(updateOverflow), { deep: true });
+
 watch(
   () => flows.value,
   (newFlows) => {
-    // Handle case where selected flow was deleted
     if (
       selectedFlowId.value !== null &&
       !newFlows.some((flow) => flow.flow_id === selectedFlowId.value)
     ) {
       if (newFlows.length > 0) {
-        // Select the first available flow
         selectFlow(newFlows[0].flow_id);
       } else {
         selectedFlowId.value = null;
@@ -269,11 +561,44 @@ watch(
   },
 );
 
+// A flow closed in another window (the change feed) leaves the tab bar; with none left, the canvas empties.
+const flowSync = useFlowSyncStore();
+watch(
+  () => flowSync.closeCount,
+  async () => {
+    const closedId = flowSync.closedFlowId;
+    if (closedId == null || !flows.value.some((flow) => flow.flow_id === closedId)) return;
+    await loadFlows();
+    if (!flows.value.length) {
+      selectedFlowId.value = null;
+      nodeStore.setFlowId(-1);
+    }
+  },
+);
+
+// A Save As made in another window moved the flow to a new id: its tab follows it there.
+watch(
+  () => flowSync.rekeyedTo,
+  async (moved) => {
+    if (!moved || !flows.value.some((flow) => flow.flow_id === moved.from)) return;
+    // Switch first, so the reload keeps this tab instead of falling back to the first flow.
+    if (selectedFlowId.value === moved.from) selectFlow(moved.to);
+    await loadFlows();
+  },
+);
+
 onMounted(() => {
   loadFlows();
+  if (tabStrip.value && typeof ResizeObserver !== "undefined") {
+    stripObserver = new ResizeObserver(updateOverflow);
+    stripObserver.observe(tabStrip.value);
+  }
 });
 
-// Expose methods and state for parent component
+onBeforeUnmount(() => {
+  stripObserver?.disconnect();
+});
+
 defineExpose({
   loadFlows,
   selectedFlowId,
@@ -285,39 +610,69 @@ defineExpose({
 
 <style scoped>
 .flow-tabs-container {
+  position: relative;
   width: 100%;
   font-family: var(--font-family-base);
 }
 
+/* Overlaid on the strip's edges so toggling them never shifts the tabs. */
+.tab-scroll-btn {
+  position: absolute;
+  top: 0;
+  bottom: 1px;
+  width: 30px;
+  display: flex;
+  align-items: center;
+  padding: 0;
+  border: none;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  z-index: 2;
+}
+
+.tab-scroll-btn.left {
+  left: 0;
+  justify-content: flex-start;
+  background: linear-gradient(to right, var(--color-background-secondary) 55%, transparent);
+}
+
+.tab-scroll-btn.right {
+  right: 0;
+  justify-content: flex-end;
+  background: linear-gradient(to left, var(--color-background-secondary) 55%, transparent);
+}
+
+.tab-scroll-btn .material-icons {
+  font-size: 20px;
+}
+
+.tab-scroll-btn:hover {
+  color: var(--color-primary);
+}
+
+/* Scrollbar hidden: a visible one steals height from the 34px strip and
+   forces a second (vertical) scrollbar. Wheel + active-tab tracking cover it. */
 .flow-tabs {
   display: flex;
   align-items: center;
   overflow-x: auto;
+  overflow-y: hidden;
   background-color: var(--color-background-secondary);
   border-bottom: 1px solid var(--color-border-primary);
-  height: 42px;
+  height: 34px;
   padding-left: var(--spacing-1);
-  scrollbar-width: thin;
+  scrollbar-width: none;
 }
 
 .flow-tabs::-webkit-scrollbar {
-  height: 4px;
-}
-
-.flow-tabs::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.flow-tabs::-webkit-scrollbar-thumb {
-  background-color: var(--color-gray-300);
-  border-radius: var(--border-radius-full);
+  display: none;
 }
 
 .flow-tab {
   display: flex;
   align-items: center;
   padding: 0 var(--spacing-4);
-  height: 38px;
+  height: 30px;
   background-color: transparent;
   border-right: 1px solid var(--color-border-light);
   cursor: pointer;
@@ -325,14 +680,14 @@ defineExpose({
   max-width: 180px;
   position: relative;
   user-select: none;
-  border-radius: var(--border-radius-md) var(--border-radius-md) 0 0;
+  border-radius: var(--border-radius-lg) var(--border-radius-lg) 0 0;
   margin-right: 1px;
   transition: all var(--transition-fast);
 }
 
 .flow-tab.active {
   background-color: var(--color-background-primary);
-  border-top: 2px solid var(--primary-blue);
+  border-top: 2px solid var(--color-primary);
   box-shadow: var(--shadow-xs);
   z-index: 1;
 }
@@ -363,6 +718,19 @@ defineExpose({
   font-weight: var(--font-weight-medium);
   letter-spacing: 0.01em;
   color: var(--color-text-secondary);
+}
+
+.tab-rename-input {
+  width: 100%;
+  min-width: 0;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+  background-color: var(--color-background-primary);
+  border: 1px solid var(--color-primary);
+  border-radius: var(--border-radius-sm);
+  padding: 1px 4px;
+  outline: none;
 }
 
 /* TODO(ux): announce dirty-state changes via aria-live so screen readers
@@ -442,14 +810,22 @@ defineExpose({
   opacity: 0.9;
 }
 
-/* New flow tab styling */
 .new-flow-tab {
-  min-width: 40px;
-  max-width: 40px;
+  flex-shrink: 0;
+  width: 34px;
+  height: 30px;
   display: flex;
   justify-content: center;
   align-items: center;
+  border: none;
+  background: transparent;
+  cursor: pointer;
   color: var(--color-primary);
+  border-radius: var(--border-radius-lg) var(--border-radius-lg) 0 0;
+}
+
+.new-flow-tab .material-icons {
+  font-size: 18px;
 }
 
 .new-flow-tab:hover {

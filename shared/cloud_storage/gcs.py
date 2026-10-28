@@ -12,9 +12,7 @@ import tempfile
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-import gcsfs
 import polars as pl
-from deltalake import DeltaTable, write_deltalake
 
 
 def use_pyarrow_for_gcs(storage_type: str, endpoint_url: str | None) -> bool:
@@ -80,6 +78,7 @@ def get_lazy_frame_from_gcs_pyarrow_dataset(
     is_directory
         If True, glob/wildcard patterns are stripped to get the base directory path.
     """
+    import gcsfs
     import pyarrow.dataset as ds
 
     clean_path = (
@@ -117,6 +116,7 @@ def sink_to_gcs(
     **kwargs
         Additional arguments passed to the underlying writer.
     """
+    import gcsfs
     import pyarrow.parquet as pq
 
     fs = gcsfs.GCSFileSystem(**storage_options)
@@ -140,6 +140,7 @@ def write_delta_to_gcs(
     path: str,
     storage_options: dict[str, Any],
     mode: str = "overwrite",
+    partition_by: list[str] | None = None,
 ) -> None:
     """Write a Polars DataFrame to a Delta Lake table on GCS via gcsfs.
 
@@ -157,14 +158,24 @@ def write_delta_to_gcs(
         GCS storage options passed to gcsfs (token, project, endpoint_url, etc.).
     mode
         Write mode: 'overwrite' or 'append'.
+    partition_by
+        Delta partition columns (applied at table creation).
     """
+    import gcsfs
+    from deltalake import write_deltalake
+
     clean_path = get_path_without_scheme(path)
 
     fs = gcsfs.GCSFileSystem(**storage_options)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         local_path = os.path.join(tmp_dir, clean_path)
-        write_deltalake(table_or_uri=local_path, data=df.collect().to_arrow(), storage_options=storage_options)
+        write_deltalake(
+            table_or_uri=local_path,
+            data=df.collect().to_arrow(),
+            storage_options=storage_options,
+            partition_by=partition_by,
+        )
         fs.put(local_path + "/", clean_path, recursive=True)
 
 
@@ -197,6 +208,9 @@ def scan_delta_from_gcs(
     pl.LazyFrame
         A lazy frame backed by the Delta table's PyArrow dataset.
     """
+    import gcsfs
+    from deltalake import DeltaTable
+
     fs = gcsfs.GCSFileSystem(**storage_options)
     clean_path = get_path_without_scheme(resource_path)
 

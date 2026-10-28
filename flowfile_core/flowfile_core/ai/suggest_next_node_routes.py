@@ -24,9 +24,9 @@ from sqlalchemy.orm import Session
 from flowfile_core import flow_file_handler
 from flowfile_core.ai.byok import ProviderNotConfiguredError, get_configured_provider
 from flowfile_core.ai.providers import (
-    PROVIDERS,
     UnknownProviderError,
-    list_supported_providers,
+    is_resolvable_provider,
+    resolvable_provider_names,
 )
 from flowfile_core.ai.suggest_next_node import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -42,8 +42,6 @@ router = APIRouter()
 
 
 _DEFAULT_PROVIDER = "anthropic"
-"""Ghost-node defaults to the same provider AnthropicProvider routes
-``ghost_node`` to (Haiku 4.5) — fastest TTFB on tool-aware traffic."""
 
 
 class SuggestNextNodeRequest(BaseModel):
@@ -55,22 +53,20 @@ class SuggestNextNodeRequest(BaseModel):
     provider: str = Field(default=_DEFAULT_PROVIDER, min_length=1)
     model: str | None = None
     intent: str | None = Field(default=None, max_length=500)
-    """Optional caller-supplied hint (e.g. ``"filter to last 30 days"``).
-    The LLM uses this to bias which suggestions it returns."""
     max_suggestions: int = Field(default=MAX_SUGGESTIONS, ge=1, le=10)
-    timeout: float = Field(default=DEFAULT_TIMEOUT_SECONDS, gt=0.0, le=10.0)
+    timeout: float = Field(default=DEFAULT_TIMEOUT_SECONDS, gt=0.0, le=60.0)
 
 
 def _ensure_known_provider(name: str) -> None:
-    if name not in PROVIDERS:
+    if not is_resolvable_provider(name):
         raise HTTPException(
             status_code=404,
-            detail=f"Unknown provider {name!r}; supported: {list_supported_providers()}",
+            detail=f"Unknown provider {name!r}; supported: {resolvable_provider_names()}",
         )
 
 
-def _resolve_flow(flow_id: int):
-    flow = flow_file_handler.get_flow(flow_id)
+def _resolve_flow(flow_id: int, user_id: int):
+    flow = flow_file_handler.get_flow(flow_id, user_id)
     if flow is None:
         raise HTTPException(status_code=404, detail=f"Flow {flow_id} not found")
     return flow
@@ -123,7 +119,7 @@ async def suggest_next_node_route(
     hides the popover when ``degraded`` is set.
     """
     _ensure_known_provider(body.provider)
-    flow = _resolve_flow(body.flow_id)
+    flow = _resolve_flow(body.flow_id, current_user.id)
     provider = _resolve_provider(db, current_user.id, body.provider, model=body.model)
     return await suggest_next_node(
         flow,

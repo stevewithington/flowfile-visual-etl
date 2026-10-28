@@ -1,19 +1,8 @@
 // Frontend API surface for the AI subsystem.
-//
-// This is a re-export shim around five seams:
-//   - `streamChat` for the read-only chat stream.
-//   - `streamRunFailureExplanation` for "Fix with AI" on a failed node.
-//   - `streamGenerateDocumentation` for the canvas-level "Generate
-//     documentation" action.
-//   - `fetchFormulaSuggestions` / `fetchJoinKeySuggestions` for
-//     settings autocomplete — fast non-streaming JSON.
-//   - the BYOK provider listing reused so the chat panel can pick a
-//     configured provider without forcing the user back to the
-//     settings tab.
 
 import axios from "../services/axios.config";
-import { fetchAiProviders } from "../views/AiProvidersView/api";
-import { AiDisabledError, AI_DISABLED_DETAIL } from "../views/AiProvidersView/api";
+import { fetchAiProviders } from "../views/AiSettingsView/api";
+import { AiDisabledError, AI_DISABLED_DETAIL } from "../views/AiSettingsView/api";
 import {
   routeMessage,
   streamChat,
@@ -50,23 +39,8 @@ export {
 };
 export { AiDisabledError, AI_DISABLED_DETAIL };
 
-// --------------------------------------------------------------------------
-// Settings autocomplete — non-streaming JSON wrappers around
-// /ai/autocomplete/{formula,join_keys}.
-// --------------------------------------------------------------------------
-
-export interface FormulaSuggestion {
-  insertText: string;
-  label: string;
-  description: string | null;
-  verified: boolean;
-}
-
-export interface FormulaSuggestionsResponse {
-  suggestions: FormulaSuggestion[];
-  degraded: boolean;
-  reason: string | null;
-}
+// Settings autocomplete — non-streaming JSON wrapper around
+// /ai/autocomplete/join_keys.
 
 export interface JoinKeyPair {
   leftCol: string;
@@ -81,17 +55,6 @@ export interface JoinKeySuggestionsResponse {
   reason: string | null;
 }
 
-export interface FormulaAutocompleteRequest {
-  flowId: number;
-  nodeId: number | string;
-  partialText: string;
-  intent?: string | null;
-  provider?: string;
-  model?: string | null;
-  maxSuggestions?: number;
-  timeout?: number;
-}
-
 export interface JoinKeyAutocompleteRequest {
   flowId: number;
   leftNodeId: number | string;
@@ -101,19 +64,6 @@ export interface JoinKeyAutocompleteRequest {
   model?: string | null;
   maxPairs?: number;
   timeout?: number;
-}
-
-interface PyFormulaSuggestion {
-  insert_text: string;
-  label: string;
-  description: string | null;
-  verified: boolean;
-}
-
-interface PyFormulaSuggestionsResponse {
-  suggestions: PyFormulaSuggestion[];
-  degraded: boolean;
-  reason: string | null;
 }
 
 interface PyJoinKeyPair {
@@ -128,13 +78,6 @@ interface PyJoinKeySuggestionsResponse {
   degraded: boolean;
   reason: string | null;
 }
-
-const fromPyFormulaSuggestion = (raw: PyFormulaSuggestion): FormulaSuggestion => ({
-  insertText: raw.insert_text,
-  label: raw.label,
-  description: raw.description,
-  verified: raw.verified,
-});
 
 const fromPyJoinKeyPair = (raw: PyJoinKeyPair): JoinKeyPair => ({
   leftCol: raw.left_col,
@@ -151,38 +94,6 @@ const isAiDisabledError = (error: unknown): boolean => {
     ?.response?.data?.detail;
   const status = (error as { response?: { status?: number } })?.response?.status;
   return status === 503 && typeof detail === "string" && detail === AI_DISABLED_DETAIL;
-};
-
-export const fetchFormulaSuggestions = async (
-  body: FormulaAutocompleteRequest,
-  signal?: AbortSignal,
-): Promise<FormulaSuggestionsResponse> => {
-  const payload: Record<string, unknown> = {
-    flow_id: body.flowId,
-    node_id: body.nodeId,
-    partial_text: body.partialText,
-  };
-  if (body.intent !== undefined && body.intent !== null) payload.intent = body.intent;
-  if (body.provider !== undefined) payload.provider = body.provider;
-  if (body.model !== undefined && body.model !== null) payload.model = body.model;
-  if (body.maxSuggestions !== undefined) payload.max_suggestions = body.maxSuggestions;
-  if (body.timeout !== undefined) payload.timeout = body.timeout;
-
-  try {
-    const response = await axios.post<PyFormulaSuggestionsResponse>(
-      "/ai/autocomplete/formula",
-      payload,
-      { signal },
-    );
-    return {
-      suggestions: response.data.suggestions.map(fromPyFormulaSuggestion),
-      degraded: response.data.degraded,
-      reason: response.data.reason,
-    };
-  } catch (error) {
-    if (isAiDisabledError(error)) throw new AiDisabledError();
-    throw error;
-  }
 };
 
 export const fetchJoinKeySuggestions = async (
@@ -217,12 +128,116 @@ export const fetchJoinKeySuggestions = async (
   }
 };
 
-// --------------------------------------------------------------------------
+// Cron generation — POST /ai/generate_cron. Plain-English → validated cron.
+
+export interface GenerateCronRequest {
+  description: string;
+  provider?: string;
+  model?: string | null;
+  timeout?: number;
+}
+
+export interface CronGenerationResponse {
+  cronExpression: string | null;
+  explanation: string | null;
+  degraded: boolean;
+  reason: string | null;
+}
+
+interface PyCronGenerationResponse {
+  cron_expression: string | null;
+  explanation: string | null;
+  degraded: boolean;
+  reason: string | null;
+}
+
+export const generateCronExpression = async (
+  body: GenerateCronRequest,
+  signal?: AbortSignal,
+): Promise<CronGenerationResponse> => {
+  const payload: Record<string, unknown> = {
+    description: body.description,
+  };
+  if (body.provider !== undefined) payload.provider = body.provider;
+  if (body.model !== undefined && body.model !== null) payload.model = body.model;
+  if (body.timeout !== undefined) payload.timeout = body.timeout;
+
+  try {
+    const response = await axios.post<PyCronGenerationResponse>("/ai/generate_cron", payload, {
+      signal,
+    });
+    return {
+      cronExpression: response.data.cron_expression,
+      explanation: response.data.explanation,
+      degraded: response.data.degraded,
+      reason: response.data.reason,
+    };
+  } catch (error) {
+    if (isAiDisabledError(error)) throw new AiDisabledError();
+    throw error;
+  }
+};
+
+// Node code generation — POST /ai/generate_node_code. Plain-English + the
+// node's upstream schema → a code snippet for polars_code / sql_query /
+// python_script nodes.
+
+export interface GenerateNodeCodeRequest {
+  flowId: number;
+  nodeId: number | string;
+  prompt: string;
+  provider?: string;
+  model?: string | null;
+  timeout?: number;
+}
+
+export interface NodeCodeGenerationResponse {
+  code: string | null;
+  explanation: string | null;
+  degraded: boolean;
+  reason: string | null;
+}
+
+interface PyNodeCodeGenerationResponse {
+  code: string | null;
+  explanation: string | null;
+  degraded: boolean;
+  reason: string | null;
+}
+
+export const generateNodeCode = async (
+  body: GenerateNodeCodeRequest,
+  signal?: AbortSignal,
+): Promise<NodeCodeGenerationResponse> => {
+  const payload: Record<string, unknown> = {
+    flow_id: body.flowId,
+    node_id: body.nodeId,
+    prompt: body.prompt,
+  };
+  if (body.provider !== undefined) payload.provider = body.provider;
+  if (body.model !== undefined && body.model !== null) payload.model = body.model;
+  if (body.timeout !== undefined) payload.timeout = body.timeout;
+
+  try {
+    const response = await axios.post<PyNodeCodeGenerationResponse>(
+      "/ai/generate_node_code",
+      payload,
+      { signal },
+    );
+    return {
+      code: response.data.code,
+      explanation: response.data.explanation,
+      degraded: response.data.degraded,
+      reason: response.data.reason,
+    };
+  } catch (error) {
+    if (isAiDisabledError(error)) throw new AiDisabledError();
+    throw error;
+  }
+};
+
 // Edge ghost-node suggestions — non-streaming JSON wrapper around
-// /ai/suggest_next_node. Matches the autocomplete shape: a hover-fast
-// synchronous call with a degraded fallback when the LLM can't produce
-// a schema-grounded result.
-// --------------------------------------------------------------------------
+// /ai/suggest_next_node.
 
 export interface SchemaColumn {
   name: string;
@@ -324,12 +339,10 @@ export const fetchNextNodeSuggestions = async (
   }
 };
 
-// --------------------------------------------------------------------------
 // Cmd+K command palette — non-streaming JSON wrapper around
 // /ai/command_palette. Returns the staged GraphDiff in the same shape
 // `useAiDiffStore.setCurrentDiff(...)` expects, so the frontend
 // composes the existing diff panel without a follow-up GET.
-// --------------------------------------------------------------------------
 
 import type { GraphDiffPayload } from "../features/ai/aiDiffTypes";
 
@@ -443,12 +456,10 @@ export const submitCommandPalette = async (
   }
 };
 
-// --------------------------------------------------------------------------
 // Multi-turn planner agent — non-streaming sibling endpoints. The SSE
 // start + resume-continue paths live in services/aiStreamClient.ts;
 // this file owns the JSON-only abort / discard-resume / status-snapshot
 // fetches.
-// --------------------------------------------------------------------------
 
 export interface AgentDriftDetail {
   missingNodeIds: number[];
@@ -469,13 +480,7 @@ export type AgentStage =
   | "fill_settings"
   | "single_stage_op";
 
-export type AgentOpKind =
-  | "add"
-  | "modify"
-  | "delete"
-  | "connect"
-  | "disconnect"
-  | "other";
+export type AgentOpKind = "add" | "modify" | "delete" | "connect" | "disconnect" | "other";
 
 export interface AgentSessionState {
   sessionId: string;

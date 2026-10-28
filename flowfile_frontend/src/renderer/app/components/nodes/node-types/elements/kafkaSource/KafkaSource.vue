@@ -220,7 +220,6 @@ const nodeStore = useNodeStore();
 const dataLoaded = ref<boolean>(false);
 const nodeKafkaSource = ref<NodeKafkaSource | null>(null);
 
-// Use the standardized node settings composable
 const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSettings({
   nodeRef: nodeKafkaSource,
 });
@@ -372,7 +371,7 @@ defineExpose({
   margin: 0 0 0.75rem 0;
   font-size: 0.95rem;
   font-weight: 600;
-  color: #4a5568;
+  color: var(--color-text-secondary);
 }
 
 .form-row {
@@ -392,7 +391,7 @@ defineExpose({
 .form-control {
   width: 100%;
   padding: 0.5rem;
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--color-border-primary);
   border-radius: 4px;
   font-size: 0.875rem;
   box-sizing: border-box;
@@ -408,12 +407,12 @@ label {
   margin-bottom: 0.25rem;
   font-size: 0.875rem;
   font-weight: 500;
-  color: #4a5568;
+  color: var(--color-text-secondary);
 }
 
 select.form-control {
   appearance: none;
-  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%234a5568' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 0.5rem center;
   background-size: 1em;
@@ -441,11 +440,11 @@ select.form-control {
   gap: 0.5rem;
   margin-top: 0.5rem;
   font-size: 0.8125rem;
-  color: #718096;
+  color: var(--color-text-tertiary);
 }
 
 .helper-text i {
-  color: #4299e1;
+  color: var(--color-accent-dark);
   font-size: 0.875rem;
 }
 
@@ -459,15 +458,15 @@ select.form-control {
 
 .loading-state p {
   margin: 0;
-  color: #718096;
+  color: var(--color-text-tertiary);
   font-size: 0.875rem;
 }
 
 .loading-spinner {
   width: 2rem;
   height: 2rem;
-  border: 2px solid #e2e8f0;
-  border-top-color: #4299e1;
+  border: 2px solid var(--color-border-primary);
+  border-top-color: var(--color-accent);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
@@ -480,7 +479,7 @@ select.form-control {
 
 .schema-table {
   margin-top: 0.5rem;
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--color-border-primary);
   border-radius: 4px;
   overflow: hidden;
 }
@@ -492,18 +491,18 @@ select.form-control {
 }
 
 .schema-table th {
-  background-color: #f7fafc;
+  background-color: var(--color-background-secondary);
   padding: 0.5rem 0.75rem;
   text-align: left;
   font-weight: 600;
-  color: #4a5568;
-  border-bottom: 1px solid #e2e8f0;
+  color: var(--color-text-secondary);
+  border-bottom: 1px solid var(--color-border-primary);
 }
 
 .schema-table td {
   padding: 0.375rem 0.75rem;
-  border-bottom: 1px solid #edf2f7;
-  color: #4a5568;
+  border-bottom: 1px solid var(--color-border-light);
+  color: var(--color-text-secondary);
 }
 
 .schema-table tr:last-child td {

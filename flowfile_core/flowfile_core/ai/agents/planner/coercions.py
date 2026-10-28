@@ -19,8 +19,6 @@ import re
 from typing import Any
 
 _FORMULA_NAME_PATTERNS: tuple[tuple[str, int], ...] = (
-    # Phrase forms the user typically uses to name a derived column.
-    # Each pattern is (regex, group index) — group 1 captures the name.
     (r"\bas\s+([A-Za-z_][A-Za-z0-9_]*)\b", 1),
     (r"\ba\s+([A-Za-z_][A-Za-z0-9_]*)\s+column\b", 1),
     (r"\bcolumn\s+(?:called|named)\s+([A-Za-z_][A-Za-z0-9_]*)\b", 1),
@@ -73,9 +71,10 @@ def _coerce_formula_bare_string_args(
       extraction of *"as <name>"* / *"a <name> column"*); falls
       back to ``"derived"`` so the user can rename in the diff
       review.
-    * The caller still wraps the result under the inner-input
-      ``function`` field name; this helper only fixes the SHAPE
-      under the wrapper.
+    * The result is the OUTER envelope (``{"function": {...}}``).
+      ``NodeFormula`` exposes both ``function`` and ``functions`` at
+      stage 3, so it is a multi-field type and the planner performs
+      no inner-input wrap for it.
 
     Returns ``tool_args`` unchanged when the coercion doesn't apply.
     Defensive: a future LLM that does emit the right shape sails
@@ -94,10 +93,12 @@ def _coerce_formula_bare_string_args(
         return tool_args
 
     derived_name = _derive_formula_output_column_name(user_prompt)
-    return {
+    coerced = dict(tool_args)
+    coerced["function"] = {
         "field": {"name": derived_name, "data_type": "String"},
         "function": candidate,
     }
+    return coerced
 
 
 def _looks_like_outer_envelope_value(value: Any) -> bool:

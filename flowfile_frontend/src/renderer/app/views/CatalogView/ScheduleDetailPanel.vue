@@ -33,7 +33,7 @@
       </div>
       <div class="header-actions">
         <button
-          v-if="isScheduleRunning && !isFlowRunning"
+          v-if="isScheduleRunning"
           class="btn btn-warning btn-sm"
           @click="$emit('cancelScheduleRun', schedule)"
         >
@@ -45,6 +45,10 @@
           class="btn btn-success btn-sm"
           @click="$emit('runNow', schedule.id)"
         >
+          <i class="fa-solid fa-play"></i>
+          Run Now
+        </button>
+        <button v-else class="btn btn-success btn-sm" disabled title="Flow is already running">
           <i class="fa-solid fa-play"></i>
           Run Now
         </button>
@@ -93,6 +97,15 @@
       >
         <span class="meta-label">Interval</span>
         <span class="meta-value">{{ formatScheduleType(schedule) }}</span>
+      </div>
+      <div v-if="schedule.schedule_type === 'cron'" class="meta-card">
+        <span class="meta-label">Schedule</span>
+        <span class="meta-value">
+          {{ formatScheduleType(schedule) }}
+          <button class="btn-icon-inline" title="Edit schedule" @click="showEdit = true">
+            <i class="fa-solid fa-pen"></i>
+          </button>
+        </span>
       </div>
       <div v-if="schedule.schedule_type === 'table_trigger'" class="meta-card">
         <span class="meta-label">Trigger Table</span>
@@ -144,6 +157,20 @@
       </div>
     </div>
 
+    <!-- Notifications -->
+    <div class="section">
+      <h3><i class="fa-solid fa-bell section-icon"></i> Notifications</h3>
+      <NotificationRules
+        :rules="scheduleRules"
+        :channels="notificationsStore.channels"
+        :scope="{ scheduleId: schedule.id }"
+        :empty-text="scheduleAlertsEmptyText"
+        no-channels-hint="No notification channels yet — set one up to be told when this schedule fails."
+        no-channels-action="Go to Alerts"
+        @need-channel="goToAlerts"
+      />
+    </div>
+
     <!-- Run History -->
     <div class="section">
       <h3><i class="fa-solid fa-clock-rotate-left section-icon"></i> Run History</h3>
@@ -156,15 +183,27 @@
         @open-snapshot="$emit('openSnapshot', $event)"
       />
     </div>
+
+    <CreateScheduleModal
+      mode="edit"
+      :visible="showEdit"
+      :edit-schedule="schedule"
+      :flows="catalogStore.allFlows"
+      :tables="catalogStore.allTables"
+      @update="handleUpdateSchedule"
+      @close="showEdit = false"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
+import { useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 import { useCatalogStore } from "../../stores/catalog-store";
+import { useNotificationsStore } from "../../stores/notifications-store";
 import { CatalogApi } from "../../api/catalog.api";
-import type { FlowSchedule } from "../../types";
+import type { FlowSchedule, FlowScheduleUpdate } from "../../types";
 import {
   formatDate,
   formatScheduleType,
@@ -172,8 +211,12 @@ import {
   scheduleIcon,
 } from "./catalog-formatters";
 import RunHistoryTable from "./RunHistoryTable.vue";
+import CreateScheduleModal from "./CreateScheduleModal.vue";
+import NotificationRules from "./components/NotificationRules.vue";
 
+const router = useRouter();
 const catalogStore = useCatalogStore();
+const notificationsStore = useNotificationsStore();
 
 const props = defineProps<{
   schedule: FlowSchedule;
@@ -199,6 +242,8 @@ const isEditingDescription = ref(false);
 const editDescription = ref("");
 const descriptionInput = ref<HTMLInputElement | null>(null);
 
+const showEdit = ref(false);
+
 const displayName = computed(() => getScheduleDisplayName(props.schedule, props.schedule.id));
 
 const flowName = computed(() => {
@@ -208,13 +253,38 @@ const flowName = computed(() => {
 
 const scheduleTypeName = computed(() => {
   if (props.schedule.schedule_type === "interval") return "Interval";
+  if (props.schedule.schedule_type === "cron") return "Schedule";
   if (props.schedule.schedule_type === "table_trigger") return "Table Trigger";
   if (props.schedule.schedule_type === "table_set_trigger") return "Table Set Trigger";
   return props.schedule.schedule_type;
 });
 
+// Alerts scoped to this schedule. Channels are shared across the view, so they are
+// only fetched when this panel has none yet. Rules are loaded unscoped so the
+// empty text can honestly say whether an account-wide alert already covers us.
+const scheduleRules = computed(() => notificationsStore.rulesForSchedule(props.schedule.id));
+
+const scheduleAlertsEmptyText = computed(() =>
+  notificationsStore.globalRules.length > 0
+    ? "No schedule-specific alerts — your account-wide alerts (Alerts tab) already cover this schedule's runs."
+    : "No alerts for this schedule yet.",
+);
+
+watch(
+  () => props.schedule.id,
+  () => {
+    if (notificationsStore.channels.length === 0) notificationsStore.loadChannels();
+    notificationsStore.loadRules();
+  },
+  { immediate: true },
+);
+
+function goToAlerts() {
+  router.push({ name: "catalog", query: { tab: "alerts" } });
+}
+
 const isScheduleRunning = computed(() =>
-  catalogStore.activeRuns.some((r) => r.registration_id === props.schedule.registration_id),
+  catalogStore.activeRuns.some((r) => r.schedule_id === props.schedule.id),
 );
 
 const isFlowRunning = computed(() =>
@@ -279,6 +349,19 @@ async function saveDescription() {
     } catch (e: any) {
       ElMessage.error(e?.response?.data?.detail ?? "Failed to update description");
     }
+  }
+}
+
+async function handleUpdateSchedule(payload: FlowScheduleUpdate) {
+  try {
+    await CatalogApi.updateSchedule(props.schedule.id, payload);
+    showEdit.value = false;
+    await Promise.all([
+      catalogStore.loadScheduleDetail(props.schedule.id),
+      catalogStore.loadSchedules(),
+    ]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to update schedule");
   }
 }
 </script>

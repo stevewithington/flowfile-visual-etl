@@ -22,7 +22,7 @@ resolver for predictable upstreams (``static`` / ``source`` /
 by calling :meth:`FlowNode.get_predicted_schema(force=True)`, which
 fires the registered ``schema_callback`` (or the
 ``_predicted_data_getter`` fallback). Dynamic node types
-(``polars_code`` / ``python_script`` / ``sql_query`` / ``pivot`` /
+(``polars_code`` / ``python_script`` / ``pivot`` /
 etc.) stay ``schema_status="unknown"`` from this surface — kernel
 dry-run is reserved for the executor path. Callers that need the
 cache-only behaviour pass ``resolve_schemas=False``
@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
@@ -70,6 +71,7 @@ SurfaceLiteral = Literal[
     "settings_autocomplete",
     "lineage",
     "intent_classifier",
+    "cron",
 ]
 
 SamplesMode = Literal["off", "regex"]
@@ -108,6 +110,12 @@ SURFACE_TO_LEVEL: dict[str, PromptLevel] = {
     # SurfaceLiteral; ``assemble_system_prompt`` is never called for
     # this surface.
     "intent_classifier": "copilot",
+    # Cron NL→expression — single-shot JSON judgement. The cron module
+    # injects its own tight system prompt rather than the layered prompt,
+    # so ``assemble_system_prompt`` is never called for this surface. Mapped
+    # to ``copilot`` only to keep SURFACE_TO_LEVEL exhaustive over
+    # SurfaceLiteral (same posture as ``intent_classifier``).
+    "cron": "copilot",
 }
 
 
@@ -120,14 +128,6 @@ _STAGE_TO_PROMPT: dict[str, str] = {
     "single_stage_op": "planner",
     "verify_completion": "stage_verify_completion",
 }
-"""Per-stage suffix file map for the ``agent_staged`` surface.
-
-Each stage gets its own short suffix prompt so the LLM only sees the
-guidance relevant to the choice it's about to make. ``single_stage_op``
-re-uses ``planner.md`` because the modify/delete/connect/disconnect
-ops follow the same staging discipline as the legacy agent surfaces
-(they emit one ``flowfile.graph.<op>`` call directly, no multi-stage
-cycle)."""
 
 
 _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
@@ -138,9 +138,7 @@ _HTML_COMMENT_CLOSE = "-->"
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------- #
-# Snapshot models                                                              #
-# --------------------------------------------------------------------------- #
+# Snapshot models
 
 
 class ColumnSnapshot(BaseModel):
@@ -195,9 +193,7 @@ class PromptContext(BaseModel):
     resolved_mentions: list[ResolvedMention] = Field(default_factory=list)
 
 
-# --------------------------------------------------------------------------- #
-# Public entry points                                                          #
-# --------------------------------------------------------------------------- #
+# Public entry points
 
 
 def render_prompt_context(
@@ -214,6 +210,8 @@ def render_prompt_context(
     resolve_schemas: bool = True,
     stage: str | None = None,
     picked_node_type: str | None = None,
+    compact_settings: bool = False,
+    local: bool = False,
 ) -> PromptContext:
     """Build a budget-bounded :class:`PromptContext` for ``surface``.
 
@@ -227,6 +225,10 @@ def render_prompt_context(
     prospective-schema resolution for predictable upstreams (see
     module docstring). Pass ``False`` to fall back to the cache-only
     behaviour.
+
+    ``local`` selects the on-device system prompt (see
+    :func:`assemble_system_prompt`); ``False`` renders exactly the cloud
+    prompt.
     """
 
     pinned_list = _coerce_to_list(pinned_node_ids)
@@ -247,7 +249,7 @@ def render_prompt_context(
     snapshot = _attach_samples(snapshot, graph, samples_mode=samples_mode, sample_rows=sample_rows)
     snapshot.samples_mode = samples_mode
 
-    rendered_user = render_user_message(snapshot, user_text=raw_text)
+    rendered_user = render_user_message(snapshot, user_text=raw_text, compact_settings=compact_settings)
     snapshot, report = apply_budget(
         snapshot,
         surface,
@@ -255,10 +257,10 @@ def render_prompt_context(
         rendered_size_hint=estimate_tokens(rendered_user),
         max_columns_per_node=max_columns_per_node,
     )
-    rendered_user = render_user_message(snapshot, user_text=raw_text)
+    rendered_user = render_user_message(snapshot, user_text=raw_text, compact_settings=compact_settings)
     report.estimated_input_tokens = estimate_tokens(rendered_user)
 
-    system = assemble_system_prompt(surface, stage=stage, picked_node_type=picked_node_type)
+    system = assemble_system_prompt(surface, stage=stage, picked_node_type=picked_node_type, local=local)
     messages = [
         Message(role="system", content=system),
         Message(role="user", content=rendered_user),
@@ -390,6 +392,7 @@ def assemble_system_prompt(
     *,
     stage: str | None = None,
     picked_node_type: str | None = None,
+    local: bool = False,
 ) -> str:
     """Compose the layered system prompt for ``surface``.
 
@@ -414,6 +417,13 @@ def assemble_system_prompt(
     single-node block at ``"fill_settings"`` (using
     ``picked_node_type``), and an empty catalog at the other stages.
 
+    ``local=True`` is the on-device (llama.cpp) variant: assist-level
+    surfaces take ``prompts/local_assist.md`` instead of ``assist.md``
+    (no agent-mode footer, no exact-block instruction a small model
+    would parrot) and the node reference collapses to one line per
+    node so the whole prompt fits a small context window. The default
+    ``False`` produces the cloud prompt byte for byte.
+
     Raises ``ValueError`` for unknown surfaces.
     """
 
@@ -428,14 +438,17 @@ def assemble_system_prompt(
         suffix_name = _STAGE_TO_PROMPT.get(stage, SURFACE_TO_LEVEL[surface])
     else:
         suffix_name = SURFACE_TO_LEVEL[surface]
+    if local and suffix_name == "assist":
+        suffix_name = _LOCAL_ASSIST_PROMPT
     suffix = _load_prompt(suffix_name)
-    catalog = _build_catalog_block(surface, stage=stage, picked_node_type=picked_node_type)
+    catalog = _build_catalog_block(surface, stage=stage, picked_node_type=picked_node_type, local=local)
     blocks = [block for block in (base, suffix, catalog) if block]
     return "\n\n".join(blocks)
 
 
 _CATALOG_HEADER = "## Tool catalog"
 _NODE_REFERENCE_HEADER = "## Flowfile node reference"
+_LOCAL_ASSIST_PROMPT = "local_assist"
 
 # Surface that gets the full catalog block. ``agent_complex`` is the
 # one-shot full-catalog surface; ``agent_staged`` renders the catalog
@@ -463,6 +476,7 @@ def _build_catalog_block(
     *,
     stage: str | None = None,
     picked_node_type: str | None = None,
+    local: bool = False,
 ) -> str:
     """Build the narrative block for ``surface``.
 
@@ -482,6 +496,8 @@ def _build_catalog_block(
       only confuse the model into mixing UI advice with tool-call talk.
     * ``settings_autocomplete`` — returns ``""`` (constrained-JSON
       output, no narrative grounding needed).
+    * ``local=True`` swaps the assist-level reference for the one-line
+      per node form (:func:`_render_compact_node_reference`).
 
     ``agent_staged`` is per-stage:
 
@@ -533,6 +549,8 @@ def _build_catalog_block(
         return _render_tool_catalog(tools)
     if surface in _ASSIST_CATALOG_SURFACES:
         node_tools = [tool for tool in full_catalog if tool.name.startswith(_NODE_TYPE_TOOL_PREFIX)]
+        if local:
+            return _render_compact_node_reference(node_tools)
         return _render_node_reference(node_tools)
     return ""
 
@@ -561,7 +579,6 @@ def _palette_label_disambiguation_pairs() -> tuple[tuple[str, str], ...]:
         label = palette_label_for(nt)
         if not label or label == nt:
             continue
-        # Snake-case the palette label and compare to the node_type.
         snake = label.lower().replace(" ", "_")
         if snake != nt and snake.replace("-", "_") != nt:
             pairs.append((nt, label))
@@ -623,31 +640,24 @@ def _build_sql_query_caveat_block() -> str:
     """Conditional sql_query-specific guidance. Renders ONLY at stage
     ``fill_settings`` when ``picked_node_type == "sql_query"`` (gated
     by the caller in ``_build_single_node_block``). Other node types
-    (including ``polars_code``, which has its own predictor path that
-    works fine) don't see this block. Pick_type / agent_complex
-    full-catalog rounds also don't render it — keeping the caveat
-    scoped to the one prompt where the LLM is about to stage a
-    sql_query, exactly when the guidance is actionable.
+    don't see this block. Pick_type / agent_complex full-catalog
+    rounds also don't render it — keeping the caveat scoped to the one
+    prompt where the LLM is about to stage a sql_query, exactly when
+    the guidance is actionable.
 
-    Two pieces:
+    **Table-name convention.** Upstream inputs are registered
+    positionally as ``input_1``, ``input_2``, ... by
+    :func:`flowfile_core.flowfile.flow_data_engine.flow_data_engine.execute_sql_query`
+    (``ctx.register(f"input_{i + 1}", ...)``). The chat LLM
+    previously hallucinated ``join_<node_id>``-shaped table names
+    from the prior worked example; the agent inherited the
+    hallucination and produced ``FROM join_5`` SQL that hit
+    ``relation 'join_5' was not found`` at runtime.
 
-    * **Table-name convention.** Upstream inputs are registered
-      positionally as ``input_1``, ``input_2``, ... by
-      :func:`flowfile_core.flowfile.flow_data_engine.flow_data_engine.execute_sql_query`
-      (``ctx.register(f"input_{i + 1}", ...)``). The chat LLM
-      previously hallucinated ``join_<node_id>``-shaped table names
-      from the prior worked example; the agent inherited the
-      hallucination and produced ``FROM join_5`` SQL that hit
-      ``relation 'join_5' was not found`` at runtime.
-    * **Development-mode auto-undo.** ``add_sql_query`` does not
-      register a ``schema_callback`` (see ``flow_graph.py``
-      ``add_sql_query``), so ``_observe_development``'s
-      ``get_predicted_schema(force=True)`` returns ``None`` and the
-      host fails the observation with ``UnpredictableSchema``,
-      auto-undoing the just-added node. Without this pre-warning the
-      LLM hits the failure, hallucinates a cause, claims false
-      success (*"I added a sql_query node"* — but the node was
-      deleted), or burns its retry budget on identical re-attempts.
+    (``add_sql_query`` now registers a ``schema_callback`` that
+    resolves the output schema by running the query plan over 0-row
+    inputs, so the node predicts like any other and no longer needs a
+    Development-mode refusal caveat.)
     """
     return (
         "## sql_query-specific guidance\n"
@@ -661,34 +671,7 @@ def _build_sql_query_caveat_block() -> str:
         "node's id, type, or display name (e.g. ``FROM join_5`` is "
         "wrong — it will fail at runtime with ``relation 'join_5' "
         "was not found``). This is true regardless of what the chat "
-        "trail above may have suggested.\n"
-        "\n"
-        "**Development-mode caveat.** Polars' embedded SQL engine "
-        "cannot introspect a SELECT's column list without running "
-        "it, and the sql_query node currently has no "
-        "``schema_callback`` to work around that, so "
-        "``get_predicted_schema`` returns ``None`` for this node "
-        "type. On ``surface=agent_live`` runs in **Development "
-        "mode**, the host's post-apply observation will fail with "
-        "``UnpredictableSchema`` and **auto-undo your just-added "
-        "node** — the canvas reverts to the prior state and you only "
-        "see the failure on the next round's tool reply.\n"
-        "\n"
-        "Before staging this node, check the user message for the "
-        "flow's execution mode (the host surfaces it). If the flow "
-        "is in Development mode, **do not stage** — instead, write a "
-        "short assistant message refusing the operation and ask the "
-        "user to switch the top-right mode toggle to **Performance** "
-        "(the schema is predictable once the query actually runs). "
-        "If the flow is already in Performance mode, proceed "
-        "normally and use ``input_1`` / ``input_2`` / ... as the "
-        "table names.\n"
-        "\n"
-        "If you've already attempted the add and the previous tool "
-        "reply contains ``UnpredictableSchema``: do **not** retry "
-        "the same payload — the failure mode is intrinsic to the "
-        "run mode, not the settings. Quote the error verbatim and "
-        "surface the Performance-mode fix."
+        "trail above may have suggested."
     )
 
 
@@ -909,12 +892,132 @@ def _render_node_reference(tools: list[Any]) -> str:
     return "\n".join(lines).rstrip()
 
 
-def render_user_message(snapshot: SubgraphSnapshot, *, user_text: str | None = None) -> str:
+_COMPACT_REFERENCE_SENTENCE_CAP = 160
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(])")
+_ABBREVIATIONS = ("e.g.", "i.e.", "vs.", "etc.")
+
+
+def _first_sentence(text: str, cap: int = _COMPACT_REFERENCE_SENTENCE_CAP) -> str:
+    """The first sentence of ``text`` (markdown emphasis stripped), capped."""
+    flat = " ".join(text.split()).replace("**", "")
+    first = ""
+    for piece in _SENTENCE_END_RE.split(flat):
+        first = f"{first} {piece}".strip()
+        if not first.endswith(_ABBREVIATIONS):
+            break
+    if len(first) > cap:
+        first = first[: cap - 1].rstrip() + "…"
+    return first
+
+
+def _render_compact_node_reference(tools: list[Any]) -> str:
+    """One line per node type — the on-device form of the node reference.
+
+    ``- <palette label> (<sidebar section>): <first sentence>`` using the
+    palette label and sidebar section from the node store and the
+    first sentence of the node's ``long_description`` (what the node
+    does; the user-shaped ``user_instructions`` lead with the settings
+    panel, which a one-liner can't carry). A ~10k-token reference
+    becomes ~1.5k, which is what lets the whole local system prompt fit
+    a 16k window with room for the flow and the conversation.
+    """
+
+    from flowfile_core.ai.tools.node_docs import palette_label_for, sidebar_section_for
+
+    documented = [tool for tool in tools if tool.user_instructions]
+    if not documented:
+        return ""
+    documented.sort(key=lambda tool: tool.name)
+    lines: list[str] = [
+        _NODE_REFERENCE_HEADER,
+        "",
+        (
+            "Every Flowfile node as `palette label (sidebar section): what it "
+            "does`. Cite these labels verbatim when telling the user what to "
+            "drag or configure; nothing else exists in the UI."
+        ),
+        "",
+    ]
+    for tool in documented:
+        node_type = tool.name.removeprefix(_NODE_TYPE_TOOL_PREFIX)
+        label = palette_label_for(node_type)
+        section = sidebar_section_for(node_type)
+        summary = _first_sentence(tool.long_description or tool.user_instructions)
+        where = f" ({section})" if section else ""
+        lines.append(f"- {label}{where}: {summary}")
+    return "\n".join(lines).rstrip()
+
+
+# Settings keys that are verbose AND render-redundant: the predicted output
+# schema is already emitted separately as ``schema_columns`` and sample data
+# under ``samples_mode``, so a node's full column/field list, inline raw data,
+# and long code bodies add tokens without adding signal. Stripped only when
+# ``compact_settings`` is on (small-window local model). Applied recursively so
+# nested envelopes (e.g. ``received_file.fields``) are caught.
+_VERBOSE_SETTINGS_KEYS: frozenset[str] = frozenset(
+    {
+        "fields",
+        "columns",
+        "raw_data",
+        "data",
+        "code",
+        "polars_code",
+        "sql_code",
+        "function",
+        "advanced_filter",
+    }
+)
+
+_COMPACT_STR_CAP = 200
+
+
+def _shrink_node_settings(value: Any) -> Any:
+    """Recursively drop verbose/redundant keys and cap long strings.
+
+    Keeps the structural/config knobs the model needs (file_type, how, mode,
+    delimiter, aggregations, …) while removing the megabyte-scale column lists
+    and code bodies that overflow a small context window. Pure — returns a new
+    structure, never mutates the input.
+    """
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if k in _VERBOSE_SETTINGS_KEYS:
+                # Replace with a compact marker so the model knows the node has
+                # columns/code without seeing all of it.
+                if isinstance(v, list):
+                    out[k] = f"<{len(v)} items omitted>"
+                elif isinstance(v, str) and len(v) > _COMPACT_STR_CAP:
+                    out[k] = v[: _COMPACT_STR_CAP - 3] + "..."
+                else:
+                    out[k] = v
+                continue
+            out[k] = _shrink_node_settings(v)
+        return out
+    if isinstance(value, list):
+        return [_shrink_node_settings(v) for v in value]
+    if isinstance(value, str) and len(value) > _COMPACT_STR_CAP:
+        return value[: _COMPACT_STR_CAP - 3] + "..."
+    return value
+
+
+def render_user_message(
+    snapshot: SubgraphSnapshot,
+    *,
+    user_text: str | None = None,
+    compact_settings: bool = False,
+) -> str:
     """Render the user prompt body from a :class:`SubgraphSnapshot`.
 
     The format is markdown-flavoured but stable enough for the prompt
     cache to hash. Pinned nodes are flagged inline; unknown schemas
     surface a clear marker so the model knows to refuse column refs.
+
+    ``compact_settings`` strips verbose, render-redundant settings keys
+    (column/field lists, inline data, code bodies) before serialising — used
+    for small-context-window models (local) so a wide node doesn't blow the
+    window. The predicted schema + samples are rendered separately, so no
+    signal is lost.
     """
 
     lines: list[str] = []
@@ -937,7 +1040,8 @@ def render_user_message(snapshot: SubgraphSnapshot, *, user_text: str | None = N
         marker = " (pinned)" if node.is_pinned else ""
         lines.append(f"### {node.name} (id={node.node_id}, type={node.node_type}){marker}")
         if node.settings:
-            lines.append(f"settings: {_compact_json(node.settings)}")
+            rendered_settings = _shrink_node_settings(node.settings) if compact_settings else node.settings
+            lines.append(f"settings: {_compact_json(rendered_settings)}")
         if node.schema_status == "unknown" or node.schema_columns is None:
             lines.append("schema: unknown — upstream node has no predicted schema")
         else:
@@ -959,9 +1063,7 @@ def render_user_message(snapshot: SubgraphSnapshot, *, user_text: str | None = N
     return "\n".join(lines).rstrip() + "\n"
 
 
-# --------------------------------------------------------------------------- #
-# Internals                                                                    #
-# --------------------------------------------------------------------------- #
+# Internals
 
 
 def _coerce_to_list(node_ids: list[int | str] | int | str) -> list[int | str]:
@@ -1122,13 +1224,43 @@ def _safe_get_sample_data(node: FlowNode, n: int) -> list[dict[str, Any]] | None
     return list(rows)[:n] if n > 0 else []
 
 
+_COLUMN_NAME_MAX_LEN = 128
+# Unicode-aware: ``\w`` matches letters/digits/underscore across scripts,
+# so non-ASCII column names (e.g. ``café``, ``顧客``) survive intact while
+# punctuation that could carry prompt-injection payloads still gets ``?``-d.
+_COLUMN_NAME_SAFE_RE = re.compile(r"[^\w\-. ]", re.UNICODE)
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _sanitize_column_name(raw: str) -> str:
+    """Sanitize a column name for safe inclusion in LLM prompts.
+
+    * Strips control characters.
+    * Replaces characters outside ``[\\w\\-. ]`` (Unicode-aware) with ``?``.
+    * Caps length at 128.
+    * Prefixes with ``~`` when the value was modified so the model sees
+      the column came from an untrusted source.
+    """
+    cleaned = _CONTROL_CHAR_RE.sub("", raw)
+    cleaned = _COLUMN_NAME_SAFE_RE.sub("?", cleaned)
+    cleaned = cleaned[:_COLUMN_NAME_MAX_LEN]
+    if cleaned != raw:
+        logger.info(
+            "sanitized column name for LLM context",
+            extra={"original_length": len(raw), "sanitized": cleaned},
+        )
+        return f"~{cleaned}"
+    return cleaned
+
+
 def _column_snapshot(column: FlowfileColumn) -> ColumnSnapshot:
     nullable = None
     empty = getattr(column, "number_of_empty_values", None)
     if isinstance(empty, int) and empty == 0:
         nullable = False
+    raw_name = getattr(column, "column_name", "?")
     return ColumnSnapshot(
-        name=getattr(column, "column_name", "?"),
+        name=_sanitize_column_name(raw_name),
         data_type=getattr(column, "data_type", "Unknown"),
         nullable=nullable,
     )

@@ -1,21 +1,32 @@
 from sqlalchemy.orm import Session
 
+from flowfile_core.auth import sharing
 from flowfile_core.database.connection import get_db_context
 from flowfile_core.database.models import CloudStorageConnection as DBCloudStorageConnection
 from flowfile_core.database.models import DatabaseConnection as DBConnectionModel
 from flowfile_core.database.models import Secret
 from flowfile_core.schemas.cloud_storage_schemas import FullCloudStorageConnection, FullCloudStorageConnectionInterface
 from flowfile_core.schemas.input_schema import FullDatabaseConnection, FullDatabaseConnectionInterface
+from flowfile_core.schemas.sharing_schema import AccessInfo
 from flowfile_core.secret_manager.secret_manager import SecretInput, decrypt_secret, encrypt_secret, store_secret
+
+_OWNER_ACCESS = AccessInfo(is_owner=True, access_level="owner")
+
+
+def _project_sync_connection(kind: str, name: str, user_id: int, deleted: bool = False) -> None:
+    """Mirror a connection change into the active project folder (no-op when none active)."""
+    from flowfile_core.project import project_sync
+
+    project_sync.connection_changed(kind=kind, connection_name=name, user_id=user_id, deleted=deleted)
 
 
 def store_database_connection(db: Session, connection: FullDatabaseConnection, user_id: int) -> DBConnectionModel:
     """
     Store a database connection in the database.
     """
-    # Encrypt the password
-
-    existing_database_connection = get_database_connection(db, connection.connection_name, user_id)
+    # Own-only check: a granted connection with the same name must not block creation
+    # (an own connection shadows a shared one, mirroring secrets).
+    existing_database_connection = _get_own_database_connection(db, connection.connection_name, user_id)
     if existing_database_connection:
         raise ValueError(
             f"Database connection with name '{connection.connection_name}' already exists for user {user_id}."
@@ -24,7 +35,6 @@ def store_database_connection(db: Session, connection: FullDatabaseConnection, u
 
     password_id = store_secret(db, SecretInput(name=connection.connection_name, value=connection.password), user_id).id
 
-    # Create a new database connection object
     db_connection = DBConnectionModel(
         connection_name=connection.connection_name,
         host=connection.host,
@@ -37,11 +47,11 @@ def store_database_connection(db: Session, connection: FullDatabaseConnection, u
         user_id=user_id,
     )
 
-    # Add and commit the new connection to the database
     db.add(db_connection)
     db.commit()
     db.refresh(db_connection)
 
+    _project_sync_connection("database", connection.connection_name, user_id)
     return db_connection
 
 
@@ -50,7 +60,9 @@ def update_database_connection(db: Session, connection: FullDatabaseConnection, 
     Update an existing database connection. If password is provided (non-empty), update it;
     otherwise keep the existing password.
     """
-    db_connection = get_database_connection(db, connection.connection_name, user_id)
+    # Own-only: routes authorize manage-grantees and then pass the OWNER's user_id,
+    # so the password below is always re-encrypted under the owner's key.
+    db_connection = _get_own_database_connection(db, connection.connection_name, user_id)
     if db_connection is None:
         raise ValueError(f"Database connection with name '{connection.connection_name}' not found for user {user_id}.")
 
@@ -62,7 +74,6 @@ def update_database_connection(db: Session, connection: FullDatabaseConnection, 
     db_connection.username = connection.username
     db_connection.ssl_enabled = connection.ssl_enabled
 
-    # Update password only if a new one is provided
     password_value = connection.password.get_secret_value()
     if password_value:
         password_secret = db.query(Secret).filter(Secret.id == db_connection.password_id).first()
@@ -75,35 +86,69 @@ def update_database_connection(db: Session, connection: FullDatabaseConnection, 
 
     db.commit()
     db.refresh(db_connection)
+    _project_sync_connection("database", connection.connection_name, user_id)
     return db_connection
 
 
-def get_database_connection(db: Session, connection_name: str, user_id: int) -> DBConnectionModel | None:
-    """
-    Get a database connection by its name and user ID.
-    """
-    db_connection = (
+def _get_own_database_connection(db: Session, connection_name: str, user_id: int) -> DBConnectionModel | None:
+    return (
         db.query(DBConnectionModel)
         .filter(DBConnectionModel.connection_name == connection_name, DBConnectionModel.user_id == user_id)
+        .order_by(DBConnectionModel.id.asc())
         .first()
     )
 
-    return db_connection
 
-
-def get_cloud_connection(db: Session, connection_name: str, user_id: int) -> DBCloudStorageConnection | None:
-    """
-    Get a cloud storage connection by its name and user ID.
-    """
-    db_connection = (
+def _get_own_cloud_connection(db: Session, connection_name: str, user_id: int) -> DBCloudStorageConnection | None:
+    return (
         db.query(DBCloudStorageConnection)
         .filter(
             DBCloudStorageConnection.connection_name == connection_name, DBCloudStorageConnection.user_id == user_id
         )
+        .order_by(DBCloudStorageConnection.id.asc())
         .first()
     )
 
-    return db_connection
+
+def get_database_connection(db: Session, connection_name: str, user_id: int) -> DBConnectionModel | None:
+    """
+    Get a database connection by its name and user ID; falls back to group-shared
+    connections (own shadows shared; lowest id wins among shared).
+    """
+    db_connection = _get_own_database_connection(db, connection_name, user_id)
+    if db_connection:
+        return db_connection
+    granted_ids = sharing.granted_resource_ids(db, user_id, "database_connection")
+    if granted_ids:
+        return (
+            db.query(DBConnectionModel)
+            .filter(DBConnectionModel.connection_name == connection_name, DBConnectionModel.id.in_(granted_ids))
+            .order_by(DBConnectionModel.id.asc())
+            .first()
+        )
+    return None
+
+
+def get_cloud_connection(db: Session, connection_name: str, user_id: int) -> DBCloudStorageConnection | None:
+    """
+    Get a cloud storage connection by its name and user ID; falls back to
+    group-shared connections (own shadows shared; lowest id wins among shared).
+    """
+    db_connection = _get_own_cloud_connection(db, connection_name, user_id)
+    if db_connection:
+        return db_connection
+    granted_ids = sharing.granted_resource_ids(db, user_id, "cloud_connection")
+    if granted_ids:
+        return (
+            db.query(DBCloudStorageConnection)
+            .filter(
+                DBCloudStorageConnection.connection_name == connection_name,
+                DBCloudStorageConnection.id.in_(granted_ids),
+            )
+            .order_by(DBCloudStorageConnection.id.asc())
+            .first()
+        )
+    return None
 
 
 def get_database_connection_schema(db: Session, connection_name: str, user_id: int) -> FullDatabaseConnection | None:
@@ -113,7 +158,6 @@ def get_database_connection_schema(db: Session, connection_name: str, user_id: i
     db_connection = get_database_connection(db, connection_name, user_id)
 
     if db_connection:
-        # Decrypt the password
         password_secret = db.query(Secret).filter(Secret.id == db_connection.password_id).first()
         if not password_secret:
             raise Exception("Password secret not found")
@@ -153,25 +197,24 @@ def get_local_cloud_connection(connection_name: str, user_id: int) -> FullCloudS
 
 def delete_database_connection(db: Session, connection_name: str, user_id: int) -> None:
     """
-    Delete a database connection by its name and user ID.
+    Delete a database connection by its name and owner user ID.
     """
-    db_connection = (
-        db.query(DBConnectionModel)
-        .filter(DBConnectionModel.connection_name == connection_name, DBConnectionModel.user_id == user_id)
-        .first()
-    )
+    db_connection = _get_own_database_connection(db, connection_name, user_id)
 
     if db_connection:
+        sharing.delete_grants_for_resource(db, "database_connection", db_connection.id)
         db.delete(db_connection)
 
         password_secret = db.query(Secret).filter(Secret.id == db_connection.password_id).first()
         if password_secret:
             db.delete(password_secret)
         db.commit()
+        _project_sync_connection("database", connection_name, user_id, deleted=True)
 
 
 def database_connection_interface_from_db_connection(
     db_connection: DBConnectionModel,
+    access: AccessInfo | None = None,
 ) -> FullDatabaseConnectionInterface:
     """
     Convert a database connection from the database model to the interface model.
@@ -184,27 +227,35 @@ def database_connection_interface_from_db_connection(
         port=db_connection.port,
         database=db_connection.database,
         ssl_enabled=db_connection.ssl_enabled,
+        id=db_connection.id,
+        access=access,
     )
 
 
 def get_all_database_connections_interface(db: Session, user_id: int) -> list[FullDatabaseConnectionInterface]:
     """
-    Get all database connections for a user.
+    Get all database connections accessible to a user: own + group-shared.
     """
-    # Get the raw query results
     query_results = db.query(DBConnectionModel).filter(DBConnectionModel.user_id == user_id).all()
 
-    # Convert with explicit type assertion
     result = []
     for db_connection in query_results:
-        # Verify that we have an instance, not a type
         if isinstance(db_connection, DBConnectionModel):
-            result.append(database_connection_interface_from_db_connection(db_connection))
+            result.append(database_connection_interface_from_db_connection(db_connection, access=_OWNER_ACCESS))
         else:
-            # Raise an error if we somehow get a type instead of an instance
             raise TypeError(f"Expected a DBConnectionModel instance, got {type(db_connection)}")
 
+    for row, access in sharing.shared_resource_rows(db, user_id, "database_connection"):
+        result.append(database_connection_interface_from_db_connection(row, access=access))
+
     return result
+
+
+def _aws_profile_to_store(connection: FullCloudStorageConnection) -> str | None:
+    """The profile only applies to aws-cli; a blank one is stored as NULL (boto3's default credential chain)."""
+    if connection.auth_method != "aws-cli":
+        return None
+    return (connection.aws_profile or "").strip() or None
 
 
 def store_cloud_connection(
@@ -214,7 +265,7 @@ def store_cloud_connection(
     Placeholder function to store a cloud database connection.
     This function should be implemented based on specific cloud provider requirements.
     """
-    existing_database_connection = get_cloud_connection(db, connection.connection_name, user_id)
+    existing_database_connection = _get_own_cloud_connection(db, connection.connection_name, user_id)
     if existing_database_connection:
         raise ValueError(
             f"Database connection with name '{connection.connection_name}' already exists for user {user_id}."
@@ -230,6 +281,14 @@ def store_cloud_connection(
         ).id
     else:
         aws_secret_access_key_ref_id = None
+    if connection.auth_method == "access_key" and _secret_text(connection.aws_session_token):
+        aws_session_token_ref_id = store_secret(
+            db,
+            SecretInput(name=connection.connection_name + "_aws_session_token", value=connection.aws_session_token),
+            user_id,
+        ).id
+    else:
+        aws_session_token_ref_id = None
     if connection.azure_client_secret is not None:
         azure_client_secret_ref_id = store_secret(
             db,
@@ -276,7 +335,9 @@ def store_cloud_connection(
         aws_access_key_id=connection.aws_access_key_id,
         aws_role_arn=connection.aws_role_arn,
         aws_secret_access_key_id=aws_secret_access_key_ref_id,
+        aws_session_token_id=aws_session_token_ref_id,
         aws_allow_unsafe_html=connection.aws_allow_unsafe_html,
+        aws_profile=_aws_profile_to_store(connection),
         # Azure ADLS fields
         azure_account_name=connection.azure_account_name,
         azure_tenant_id=connection.azure_tenant_id,
@@ -294,6 +355,7 @@ def store_cloud_connection(
     db.add(db_cloud_connection)
     db.commit()
     db.refresh(db_cloud_connection)
+    _project_sync_connection("cloud", connection.connection_name, user_id)
     return db_cloud_connection
 
 
@@ -302,19 +364,27 @@ def _update_cloud_secret(
 ) -> int | None:
     """Helper to update a cloud connection secret field. Returns the secret ID to use."""
     if secret_value:
-        # New value provided — update existing or create new
         if existing_secret_id:
             secret_record = db.query(Secret).filter(Secret.id == existing_secret_id).first()
             if secret_record:
                 secret_record.encrypted_value = encrypt_secret(secret_value, user_id)
                 return existing_secret_id
-        # No existing secret record, create new
         from pydantic import SecretStr
 
         new_secret = store_secret(db, SecretInput(name=secret_name, value=SecretStr(secret_value)), user_id)
         return new_secret.id
-    # Empty value — keep existing secret unchanged
     return existing_secret_id
+
+
+def _secret_text(value) -> str:
+    return value.get_secret_value() if value else ""
+
+
+def _drop_cloud_secret(db: Session, secret_id: int | None) -> None:
+    """Delete a secret the connection no longer references (flush the cleared FK first)."""
+    if secret_id is not None:
+        db.flush()
+        db.query(Secret).filter(Secret.id == secret_id).delete(synchronize_session=False)
 
 
 def update_cloud_connection(
@@ -323,10 +393,17 @@ def update_cloud_connection(
     """
     Update an existing cloud storage connection. Secret fields are only updated
     if a new non-empty value is provided; otherwise the existing secret is kept.
+
+    The AWS session token is dropped unless re-entered whenever the key pair or auth method changes;
+    ``aws_profile`` is kept when the caller omits the field.
     """
-    db_connection = get_cloud_connection(db, connection.connection_name, user_id)
+    # Own-only: routes authorize manage-grantees and then pass the OWNER's user_id,
+    # so rotated secrets below are always re-encrypted under the owner's key.
+    db_connection = _get_own_cloud_connection(db, connection.connection_name, user_id)
     if db_connection is None:
         raise ValueError(f"Cloud connection with name '{connection.connection_name}' not found for user {user_id}.")
+
+    previous_access_key_id = db_connection.aws_access_key_id
 
     # Update non-secret fields
     db_connection.storage_type = connection.storage_type
@@ -335,6 +412,8 @@ def update_cloud_connection(
     db_connection.aws_access_key_id = connection.aws_access_key_id
     db_connection.aws_role_arn = connection.aws_role_arn
     db_connection.aws_allow_unsafe_html = connection.aws_allow_unsafe_html
+    if "aws_profile" in connection.model_fields_set or connection.auth_method != "aws-cli":
+        db_connection.aws_profile = _aws_profile_to_store(connection)
     db_connection.azure_account_name = connection.azure_account_name
     db_connection.azure_tenant_id = connection.azure_tenant_id
     db_connection.azure_client_id = connection.azure_client_id
@@ -351,6 +430,21 @@ def update_cloud_connection(
         connection.connection_name + "_aws_secret_access_key",
         user_id,
     )
+
+    aws_token_value = _secret_text(connection.aws_session_token)
+    key_pair_changed = bool(aws_secret_value) or connection.aws_access_key_id != previous_access_key_id
+    if connection.auth_method == "access_key" and aws_token_value:
+        db_connection.aws_session_token_id = _update_cloud_secret(
+            db,
+            db_connection.aws_session_token_id,
+            aws_token_value,
+            connection.connection_name + "_aws_session_token",
+            user_id,
+        )
+    elif connection.auth_method != "access_key" or key_pair_changed:
+        stale_token_id = db_connection.aws_session_token_id
+        db_connection.aws_session_token_id = None
+        _drop_cloud_secret(db, stale_token_id)
 
     azure_key_value = connection.azure_account_key.get_secret_value() if connection.azure_account_key else ""
     db_connection.azure_account_key_id = _update_cloud_secret(
@@ -390,6 +484,7 @@ def update_cloud_connection(
 
     db.commit()
     db.refresh(db_connection)
+    _project_sync_connection("cloud", connection.connection_name, user_id)
     return db_connection
 
 
@@ -407,6 +502,7 @@ def get_full_cloud_storage_interface_from_db(
         aws_region=db_cloud_connection.aws_region,
         aws_access_key_id=db_cloud_connection.aws_access_key_id,
         aws_role_arn=db_cloud_connection.aws_role_arn,
+        aws_profile=db_cloud_connection.aws_profile,
         azure_account_name=db_cloud_connection.azure_account_name,
         azure_tenant_id=db_cloud_connection.azure_tenant_id,
         azure_client_id=db_cloud_connection.azure_client_id,
@@ -416,13 +512,25 @@ def get_full_cloud_storage_interface_from_db(
     )
 
 
+class CloudConnectionNotAllowedError(ValueError):
+    """A saved cloud connection that would authenticate as the server, refused in multi-user mode."""
+
+
 def get_cloud_connection_schema(db: Session, connection_name: str, user_id: int) -> FullCloudStorageConnection | None:
     """
     Retrieves a full cloud storage connection schema, including decrypted secrets, by its name and user ID.
+
+    Raises:
+        CloudConnectionNotAllowedError: In multi-user mode, for a server-identity connection not owned by an admin.
     """
     db_connection = get_cloud_connection(db, connection_name, user_id)
     if not db_connection:
         return None
+    if sharing.uses_server_identity(db_connection.auth_method) and not sharing.is_admin_user(db, db_connection.user_id):
+        raise CloudConnectionNotAllowedError(
+            f"Cloud connection '{connection_name}' ({db_connection.auth_method}) "
+            f"{sharing.SERVER_IDENTITY_REFUSED_MESSAGE}"
+        )
 
     # Decrypt secrets associated with the connection
     aws_secret_key = None
@@ -430,6 +538,12 @@ def get_cloud_connection_schema(db: Session, connection_name: str, user_id: int)
         secret_record = db.query(Secret).filter(Secret.id == db_connection.aws_secret_access_key_id).first()
         if secret_record:
             aws_secret_key = decrypt_secret(secret_record.encrypted_value)
+
+    aws_session_token = None
+    if db_connection.aws_session_token_id:
+        secret_record = db.query(Secret).filter(Secret.id == db_connection.aws_session_token_id).first()
+        if secret_record:
+            aws_session_token = decrypt_secret(secret_record.encrypted_value)
 
     azure_account_key = None
     if db_connection.azure_account_key_id:
@@ -455,7 +569,6 @@ def get_cloud_connection_schema(db: Session, connection_name: str, user_id: int)
         if secret_record:
             gcs_service_account_key = decrypt_secret(secret_record.encrypted_value)
 
-    # Construct the full Pydantic model
     return FullCloudStorageConnection(
         connection_name=db_connection.connection_name,
         storage_type=db_connection.storage_type,
@@ -464,7 +577,9 @@ def get_cloud_connection_schema(db: Session, connection_name: str, user_id: int)
         aws_region=db_connection.aws_region,
         aws_access_key_id=db_connection.aws_access_key_id,
         aws_secret_access_key=aws_secret_key,
+        aws_session_token=aws_session_token,
         aws_role_arn=db_connection.aws_role_arn,
+        aws_profile=db_connection.aws_profile,
         azure_account_name=db_connection.azure_account_name,
         azure_account_key=azure_account_key,
         azure_tenant_id=db_connection.azure_tenant_id,
@@ -480,6 +595,7 @@ def get_cloud_connection_schema(db: Session, connection_name: str, user_id: int)
 
 def cloud_connection_interface_from_db_connection(
     db_connection: DBCloudStorageConnection,
+    access: AccessInfo | None = None,
 ) -> FullCloudStorageConnectionInterface:
     """
     Converts a DBCloudStorageConnection model to a FullCloudStorageConnectionInterface model,
@@ -493,32 +609,39 @@ def cloud_connection_interface_from_db_connection(
         aws_region=db_connection.aws_region,
         aws_access_key_id=db_connection.aws_access_key_id,
         aws_role_arn=db_connection.aws_role_arn,
+        aws_profile=db_connection.aws_profile,
         azure_account_name=db_connection.azure_account_name,
         azure_tenant_id=db_connection.azure_tenant_id,
         azure_client_id=db_connection.azure_client_id,
         gcs_project_id=db_connection.gcs_project_id,
         endpoint_url=db_connection.endpoint_url,
         verify_ssl=db_connection.verify_ssl,
+        id=db_connection.id,
+        access=access,
     )
 
 
 def get_all_cloud_connections_interface(db: Session, user_id: int) -> list[FullCloudStorageConnectionInterface]:
     """
-    Retrieves a list of all cloud storage connections for a user in a safe interface format (no secrets).
+    Retrieves all cloud storage connections accessible to a user (own + group-shared)
+    in a safe interface format (no secrets).
     """
     db_connections = db.query(DBCloudStorageConnection).filter(DBCloudStorageConnection.user_id == user_id).all()
 
-    return [cloud_connection_interface_from_db_connection(conn) for conn in db_connections]
+    result = [cloud_connection_interface_from_db_connection(conn, access=_OWNER_ACCESS) for conn in db_connections]
+    for row, access in sharing.shared_resource_rows(db, user_id, "cloud_connection"):
+        result.append(cloud_connection_interface_from_db_connection(row, access=access))
+    return result
 
 
 def delete_cloud_connection(db: Session, connection_name: str, user_id: int) -> None:
     """
-    Deletes a cloud storage connection and all of its associated secrets from the database.
+    Deletes a cloud storage connection (by name and owner user ID) and all of its
+    associated secrets from the database.
     """
-    db_connection = get_cloud_connection(db, connection_name, user_id)
+    db_connection = _get_own_cloud_connection(db, connection_name, user_id)
 
     if db_connection:
-        # Collect all secret IDs associated with this connection
         secret_ids_to_delete = [
             db_connection.aws_secret_access_key_id,
             db_connection.aws_session_token_id,
@@ -527,13 +650,12 @@ def delete_cloud_connection(db: Session, connection_name: str, user_id: int) -> 
             db_connection.azure_sas_token_id,
             db_connection.gcs_service_account_key_id,
         ]
-        # Filter out None values
         secret_ids_to_delete = [id for id in secret_ids_to_delete if id is not None]
 
-        # Delete associated secrets if they exist
         if secret_ids_to_delete:
             db.query(Secret).filter(Secret.id.in_(secret_ids_to_delete)).delete(synchronize_session=False)
 
-        # Delete the connection record itself
+        sharing.delete_grants_for_resource(db, "cloud_connection", db_connection.id)
         db.delete(db_connection)
         db.commit()
+        _project_sync_connection("cloud", connection_name, user_id, deleted=True)

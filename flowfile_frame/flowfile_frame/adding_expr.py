@@ -8,12 +8,28 @@ import polars as pl
 
 from flowfile_frame.callable_utils import process_callable_args
 from flowfile_frame.config import logger
+from flowfile_frame.native import NativeNodeError
+from flowfile_frame.parameters import contains_parameter
 
 if TYPE_CHECKING:
     from flowfile_frame.expr import Expr
 
 ExprT = TypeVar("ExprT", bound="Expr")
 PASSTHROUGH_METHODS = {"map_elements", "map_batches"}
+_BUILD_KEYWORDS = frozenset({"convertable_to_code", "ff_repr", "_repr_override"})
+"""Keywords of ``Expr._create_next_expr`` that no Polars method takes; a caller must not set them."""
+
+
+def refuse_parameter_argument(
+    method_name: str, args: tuple, kwargs: dict, hint: str = "pass it as an expression with ff.lit(parameter)"
+) -> None:
+    """Raise when a ``ff.Parameter`` sits, at any nesting, in the arguments of an ``Expr`` method.
+
+    The method hands its arguments to Polars as they are, and a ``Parameter`` is no Polars value:
+    Polars refuses it, or its repr lands in the node's code as an undefined name.
+    """
+    if contains_parameter(args) or contains_parameter(kwargs):
+        raise NativeNodeError(f"{method_name}() takes no ff.Parameter as an argument; {hint}")
 
 
 def create_expr_method_wrapper(method_name: str, original_method: Callable) -> Callable:
@@ -35,15 +51,19 @@ def create_expr_method_wrapper(method_name: str, original_method: Callable) -> C
 
     @wraps(original_method)
     def wrapper(self: Expr, *args, **kwargs):
-        # Check if we have a valid underlying expression
         if self.expr is None:
             raise ValueError(f"Cannot call '{method_name}' on Expr with no underlying polars expression.")
+        refuse_parameter_argument(method_name, args, kwargs)
+        internal = sorted(_BUILD_KEYWORDS & kwargs.keys())
+        if internal:
+            raise TypeError(f"{method_name}() got an unexpected keyword argument {internal[0]!r}")
 
         processed = process_callable_args(args, kwargs)
 
-        # Call the method on the underlying polars expression
+        from flowfile_frame.expr import _polars_argument
+
         try:
-            result_expr = getattr(self.expr, method_name)(*args, **kwargs)
+            result_expr = getattr(self.expr, method_name)(*_polars_argument(args), **_polars_argument(kwargs))
         except Exception as e:
             logger.debug(f"Warning: Error in {method_name}() call: {e}")
             result_expr = None
@@ -102,13 +122,10 @@ def create_expr_method_wrapper(method_name: str, original_method: Callable) -> C
             "shift_and_fill",
         }
 
-        # Determine new agg_func status
         new_agg_func = method_name if method_name in agg_methods else self.agg_func
 
-        # Determine if this makes the expression complex
         is_complex = self.is_complex or method_name in complex_methods
 
-        # Pass function sources to _create_next_expr
         result = self._create_next_expr(
             *args,
             **kwargs,
@@ -118,7 +135,6 @@ def create_expr_method_wrapper(method_name: str, original_method: Callable) -> C
             _function_sources=processed.function_sources,
         )
 
-        # Set the agg_func if needed
         if new_agg_func != self.agg_func:
             result.agg_func = new_agg_func
 
@@ -144,14 +160,12 @@ def add_expr_methods(cls: type[ExprT]) -> type[ExprT]:
     Type[ExprT]
         The modified class.
     """
-    # Get methods already defined in the class (including inherited methods)
     existing_methods = set(dir(cls))
 
     skip_methods = {
         name for name in dir(pl.Expr) if name.startswith("_") or isinstance(getattr(pl.Expr, name, None), property)
     }
 
-    # Add all public Expr methods that don't already exist
     for name in dir(pl.Expr):
         if name in existing_methods or name in skip_methods:
             continue
@@ -159,7 +173,7 @@ def add_expr_methods(cls: type[ExprT]) -> type[ExprT]:
         attr = getattr(pl.Expr, name)
         if callable(attr):
             if name in PASSTHROUGH_METHODS:
-                # Create passthrough method that marks the expression as not convertible to code
+
                 def create_passthrough_method(method_name, method_attr):
                     @wraps(method_attr)
                     def passthrough_method(self, *args, **kwargs):
@@ -180,12 +194,9 @@ def add_expr_methods(cls: type[ExprT]) -> type[ExprT]:
                                 "In a separate script"
                             )
 
-                        # Call the underlying polars method
                         result_expr = getattr(self.expr, method_name)(*args, **kwargs)
 
-                        # Create a representation string
                         new_repr = f"{self._repr_str}.{method_name}({processed.params_repr})"
-                        # Return a new expression with the convertable_to_code flag set appropriately
                         result = self._create_next_expr(
                             *args,
                             method_name=method_name,
@@ -202,7 +213,6 @@ def add_expr_methods(cls: type[ExprT]) -> type[ExprT]:
 
                 setattr(cls, name, create_passthrough_method(name, attr))
             else:
-                # Use standard wrapper for other methods
                 wrapped_method = create_expr_method_wrapper(name, attr)
                 setattr(cls, name, wrapped_method)
 

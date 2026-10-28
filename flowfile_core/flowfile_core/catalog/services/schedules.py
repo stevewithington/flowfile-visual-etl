@@ -24,6 +24,13 @@ from flowfile_core.schemas.catalog_schema import FlowRunOut, FlowScheduleOut
 logger = logging.getLogger(__name__)
 
 
+def _project_sync_schedule(registration_id: int, owner_id: int) -> None:
+    """Mirror a schedule definition change into the active project folder (no-op when none active)."""
+    from flowfile_core.project import project_sync
+
+    project_sync.schedule_changed(registration_id, owner_id)
+
+
 class ScheduleService:
     """Owns schedule CRUD, manual triggers, and the push path of table_trigger fan-out."""
 
@@ -82,6 +89,8 @@ class ScheduleService:
             description=schedule.description,
             schedule_type=schedule.schedule_type,
             interval_seconds=schedule.interval_seconds,
+            cron_expression=schedule.cron_expression,
+            cron_timezone=schedule.cron_timezone,
             trigger_table_id=schedule.trigger_table_id,
             trigger_table_name=trigger_table_name,
             trigger_namespace_id=trigger_namespace_id,
@@ -96,12 +105,39 @@ class ScheduleService:
             updated_at=schedule.updated_at,
         )
 
+    def _arm_trigger(self, schedule: FlowSchedule, trigger_table_ids: list[int] | None = None) -> None:
+        """Seed a trigger schedule's watermark to what its table(s) look like now.
+
+        Without this the scheduler's first tick reads a NULL watermark against a
+        never-NULL ``CatalogTable.updated_at`` and fires a phantom run. The tables
+        were just validated, so ``get_table`` here is an identity-map hit.
+        """
+        if schedule.schedule_type == "table_trigger":
+            if schedule.trigger_table_id is None:
+                return
+            table = self.repo.get_table(schedule.trigger_table_id)
+            if table is not None and table.updated_at is not None:
+                schedule.last_trigger_table_updated_at = table.updated_at
+        elif schedule.schedule_type == "table_set_trigger":
+            table_ids = trigger_table_ids
+            if table_ids is None:
+                table_ids = self.repo.get_trigger_table_ids(schedule.id)
+            stamps = []
+            for table_id in table_ids:
+                table = self.repo.get_table(table_id)
+                if table is not None and table.updated_at is not None:
+                    stamps.append(table.updated_at)
+            if stamps:
+                schedule.last_trigger_table_updated_at = max(stamps)
+
     def create_schedule(
         self,
         registration_id: int,
         owner_id: int,
         schedule_type: str,
         interval_seconds: int | None = None,
+        cron_expression: str | None = None,
+        cron_timezone: str | None = None,
         trigger_table_id: int | None = None,
         trigger_table_ids: list[int] | None = None,
         enabled: bool = True,
@@ -119,6 +155,8 @@ class ScheduleService:
             trigger_table_id=trigger_table_id,
             trigger_table_ids=trigger_table_ids,
             table_exists=lambda table_id: self.repo.get_table(table_id) is not None,
+            cron_expression=cron_expression,
+            cron_timezone=cron_timezone,
         )
 
         schedule = FlowSchedule(
@@ -129,13 +167,17 @@ class ScheduleService:
             description=description,
             schedule_type=schedule_type,
             interval_seconds=interval_seconds,
+            cron_expression=cron_expression,
+            cron_timezone=cron_timezone,
             trigger_table_id=trigger_table_id,
         )
+        self._arm_trigger(schedule, trigger_table_ids=trigger_table_ids)
         schedule = self.repo.create_schedule(schedule)
 
         if schedule_type == "table_set_trigger" and trigger_table_ids:
             self.repo.set_trigger_table_ids(schedule.id, trigger_table_ids)
 
+        _project_sync_schedule(registration_id, owner_id)
         return self._schedule_to_out(schedule)
 
     def update_schedule(
@@ -143,6 +185,8 @@ class ScheduleService:
         schedule_id: int,
         enabled: bool | None = None,
         interval_seconds: int | None = None,
+        cron_expression: str | None = None,
+        cron_timezone: str | None = None,
         name: str | None = None,
         description: str | None = None,
     ) -> FlowScheduleOut:
@@ -150,16 +194,28 @@ class ScheduleService:
         schedule = self.repo.get_schedule(schedule_id)
         if schedule is None:
             raise ScheduleNotFoundError(schedule_id=schedule_id)
+        # Cron fields only make sense on a cron schedule; reject them otherwise so we never
+        # store a cron_expression on an interval/table-trigger schedule (where it is ignored).
+        if (cron_expression is not None or cron_timezone is not None) and schedule.schedule_type != "cron":
+            raise ValueError("cron_expression/cron_timezone can only be set on cron schedules")
+        validate_schedule_update(interval_seconds, cron_expression, cron_timezone)
         if enabled is not None:
+            # Re-arm on re-enable: writes made while disabled must not fire on resume.
+            if enabled and not schedule.enabled:
+                self._arm_trigger(schedule)
             schedule.enabled = enabled
         if interval_seconds is not None:
-            validate_schedule_update(interval_seconds)
             schedule.interval_seconds = interval_seconds
+        if cron_expression is not None:
+            schedule.cron_expression = cron_expression
+        if cron_timezone is not None:
+            schedule.cron_timezone = cron_timezone
         if name is not None:
             schedule.name = name
         if description is not None:
             schedule.description = description
         schedule = self.repo.update_schedule(schedule)
+        _project_sync_schedule(schedule.registration_id, schedule.owner_id)
         return self._schedule_to_out(schedule)
 
     def delete_schedule(self, schedule_id: int) -> None:
@@ -167,7 +223,9 @@ class ScheduleService:
         schedule = self.repo.get_schedule(schedule_id)
         if schedule is None:
             raise ScheduleNotFoundError(schedule_id=schedule_id)
+        registration_id, owner_id = schedule.registration_id, schedule.owner_id
         self.repo.delete_schedule(schedule_id)
+        _project_sync_schedule(registration_id, owner_id)
 
     def get_schedule(self, schedule_id: int) -> FlowScheduleOut:
         """Get a schedule by ID."""
@@ -181,8 +239,12 @@ class ScheduleService:
         schedules = self.repo.list_schedules(registration_id=registration_id)
         return [self._schedule_to_out(s) for s in schedules]
 
-    def trigger_schedule_now(self, schedule_id: int, user_id: int) -> FlowRunOut:
-        """Manually trigger a scheduled flow immediately."""
+    def trigger_schedule_now(self, schedule_id: int, user_id: int, *, suppress_telemetry: bool = False) -> FlowRunOut:
+        """Manually trigger a scheduled flow immediately.
+
+        ``suppress_telemetry`` is for app-driven triggers (the demo seeder), whose
+        run is not the user's and must stay out of telemetry in the spawned child.
+        """
         schedule = self.repo.get_schedule(schedule_id)
         if schedule is None:
             raise ScheduleNotFoundError(schedule_id=schedule_id)
@@ -194,7 +256,13 @@ class ScheduleService:
         if self.repo.has_active_run(schedule.registration_id):
             raise FlowAlreadyRunningError(registration_id=schedule.registration_id)
 
-        run = self._runs.spawn_flow_run(flow, user_id=user_id, run_type="on_demand", schedule_id=schedule.id)
+        run = self._runs.spawn_flow_run(
+            flow,
+            user_id=user_id,
+            run_type="on_demand",
+            schedule_id=schedule.id,
+            suppress_telemetry=suppress_telemetry,
+        )
         return self._runs.run_to_out(run)
 
     def fire_table_trigger_schedules(self, table_id: int, table_updated_at: datetime) -> int:

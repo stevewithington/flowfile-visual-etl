@@ -50,9 +50,7 @@ from flowfile_core.ai.tools import executor as executor_module
 from flowfile_core.flowfile.flow_graph import FlowGraph, add_connection
 from flowfile_core.schemas import input_schema, schemas, transform_schema
 
-# --------------------------------------------------------------------------- #
-# Test helpers #
-# --------------------------------------------------------------------------- #
+# Test helpers
 
 
 def _flow_settings(flow_id: int = 1) -> schemas.FlowSettings:
@@ -141,9 +139,7 @@ def stub_kernel(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, Any]
     yield calls
 
 
-# --------------------------------------------------------------------------- #
-# 1. Static apply #
-# --------------------------------------------------------------------------- #
+# 1. Static apply
 
 
 def test_static_apply_returns_predicted_schema(call_kwargs: dict[str, Any]) -> None:
@@ -161,15 +157,12 @@ def test_static_apply_returns_predicted_schema(call_kwargs: dict[str, Any]) -> N
     assert result.predicted_output_schema is not None
     names = {col["name"] for col in result.predicted_output_schema}
     assert {"order_id", "customer_id", "amount", "region"} <= names
-    # Real graph mutated: filter node now exists, wired to orders.
     assert flow.get_node(2) is not None
     assert flow.get_node(2).node_inputs.main_inputs[0].node_id == 1
     assert result.audit_id is not None
 
 
-# --------------------------------------------------------------------------- #
-# 2. Unknown-columns refusal #
-# --------------------------------------------------------------------------- #
+# 2. Unknown-columns refusal
 
 
 def test_unknown_columns_refusal(call_kwargs: dict[str, Any]) -> None:
@@ -199,14 +192,11 @@ def test_unknown_columns_refusal(call_kwargs: dict[str, Any]) -> None:
     assert result.refusal_reason == "unknown_columns"
     assert "not_a_real_column" in (result.refusal_detail or "")
     assert flow.get_node(99) is None  # NOT added
-    # Audit row recorded with rejected status.
     rows = audit.query_events(session_id="test-session-w31", limit=10)
     assert any(r.tool_name == "flowfile.graph.add_filter" and r.result_status == "rejected" for r in rows)
 
 
-# --------------------------------------------------------------------------- #
-# 3. Dynamic node dry-run cache #
-# --------------------------------------------------------------------------- #
+# 3. Dynamic node dry-run cache
 
 
 def test_dynamic_node_dry_run_cache(call_kwargs: dict[str, Any], stub_kernel: list[dict[str, Any]]) -> None:
@@ -235,7 +225,6 @@ def test_dynamic_node_dry_run_cache(call_kwargs: dict[str, Any], stub_kernel: li
     assert first.predicted_output_schema is not None
     assert len(stub_kernel) == 1
 
-    # Second call with identical (code, sample) hits cache → kernel NOT called.
     polars_settings_2 = polars_settings.model_copy(update={"node_id": 11})
     second = execute_tool_call(
         flow_id=flow.flow_id,
@@ -251,9 +240,7 @@ def test_dynamic_node_dry_run_cache(call_kwargs: dict[str, Any], stub_kernel: li
     assert len(stub_kernel) == 1, "second identical call should hit cache"
 
 
-# --------------------------------------------------------------------------- #
-# 4. Source target via mirror-graph (no upstream needed) #
-# --------------------------------------------------------------------------- #
+# 4. Source target via mirror-graph (no upstream needed)
 
 
 def test_source_target_via_mirror(call_kwargs: dict[str, Any]) -> None:
@@ -283,9 +270,7 @@ def test_source_target_via_mirror(call_kwargs: dict[str, Any]) -> None:
     assert names == {"id", "label"}
 
 
-# --------------------------------------------------------------------------- #
-# 5. Network egress refusal #
-# --------------------------------------------------------------------------- #
+# 5. Network egress refusal
 
 
 def test_network_egress_refusal(call_kwargs: dict[str, Any], stub_kernel: list[dict[str, Any]]) -> None:
@@ -349,21 +334,14 @@ def test_polars_code_with_import_refuses_with_guidance(
     assert result.refusal_reason == "polars_code_import_forbidden"
     detail = result.refusal_detail or ""
     detail_lower = detail.lower()
-    # Refusal must say imports aren't allowed AND tell the LLM `pl` is
-    # already there — without those the LLM doesn't know how to fix it.
     assert "import" in detail_lower
     assert "already" in detail_lower or "available" in detail_lower
     assert "``pl``" in detail or "`pl`" in detail
-    # Pre-flight short-circuits BEFORE the dry-run kernel runs — no
-    # kernel call should have fired.
     assert len(stub_kernel) == 0, "import-rejected code must not reach the kernel"
-    # And the node must NOT have been added to the flow.
     assert flow.get_node(20) is None
 
 
-# --------------------------------------------------------------------------- #
-# 6. Audit redacts secret refs #
-# --------------------------------------------------------------------------- #
+# 6. Audit redacts secret refs
 
 
 def test_audit_redacts_secrets(call_kwargs: dict[str, Any]) -> None:
@@ -391,9 +369,7 @@ def test_audit_redacts_secrets(call_kwargs: dict[str, Any]) -> None:
     assert result.executed_args.get("password_ref") == "<<secret:my-secret>>"
 
 
-# --------------------------------------------------------------------------- #
-# 6b. Connect tool flat-shape contract #
-# --------------------------------------------------------------------------- #
+# 6b. Connect tool flat-shape contract
 
 
 def _flow_with_orders_and_filter() -> FlowGraph:
@@ -426,6 +402,109 @@ def test_connect_accepts_flat_shape(call_kwargs: dict[str, Any]) -> None:
     assert result.status == "applied", result.refusal_detail
     target_inputs = flow.get_node(2).node_inputs.main_inputs
     assert [n.node_id for n in target_inputs] == [1]
+
+
+def test_connect_rejects_wiring_into_live_source_node(call_kwargs: dict[str, Any]) -> None:
+    """Wiring INTO a live source node (node 1 = manual_input) must be refused at
+    stage time with ``target_is_source`` so the planner can self-correct, instead
+    of staging a dangling edge that only fails at apply-time."""
+    flow = _flow_with_orders_and_filter()  # node 1 = manual_input (source), node 2 = filter
+    result = execute_tool_call(
+        flow_id=flow.flow_id,
+        tool_name="flowfile.graph.connect",
+        tool_args={"flow_id": flow.flow_id, "from_node_id": 2, "to_node_id": 1},
+        insertion_context=InsertionContext(),
+        flow=flow,
+        mode="stage",
+        **call_kwargs,
+    )
+    assert result.status == "rejected"
+    assert result.refusal_reason == "target_is_source"
+    assert "source node" in (result.refusal_detail or "")
+    assert "1" in (result.refusal_detail or "")
+    assert flow.get_node(1).node_inputs.main_inputs in (None, [])
+
+
+def test_connect_rejects_missing_target_at_stage_time(call_kwargs: dict[str, Any]) -> None:
+    """Connecting INTO a node that exists nowhere — not live, not staged this
+    session — must be refused at stage time with ``target_not_found`` instead
+    of silently staging a dangling edge. This is the join dogfood: the planner
+    narrates a join node (id 4) it never added, then wires the sources into
+    that phantom id. The refusal steers toward ADDING the join first."""
+    flow = _flow_with_orders_and_filter()  # live nodes: 1 (source), 2 (filter)
+    result = execute_tool_call(
+        flow_id=flow.flow_id,
+        tool_name="flowfile.graph.connect",
+        tool_args={"flow_id": flow.flow_id, "from_node_id": 1, "to_node_id": 4},
+        insertion_context=InsertionContext(),
+        flow=flow,
+        mode="stage",
+        audit_meta={
+            "live_node_ids_at_stage": [1, 2],
+            "staged_node_ids_at_stage": [],
+            "staged_source_node_ids_at_stage": [],
+        },
+        **call_kwargs,
+    )
+    assert result.status == "rejected"
+    assert result.refusal_reason == "target_not_found"
+    detail = result.refusal_detail or ""
+    assert "4" in detail
+    assert "does not exist" in detail
+    assert "join" in detail
+
+
+def test_connect_allows_target_staged_earlier_this_session(call_kwargs: dict[str, Any]) -> None:
+    """The ``target_not_found`` guard must NOT fire when the target is a node
+    the agent staged earlier this session (no live FlowNode yet, but present in
+    ``staged_node_ids_at_stage``) — e.g. wiring a sibling into a freshly-staged
+    join's input. Pins that the guard is scoped to genuinely-missing ids."""
+    flow = _flow_with_orders_and_filter()
+    result = execute_tool_call(
+        flow_id=flow.flow_id,
+        tool_name="flowfile.graph.connect",
+        tool_args={"flow_id": flow.flow_id, "from_node_id": 1, "to_node_id": 7},
+        insertion_context=InsertionContext(),
+        flow=flow,
+        mode="stage",
+        audit_meta={
+            "live_node_ids_at_stage": [1, 2],
+            "staged_node_ids_at_stage": [7],  # 7 = a join staged earlier this session
+            "staged_source_node_ids_at_stage": [],
+        },
+        **call_kwargs,
+    )
+    assert result.status == "staged", result.refusal_detail
+    assert result.refusal_reason is None
+
+
+def test_connect_rejects_cycle_at_stage_time(call_kwargs: dict[str, Any]) -> None:
+    """Cycles among live nodes are now caught at stage time (not only at apply),
+    so the planner gets immediate feedback. Target is a transform, so the cycle
+    check — not the source-target check — is what rejects it."""
+    flow = _flow_with_orders_and_filter()  # node 1 = source, node 2 = filter (unwired)
+    flow.add_filter(
+        input_schema.NodeFilter(
+            flow_id=flow.flow_id,
+            node_id=3,
+            depending_on_id=2,
+            filter_input=transform_schema.FilterInput(filter_type="advanced", advanced_filter="[region]=='US'"),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+    result = execute_tool_call(
+        flow_id=flow.flow_id,
+        tool_name="flowfile.graph.connect",
+        tool_args={"flow_id": flow.flow_id, "from_node_id": 3, "to_node_id": 2},
+        insertion_context=InsertionContext(),
+        flow=flow,
+        mode="stage",
+        **call_kwargs,
+    )
+    assert result.status == "rejected"
+    assert result.refusal_reason == "would_create_cycle"
+    assert "would create a cycle" in (result.refusal_detail or "")
 
 
 def test_connect_flat_shape_with_explicit_classes(call_kwargs: dict[str, Any]) -> None:
@@ -559,7 +638,6 @@ def test_delete_connection_idempotent_when_already_removed(call_kwargs: dict[str
     add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
     assert [n.node_id for n in flow.get_node(2).node_inputs.main_inputs] == [1]
 
-    # First delete — succeeds, removes the wire.
     result1 = execute_tool_call(
         flow_id=flow.flow_id,
         tool_name="flowfile.graph.delete_connection",
@@ -571,7 +649,6 @@ def test_delete_connection_idempotent_when_already_removed(call_kwargs: dict[str
     assert result1.status == "applied"
     assert flow.get_node(2).node_inputs.main_inputs == []
 
-    # Second delete on the SAME wire — silent no-op (was 422 previously).
     result2 = execute_tool_call(
         flow_id=flow.flow_id,
         tool_name="flowfile.graph.delete_connection",
@@ -581,10 +658,9 @@ def test_delete_connection_idempotent_when_already_removed(call_kwargs: dict[str
         **call_kwargs,
     )
     assert result2.status == "applied", (
-        "v2.8A: deleting an already-absent connection must be a silent no-op, "
+        "deleting an already-absent connection must be a silent no-op, "
         f"not a refusal; got status={result2.status} detail={result2.refusal_detail}"
     )
-    # Still empty — second delete didn't perturb anything.
     assert flow.get_node(2).node_inputs.main_inputs == []
 
 
@@ -598,7 +674,6 @@ def test_add_connection_idempotent_when_already_present(call_kwargs: dict[str, A
     add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
     assert [n.node_id for n in flow.get_node(2).node_inputs.main_inputs] == [1]
 
-    # Re-issue the same connect via the executor.
     result = execute_tool_call(
         flow_id=flow.flow_id,
         tool_name="flowfile.graph.connect",
@@ -608,7 +683,6 @@ def test_add_connection_idempotent_when_already_present(call_kwargs: dict[str, A
         **call_kwargs,
     )
     assert result.status == "applied", result.refusal_detail
-    # Wire is still there — exactly once, not duplicated.
     assert [n.node_id for n in flow.get_node(2).node_inputs.main_inputs] == [1]
 
 
@@ -626,27 +700,23 @@ def test_delete_connection_accepts_arrow_id_shape(call_kwargs: dict[str, Any]) -
     result = execute_tool_call(
         flow_id=flow.flow_id,
         tool_name="flowfile.graph.delete_connection",
-        # The LLM-natural shape — previously this was rejected.
         tool_args={"flow_id": flow.flow_id, "connection_id": "1→2"},
         insertion_context=InsertionContext(),
         flow=flow,
         **call_kwargs,
     )
     assert result.status == "applied", (
-        f"v2.8C: connection_id arrow shape must coerce to from/to_node_id; "
+        f"connection_id arrow shape must coerce to from/to_node_id; "
         f"got status={result.status} detail={result.refusal_detail}"
     )
     assert flow.get_node(2).node_inputs.main_inputs == []
 
 
-# --------------------------------------------------------------------------- #
-# 7-9. tiered handling #
-# --------------------------------------------------------------------------- #
+# 7-9. tiered handling
 
 
 def test_d011_tier_0_cached_schema(call_kwargs: dict[str, Any]) -> None:
     flow = _flow_with_orders()
-    # Upstream is already populated; tier 0 returns the cached schema.
     assert flow.get_node(1).node_schema.predicted_schema is not None
     result = execute_tool_call(
         flow_id=flow.flow_id,
@@ -674,7 +744,6 @@ def test_d011_tier_1_callback_fires(call_kwargs: dict[str, Any]) -> None:
     )
     flow.add_filter(filter_settings)
     add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
-    # Wipe the filter's cached predicted_schema to force tier 1 path.
     flow.get_node(2).node_schema.predicted_schema = None
 
     result = execute_tool_call(
@@ -687,7 +756,6 @@ def test_d011_tier_1_callback_fires(call_kwargs: dict[str, Any]) -> None:
     )
     assert result.status == "applied", result.refusal_detail
     assert result.warnings == []
-    # Tier 1 populated the upstream's predicted_schema in place.
     assert flow.get_node(2).node_schema.predicted_schema is not None
 
 
@@ -729,9 +797,7 @@ def test_d011_tier_2_warn_and_stage(call_kwargs: dict[str, Any]) -> None:
         assert any("schema unknown" in w for w in result.warnings)
 
 
-# --------------------------------------------------------------------------- #
-# 10. Stage mode #
-# --------------------------------------------------------------------------- #
+# 10. Stage mode
 
 
 def test_stage_mode_returns_payload(call_kwargs: dict[str, Any]) -> None:
@@ -751,15 +817,11 @@ def test_stage_mode_returns_payload(call_kwargs: dict[str, Any]) -> None:
     assert result.staged_node_payload["node_type"] == "filter"
     assert result.staged_node_payload["settings"]["node_id"] == 42
     assert result.predicted_output_schema is not None
-    # Real graph not mutated.
     assert flow.get_node(42) is None
-    # Audit row still recorded.
     assert result.audit_id is not None
 
 
-# --------------------------------------------------------------------------- #
-# 10b. — auto-layout for staged nodes #
-# --------------------------------------------------------------------------- #
+# 10b. — auto-layout for staged nodes
 
 
 def test_w62_default_pos_resolves_from_upstream(call_kwargs: dict[str, Any]) -> None:
@@ -772,13 +834,10 @@ def test_w62_default_pos_resolves_from_upstream(call_kwargs: dict[str, Any]) -> 
     )
 
     flow = _flow_with_orders()
-    # Stamp a known upstream position so the assertion is unambiguous.
     flow.get_node(1).setting_input.pos_x = 400.0
     flow.get_node(1).setting_input.pos_y = 300.0
 
     args = _filter_args(node_id=2, depending_on_id=1)
-    # Strip pos_x / pos_y from tool_args so the executor's "settings have
-    # explicit coords" branch doesn't fire.
     args.pop("pos_x", None)
     args.pop("pos_y", None)
 
@@ -803,9 +862,7 @@ def test_w62_default_pos_resolves_from_upstream(call_kwargs: dict[str, Any]) -> 
     # the node at the resolved position.
     assert payload["settings"]["pos_x"] == 400.0 + _AUTO_LAYOUT_X_SPACING
     assert payload["settings"]["pos_y"] == 300.0
-    # Sanity: not the previously (0, 0) bug.
     assert (ic["pos_x"], ic["pos_y"]) != (0.0, 0.0)
-    # Layout offset Δy unused for a single anchor — staged_offset_index defaults to 0.
     _ = _AUTO_LAYOUT_Y_SPACING  # imported to assert it exists
 
 
@@ -861,7 +918,6 @@ def test_w62_explicit_zero_pos_respected(call_kwargs: dict[str, Any]) -> None:
     )
     assert result.status == "staged"
     ic = result.staged_node_payload["insertion_context"]
-    # (0, 0) survives — it was deliberate.
     assert (ic["pos_x"], ic["pos_y"]) == (0.0, 0.0)
 
 
@@ -927,7 +983,6 @@ def test_w62_staged_offset_index_stacks_fan_out(call_kwargs: dict[str, Any]) -> 
         assert result.status == "staged", result.refusal_detail
         ic = result.staged_node_payload["insertion_context"]
         coords.append((ic["pos_x"], ic["pos_y"]))
-    # All three at the same x (one column over from upstream), increasing y.
     xs = {c[0] for c in coords}
     ys = [c[1] for c in coords]
     assert len(xs) == 1
@@ -936,9 +991,7 @@ def test_w62_staged_offset_index_stacks_fan_out(call_kwargs: dict[str, Any]) -> 
     assert ys[2] > ys[1]
 
 
-# --------------------------------------------------------------------------- #
-# 11. Meta classify_intent #
-# --------------------------------------------------------------------------- #
+# 11. Meta classify_intent
 #
 # — ``test_meta_pick_category`` was deleted. The legacy
 # ``flowfile.meta.pick_category`` tool was removed alongside the
@@ -949,9 +1002,7 @@ def test_w62_staged_offset_index_stacks_fan_out(call_kwargs: dict[str, Any]) -> 
 # code path.
 
 
-# --------------------------------------------------------------------------- #
-# 12. Invalid tool name #
-# --------------------------------------------------------------------------- #
+# 12. Invalid tool name
 
 
 def test_invalid_tool_name(call_kwargs: dict[str, Any]) -> None:
@@ -968,17 +1019,13 @@ def test_invalid_tool_name(call_kwargs: dict[str, Any]) -> None:
     assert "invalid tool name" in (result.refusal_detail or "")
 
 
-# --------------------------------------------------------------------------- #
-# 13. Lazy litellm contract #
-# --------------------------------------------------------------------------- #
+# 13. Lazy litellm contract
 
 
 def test_lazy_litellm_contract() -> None:
-    # Drop any cached litellm shims so the contract is enforced from a clean slate.
     for mod in list(sys.modules):
         if mod.startswith("litellm") or mod == "litellm":
             sys.modules.pop(mod, None)
-    # Re-import the executor surface.
     sys.modules.pop("flowfile_core.ai.tools.executor", None)
     sys.modules.pop("flowfile_core.ai.tools", None)
     import flowfile_core.ai.tools  # noqa: F401
@@ -988,9 +1035,7 @@ def test_lazy_litellm_contract() -> None:
     assert not leaked, f"litellm leaked: {leaked}"
 
 
-# --------------------------------------------------------------------------- #
-# 14. Formula is static — no kernel call #
-# --------------------------------------------------------------------------- #
+# 14. Formula is static — no kernel call
 
 
 def test_formula_predicts_via_mirror_not_kernel(call_kwargs: dict[str, Any], stub_kernel: list[dict[str, Any]]) -> None:
@@ -1018,13 +1063,11 @@ def test_formula_predicts_via_mirror_not_kernel(call_kwargs: dict[str, Any], stu
     assert result.tool_name == "flowfile.graph.add_formula"
 
 
-# --------------------------------------------------------------------------- #
-# LLM-provided node_id validation #
-# --------------------------------------------------------------------------- #
+# LLM-provided node_id validation
 
 
 def test_add_with_llm_provided_colliding_node_id_is_refused(call_kwargs: dict[str, Any]) -> None:
-    """AC2 — LLM emits ``add_filter(node_id=3, upstream_node_ids=[3])``.
+    """LLM emits ``add_filter(node_id=3, upstream_node_ids=[3])``.
 
     The executor refuses with ``self_loop_prevented`` *before* Pydantic validation;
     no node is staged or applied; an audit row records the rejection.
@@ -1084,9 +1127,7 @@ def test_add_with_llm_provided_id_already_live_is_refused(call_kwargs: dict[str,
     assert "already exists in the live graph" in (result.refusal_detail or "")
 
 
-# --------------------------------------------------------------------------- #
-# Sanity: ToolExecutionResult shape #
-# --------------------------------------------------------------------------- #
+# Sanity: ToolExecutionResult shape
 
 
 def test_tool_execution_result_default_shape() -> None:
@@ -1100,13 +1141,10 @@ def test_executor_module_exposes_seam() -> None:
     """The kernel-runner seam must be a module attribute we can monkey-patch."""
     assert hasattr(dry_run_module, "_run_kernel_for_dry_run")
     assert callable(dry_run_module._run_kernel_for_dry_run)
-    # And the executor module re-exports the public surface unchanged.
     assert executor_module.execute_tool_call is execute_tool_call
 
 
-# --------------------------------------------------------------------------- #
-# settings-validation refusal enrichment #
-# --------------------------------------------------------------------------- #
+# settings-validation refusal enrichment
 
 
 def _add_manual_input_args_with_string_raw_data() -> dict[str, Any]:
@@ -1167,8 +1205,6 @@ def test_w67_settings_validation_refusal_includes_field_and_shape(call_kwargs: d
     detail = result.refusal_detail or ""
     assert "raw_data_format" in detail, detail
     assert "object" in detail.lower(), detail
-    # Received type is Python's ``str`` — exact substring match on what
-    # ``type(received).__name__`` produces.
     assert "str" in detail, detail
     assert "flowfile.graph.add_manual_input" in detail, detail
     assert "JSON-encoded string" in detail, detail
@@ -1214,9 +1250,7 @@ def test_w67_settings_validation_refusal_includes_concrete_example(call_kwargs: 
     assert "data" in parsed, parsed
 
 
-# --------------------------------------------------------------------------- #
-# — manual_input shape tolerance #
-# --------------------------------------------------------------------------- #
+# — manual_input shape tolerance
 
 
 def test_normalize_columns_dict_to_list_of_objects() -> None:
@@ -1460,9 +1494,7 @@ def test_executor_canonical_manual_input_still_validates(call_kwargs: dict[str, 
     assert raw.data == [["Alice", "Bob", "Cat"], [30, 25, 19]]
 
 
-# --------------------------------------------------------------------------- #
-# update_node_settings #
-# --------------------------------------------------------------------------- #
+# update_node_settings
 
 
 def _flow_with_orders_and_filter() -> FlowGraph:
@@ -1527,11 +1559,9 @@ def test_update_node_settings_stage_returns_modification_payload(call_kwargs: di
     assert payload["kind"] == "modification"
     assert payload["node_id"] == 2
     assert payload["node_type"] == "filter"
-    # Old settings reflect the pre-change state captured at stage time.
     assert payload["old_settings"]["filter_input"]["advanced_filter"] == "[region]=='EU'"
     assert payload["new_settings"]["filter_input"]["advanced_filter"] == "[amount] > 50"
     assert payload["predicted_output_schema"] is not None
-    # Live graph unchanged.
     assert (
         flow.get_node(2).setting_input.model_dump(mode="json")["filter_input"]["advanced_filter"]
         == pre_filter["filter_input"]["advanced_filter"]
@@ -1560,7 +1590,6 @@ def test_update_node_settings_apply_mutates_live_node(call_kwargs: dict[str, Any
     assert result.node_id == 2
     post = flow.get_node(2).setting_input
     assert post.filter_input.advanced_filter == "[amount] > 50"
-    # The wiring is preserved — main upstream is still node 1.
     assert flow.get_node(2).node_inputs.main_inputs[0].node_id == 1
 
 
@@ -1695,9 +1724,7 @@ def test_update_node_settings_missing_node_id_arg(call_kwargs: dict[str, Any]) -
     assert "node_id" in (result.refusal_detail or "")
 
 
-# --------------------------------------------------------------------------- #
-# sink-as-upstream refusal #
-# --------------------------------------------------------------------------- #
+# sink-as-upstream refusal
 
 
 def _flow_with_orders_and_explore_data() -> FlowGraph:
@@ -1738,7 +1765,6 @@ def test_add_node_refuses_when_upstream_is_sink(call_kwargs: dict[str, Any]) -> 
     detail = result.refusal_detail or ""
     assert "99" in detail
     assert "explore_data" in detail
-    # Refusal includes non-sink candidates so the LLM can retry intelligently.
     assert "[1]" in detail
 
 
@@ -1767,7 +1793,6 @@ def test_connect_refuses_self_loop(call_kwargs: dict[str, Any]) -> None:
     detail = result.refusal_detail or ""
     assert "must be different" in detail
     assert "2" in detail
-    # No connection got staged — the input list of node 2 is unchanged.
     assert flow.get_node(2) is not None
 
 
@@ -1828,10 +1853,8 @@ def test_add_node_passes_when_upstream_is_non_sink(call_kwargs: dict[str, Any]) 
     assert result.refusal_reason is None
 
 
-# --------------------------------------------------------------------------- #
-# — refuse unrequested wires from freshly-staged source nodes #
-# into pre-existing live nodes #
-# --------------------------------------------------------------------------- #
+# — refuse unrequested wires from freshly-staged source nodes
+# into pre-existing live nodes
 
 
 def test_connect_refuses_unrequested_wire_from_staged_source_to_live(
@@ -1933,11 +1956,13 @@ def test_connect_allows_live_to_live_without_audit_meta(
     assert result.refusal_reason is None
 
 
-def test_connect_allows_live_to_staged_source(call_kwargs: dict[str, Any]) -> None:
-    """wiring a pre-existing live upstream into a freshly-
-    staged source node id is allowed. Pins the asymmetry of the rule:
-    the refusal triggers only when ``from_id`` is a same-session-staged
-    SOURCE node going INTO a live downstream — not the reverse.
+def test_connect_refuses_wiring_into_staged_source(call_kwargs: dict[str, Any]) -> None:
+    """Wiring ANY upstream into a freshly-staged source node is refused with
+    ``target_is_source``: a source has no input port, so this is invalid topology
+    regardless of where the edge comes from (the ``read -> read`` build-from-scratch
+    bug, where the target source was added earlier in the same diff). This is a
+    distinct guard from ``unrequested_wire_to_live`` (which is about a staged source
+    as the FROM side); here node 5 is the source TO side.
     """
     flow = _flow_with_orders_and_filter()
     result = execute_tool_call(
@@ -1954,8 +1979,39 @@ def test_connect_allows_live_to_staged_source(call_kwargs: dict[str, Any]) -> No
         },
         **call_kwargs,
     )
-    assert result.status == "staged", result.refusal_detail
-    assert result.refusal_reason is None
+    assert result.status == "rejected"
+    assert result.refusal_reason == "target_is_source"
+    assert "5" in (result.refusal_detail or "")
+
+
+def test_connect_refuses_staged_nonsource_into_live_source(call_kwargs: dict[str, Any]) -> None:
+    """Gap guard: a freshly-staged NON-source FROM node (no live FlowNode yet, and
+    NOT in ``staged_source_node_ids_at_stage``) wired INTO a pre-existing LIVE
+    source node must still be refused with ``target_is_source``. Because the FROM
+    side is staged, the live→live ``validate_connection`` never runs; and because
+    the TO id is live it isn't in ``staged_source_ids`` — so neither pre-existing
+    branch fired, yet a source TO has no input port and must be rejected.
+    """
+    flow = _flow_with_orders_and_filter()  # node 1 = manual_input (LIVE source), node 2 = filter
+    result = execute_tool_call(
+        flow_id=flow.flow_id,
+        tool_name="flowfile.graph.connect",
+        tool_args={"flow_id": flow.flow_id, "from_node_id": 5, "to_node_id": 1},
+        insertion_context=InsertionContext(),
+        flow=flow,
+        mode="stage",
+        audit_meta={
+            "live_node_ids_at_stage": [1, 2],
+            "staged_node_ids_at_stage": [5],
+            "staged_source_node_ids_at_stage": [],  # 5 is a staged NON-source
+        },
+        **call_kwargs,
+    )
+    assert result.status == "rejected"
+    assert result.refusal_reason == "target_is_source"
+    assert "source node" in (result.refusal_detail or "")
+    assert "1" in (result.refusal_detail or "")
+    assert flow.get_node(1).node_inputs.main_inputs in (None, [])
 
 
 def test_connect_allows_staged_non_source_to_live(call_kwargs: dict[str, Any]) -> None:
@@ -1983,9 +2039,7 @@ def test_connect_allows_staged_non_source_to_live(call_kwargs: dict[str, Any]) -
     assert result.refusal_reason is None
 
 
-# --------------------------------------------------------------------------- #
-# node_id coercion in non-Pydantic handlers #
-# --------------------------------------------------------------------------- #
+# node_id coercion in non-Pydantic handlers
 
 
 def test_delete_node_coerces_string_node_id(call_kwargs: dict[str, Any]) -> None:
@@ -2004,7 +2058,6 @@ def test_delete_node_coerces_string_node_id(call_kwargs: dict[str, Any]) -> None
         mode="stage",
         **call_kwargs,
     )
-    # Coercion succeeded → handler ran → staging path applied.
     assert result.status == "staged", result.refusal_detail
 
 
@@ -2059,9 +2112,7 @@ def test_delete_node_refuses_bool_node_id(call_kwargs: dict[str, Any]) -> None:
     assert "bool" in (result.refusal_detail or "")
 
 
-# --------------------------------------------------------------------------- #
-# — join-shaped wire validation #
-# --------------------------------------------------------------------------- #
+# — join-shaped wire validation
 
 
 def _flow_with_two_inputs() -> FlowGraph:
@@ -2126,7 +2177,6 @@ def test_cross_join_refused_when_right_input_missing(call_kwargs: dict[str, Any]
     assert result.status == "rejected"
     assert "join-shaped" in (result.refusal_detail or "")
     assert "right" in (result.refusal_detail or "").lower()
-    # The flow must NOT have a partially-wired cross_join node.
     assert flow.get_node(3) is None
 
 
@@ -2172,9 +2222,7 @@ def test_agent_writer_node_types_refused_with_writer_blocked(call_kwargs: dict[s
     )
     assert result.status == "rejected"
     assert result.refusal_reason == "writer_blocked"
-    assert "external destination" in (result.refusal_detail or "")
-    # The writer node never gets staged — the live graph stays
-    # exactly as it was.
+    assert "Writer nodes" in (result.refusal_detail or "")
     assert flow.get_node(2) is None
 
 
@@ -2273,7 +2321,6 @@ def test_cross_join_succeeds_with_one_left_and_one_right(call_kwargs: dict[str, 
     assert result.status in ("applied", "warned"), result.refusal_detail
     join_node = flow.get_node(3)
     assert join_node is not None
-    # Both wires must be present on the join node.
     main_input_ids = [n.node_id for n in (join_node.node_inputs.main_inputs or [])]
     assert main_input_ids == [1], main_input_ids
     assert (
@@ -2282,9 +2329,7 @@ def test_cross_join_succeeds_with_one_left_and_one_right(call_kwargs: dict[str, 
     )
 
 
-# --------------------------------------------------------------------------- #
-# — _unwrap_json_string_values: scalar preservation #
-# --------------------------------------------------------------------------- #
+# — _unwrap_json_string_values: scalar preservation
 
 
 def test_unwrap_preserves_digit_string_for_str_fields() -> None:
@@ -2299,17 +2344,14 @@ def test_unwrap_preserves_digit_string_for_str_fields() -> None:
     """
     from flowfile_core.ai.tools.executor import _unwrap_json_string_values
 
-    # Bare scalar digit strings preserved verbatim — the bug fix.
     assert _unwrap_json_string_values("1") == "1"
     assert _unwrap_json_string_values("-5") == "-5"
     assert _unwrap_json_string_values("3.14") == "3.14"
     assert _unwrap_json_string_values("0") == "0"
 
-    # Container unwrap still works — the cases this heuristic exists for.
     assert _unwrap_json_string_values("[3, 4]") == [3, 4]
     assert _unwrap_json_string_values('{"a": 1}') == {"a": 1}
 
-    # Recursive: numeric string nested inside a real dict stays a string.
     nested = {"filter_input": {"basic_filter": {"value": "1"}}}
     assert _unwrap_json_string_values(nested) == nested
 
@@ -2318,7 +2360,6 @@ def test_unwrap_preserves_digit_string_for_str_fields() -> None:
     # cleanly, so they pass through untouched.
     assert _unwrap_json_string_values("2024_q1") == "2024_q1"
 
-    # Booleans and code bodies still pass through (existing guarantees).
     assert _unwrap_json_string_values("true") == "true"
     assert _unwrap_json_string_values("pl.col('x') > 5") == "pl.col('x') > 5"
 
@@ -2358,3 +2399,28 @@ def test_add_filter_basic_numeric_value_accepts_string(call_kwargs: dict[str, An
     )
     assert result.status != "rejected", result.refusal_detail
     assert "got int" not in (result.refusal_detail or "")
+
+
+def test_add_formula_accepts_a_multi_entry_functions_list(call_kwargs: dict[str, Any]) -> None:
+    """The planner must be able to stage a chained formula node, not just a single entry."""
+    flow = _flow_with_orders()
+    result = execute_tool_call(
+        flow_id=flow.flow_id,
+        tool_name="flowfile.graph.add_formula",
+        tool_args={
+            "flow_id": 1,
+            "node_id": 51,
+            "depending_on_id": 1,
+            "functions": [
+                {"field": {"name": "net_amount", "data_type": "Double"}, "function": "[amount] * 0.95"},
+                {"field": {"name": "rounded", "data_type": "Double"}, "function": "round([net_amount], 2)"},
+            ],
+        },
+        insertion_context=InsertionContext(upstream_node_ids=[1]),
+        flow=flow,
+        **call_kwargs,
+    )
+    assert result.status == "applied", result.refusal_detail or result.refusal_reason
+    entries = flow.get_node(51).setting_input.entries
+    assert [e.field.name for e in entries] == ["net_amount", "rounded"]
+    assert flow.get_node(51).setting_input.function is None, "two entries must not mirror onto `function`"

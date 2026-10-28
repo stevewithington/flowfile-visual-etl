@@ -7,19 +7,24 @@ results as raw binary frames (no base64 encoding).
 
 import io
 import json
+import time
+from base64 import b64decode
+from unittest.mock import AsyncMock
 
 import polars as pl
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
-from flowfile_worker import main, models
+from flowfile_worker import funcs, main, models, mp_context, status_dict, status_dict_lock
+from flowfile_worker.spawner import drain_result_queue, handle_task, process_manager
+from flowfile_worker.streaming import _monitor_progress
+from tests.conftest import INTERNAL_AUTH_HEADERS
 
-client = TestClient(main.app)
+client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 def _ws_submit(metadata: dict, payload_bytes: bytes, timeout: float = 30.0):
     """Run a full WebSocket submit cycle and return (messages, binary_results).
@@ -33,12 +38,10 @@ def _ws_submit(metadata: dict, payload_bytes: bytes, timeout: float = 30.0):
     json_messages = []
     binary_frames = []
 
-    with client.websocket_connect("/ws/submit") as ws:
-        # Send metadata + binary payload
+    with client.websocket_connect("/ws/submit", headers=INTERNAL_AUTH_HEADERS) as ws:
         ws.send_json(metadata)
         ws.send_bytes(payload_bytes)
 
-        # Receive messages until we get a terminal one (complete or error)
         expecting_binary = False
         while True:
             if expecting_binary:
@@ -53,26 +56,34 @@ def _ws_submit(metadata: dict, payload_bytes: bytes, timeout: float = 30.0):
                 if data.get("type") == "complete":
                     if data.get("has_result"):
                         if data.get("result_type") == "polars":
-                            # Next frame is binary (raw LazyFrame bytes)
                             expecting_binary = True
                             continue
                         else:
-                            # Next frame is JSON (result_data)
                             continue
-                    # No result data follows
                     break
                 elif data.get("type") == "error":
                     break
                 elif data.get("type") == "result_data":
                     break
-                # progress messages: keep reading
 
     return json_messages, binary_frames
 
 
-# ---------------------------------------------------------------------------
+# Tests: Auth boundary
+
+class TestWsAuth:
+    """/ws/submit closes with 1008 before accept when the internal token is absent or wrong."""
+
+    @pytest.mark.parametrize("headers", [{}, {"X-Flowfile-Internal": "wrong-token"}])
+    def test_ws_submit_rejects_bad_token(self, headers):
+        unauthenticated = TestClient(main.app)
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with unauthenticated.websocket_connect("/ws/submit", headers=headers):
+                pass
+        assert exc_info.value.code == 1008
+
+
 # Tests: Store operation (polars result via binary frame)
-# ---------------------------------------------------------------------------
 
 class TestWsStoreOperation:
     """Test the 'store' operation which returns a serialized LazyFrame as binary."""
@@ -88,7 +99,6 @@ class TestWsStoreOperation:
 
         json_msgs, binary_frames = _ws_submit(metadata, lf.serialize())
 
-        # Should have at least one progress message and a complete message
         complete_msgs = [m for m in json_msgs if m.get("type") == "complete"]
         assert len(complete_msgs) == 1, f"Expected 1 complete message, got {len(complete_msgs)}"
 
@@ -96,8 +106,8 @@ class TestWsStoreOperation:
         assert complete["result_type"] == "polars"
         assert complete["has_result"] is True
         assert complete["file_ref"].endswith(".arrow")
+        assert complete["number_of_records"] == 3, "store must ride-along the row count on the complete frame"
 
-        # Binary frame should contain a valid serialized LazyFrame
         assert len(binary_frames) == 1, "Expected exactly 1 binary frame with result"
         result_lf = pl.LazyFrame.deserialize(io.BytesIO(binary_frames[0]))
         result_df = result_lf.collect()
@@ -140,10 +150,8 @@ class TestWsStoreOperation:
         json_msgs, binary_frames = _ws_submit(metadata, lf.serialize())
 
         progress_msgs = [m for m in json_msgs if m.get("type") == "progress"]
-        # At least the initial progress should be reported
         assert len(progress_msgs) >= 0, "Progress messages may or may not appear depending on timing"
 
-        # The complete message must be present
         complete_msgs = [m for m in json_msgs if m.get("type") == "complete"]
         assert len(complete_msgs) == 1
 
@@ -162,16 +170,12 @@ class TestWsStoreOperation:
         assert len(binary_frames) == 1
         raw_bytes = binary_frames[0]
 
-        # Should be raw bytes, not a base64 string
         assert isinstance(raw_bytes, bytes)
-        # Verify it's directly deserializable without base64 decoding
         result_lf = pl.LazyFrame.deserialize(io.BytesIO(raw_bytes))
         assert result_lf.collect().equals(lf.collect())
 
 
-# ---------------------------------------------------------------------------
 # Tests: Store sample operation (file on disk, no binary result)
-# ---------------------------------------------------------------------------
 
 class TestWsStoreSampleOperation:
     """Test the 'store_sample' operation which writes to disk without returning data."""
@@ -192,18 +196,15 @@ class TestWsStoreSampleOperation:
         assert complete["result_type"] == "other"
         assert complete["has_result"] is False
         assert complete["file_ref"].endswith(".arrow")
+        assert complete.get("number_of_records") is None, "store_sample does not ride-along a count"
 
-        # No binary frame since store_sample has no queue result
         assert len(binary_frames) == 0
 
-        # The file should exist and contain the sampled data
         result_df = pl.read_ipc(complete["file_ref"])
         assert len(result_df) == 10, f"Expected 10 rows, got {len(result_df)}"
 
 
-# ---------------------------------------------------------------------------
 # Tests: Calculate schema operation (JSON result, not binary)
-# ---------------------------------------------------------------------------
 
 class TestWsCalculateSchemaOperation:
     """Test the 'calculate_schema' operation which returns schema stats as JSON."""
@@ -222,7 +223,6 @@ class TestWsCalculateSchemaOperation:
         complete = [m for m in json_msgs if m.get("type") == "complete"][0]
         assert complete["result_type"] == "other"
 
-        # Schema result comes as JSON, not binary
         assert len(binary_frames) == 0
         result_data_msgs = [m for m in json_msgs if m.get("type") == "result_data"]
         assert len(result_data_msgs) == 1, "Expected 1 result_data message"
@@ -230,15 +230,12 @@ class TestWsCalculateSchemaOperation:
         schema_stats = result_data_msgs[0]["data"]
         assert isinstance(schema_stats, list)
         assert len(schema_stats) > 0
-        # Schema stats should contain column info
         col_names = {s.get("column_name") for s in schema_stats}
         assert "name" in col_names
         assert "age" in col_names
 
 
-# ---------------------------------------------------------------------------
 # Tests: Calculate number of records (JSON result, integer)
-# ---------------------------------------------------------------------------
 
 class TestWsCalculateNumberOfRecords:
     """Test 'calculate_number_of_records' which returns an integer via JSON."""
@@ -256,15 +253,14 @@ class TestWsCalculateNumberOfRecords:
 
         complete = [m for m in json_msgs if m.get("type") == "complete"][0]
         assert complete["result_type"] == "other"
+        assert complete.get("number_of_records") is None, "the count is the result_data payload, not a ride-along"
 
         result_data_msgs = [m for m in json_msgs if m.get("type") == "result_data"]
         assert len(result_data_msgs) == 1
         assert result_data_msgs[0]["data"] == 42
 
 
-# ---------------------------------------------------------------------------
 # Tests: REST endpoint compatibility (ensures REST still works after changes)
-# ---------------------------------------------------------------------------
 
 class TestRestCompatibilityAfterStreamingChanges:
     """Verify the existing REST endpoints still work correctly.
@@ -288,9 +284,7 @@ class TestRestCompatibilityAfterStreamingChanges:
         r = client.get(f"/status/{status.background_task_id}")
         status = models.Status.model_validate(r.json())
         assert status.status == "Completed", f"Expected Completed, got {status.status}: {status.error_message}"
-
-        # Results should still be base64-encoded in REST responses
-        from base64 import b64decode
+        assert status.number_of_records == 2, "REST /status must surface the store ride-along count"
 
         result_df = pl.LazyFrame.deserialize(io.BytesIO(b64decode(status.results))).collect()
         assert result_df.equals(lf.collect())
@@ -316,9 +310,7 @@ class TestRestCompatibilityAfterStreamingChanges:
         assert len(result_df) == 5
 
 
-# ---------------------------------------------------------------------------
 # Tests: Error handling
-# ---------------------------------------------------------------------------
 
 class TestWsErrorHandling:
     """Test WebSocket error scenarios."""
@@ -337,6 +329,50 @@ class TestWsErrorHandling:
         error_msgs = [m for m in json_msgs if m.get("type") == "error"]
         assert len(error_msgs) >= 1, f"Expected error message, got: {json_msgs}"
 
+    def test_task_failure_frame_is_marked_as_task_error(self):
+        """A plan that fails while collecting reports status "Error" so core fails the node."""
+        lf = pl.LazyFrame({"a": ["abc"]}).with_columns(pl.col("a").cast(pl.Int64))
+        metadata = {
+            "task_id": "ws-test-task-failure",
+            "operation": "store",
+            "flow_id": 1,
+            "node_id": -1,
+        }
+
+        json_msgs, _ = _ws_submit(metadata, lf.serialize())
+
+        error_msgs = [m for m in json_msgs if m.get("type") == "error"]
+        assert len(error_msgs) == 1, f"Expected one error message, got: {json_msgs}"
+        assert error_msgs[0]["status"] == "Error"
+        assert error_msgs[0]["error_kind"] == "task"
+        assert "InvalidOperationError" in error_msgs[0]["error_message"]
+
+    def test_plan_the_worker_cannot_load_is_an_environment_failure(self, unloadable_plan):
+        """A plan whose UDF can't be imported here says so, so core degrades instead of failing."""
+        task_id = "ws-test-unloadable-plan"
+        metadata = {"task_id": task_id, "operation": "store", "flow_id": 1, "node_id": -1}
+
+        json_msgs, _ = _ws_submit(metadata, unloadable_plan)
+
+        error_msgs = [m for m in json_msgs if m.get("type") == "error"]
+        assert len(error_msgs) == 1, f"Expected one error message, got: {json_msgs}"
+        assert error_msgs[0]["status"] == "Error"
+        assert error_msgs[0]["error_kind"] == "environment"
+        assert error_msgs[0]["error_message"].startswith("ModuleNotFoundError:"), "the marker must not leak to core"
+        assert "core_only_udf" in error_msgs[0]["error_message"]
+        with status_dict_lock:
+            assert status_dict[task_id].error_kind == "environment"
+
+    def test_result_write_failure_is_an_environment_failure(self):
+        """The plan evaluated fine but the IPC result file could not be written."""
+        metadata = {"task_id": "missing-subdir/ws-test-write", "operation": "store", "flow_id": 1, "node_id": -1}
+
+        json_msgs, _ = _ws_submit(metadata, pl.LazyFrame({"a": [1]}).serialize())
+
+        error_msgs = [m for m in json_msgs if m.get("type") == "error"]
+        assert len(error_msgs) == 1, f"Expected one error message, got: {json_msgs}"
+        assert error_msgs[0]["error_kind"] == "environment"
+
     def test_status_dict_updated_for_rest_compatibility(self):
         """After WebSocket completes, status_dict should also be updated."""
         task_id = "ws-test-status-compat"
@@ -350,8 +386,235 @@ class TestWsErrorHandling:
 
         _ws_submit(metadata, lf.serialize())
 
-        # The REST status endpoint should also show completed
         r = client.get(f"/status/{task_id}")
         assert r.status_code == 200
         status = models.Status.model_validate(r.json())
         assert status.status == "Completed"
+
+
+# Tests: Row-count ride-along (Work Item 2)
+
+class TestStoreRowCountRideAlong:
+    """funcs.store queues (plan_bytes, row_count); the count surfaces on Status."""
+
+    def _spawn_store(self, lf: pl.LazyFrame, file_path: str):
+        progress = mp_context.Value("i", 0)
+        error_message = mp_context.Array("c", 1024)
+        q = mp_context.Queue(maxsize=1)
+        p = mp_context.Process(
+            target=funcs.store,
+            kwargs=dict(
+                polars_serializable_object=lf.serialize(),
+                progress=progress,
+                error_message=error_message,
+                queue=q,
+                file_path=file_path,
+                flowfile_flow_id=-1,
+                flowfile_node_id=-1,
+            ),
+        )
+        p.start()
+        return p, progress, error_message, q
+
+    def test_store_queues_plan_bytes_and_count(self, tmp_path):
+        lf = pl.LazyFrame({"a": [1, 2, 3, 4, 5]})
+        file_path = str(tmp_path / "store.arrow")
+        p, progress, error_message, q = self._spawn_store(lf, file_path)
+        try:
+            result = drain_result_queue(q, p, timeout=30.0)
+            p.join(timeout=30)
+        finally:
+            if p.is_alive():
+                p.terminate()
+                p.join()
+
+        assert isinstance(result, tuple) and len(result) == 2, "store must put a (payload, count) tuple"
+        plan_bytes, row_count = result
+        assert isinstance(plan_bytes, bytes)
+        assert row_count == 5
+        restored = pl.LazyFrame.deserialize(io.BytesIO(plan_bytes))
+        assert restored.collect().equals(lf.collect())
+
+    def test_handle_task_surfaces_count_and_keeps_plan_bytes(self, tmp_path):
+        task_id = "test-store-ride-along-e2e"
+        lf = pl.LazyFrame({"x": list(range(7))})
+        file_path = str(tmp_path / "store-e2e.arrow")
+        p, progress, error_message, q = self._spawn_store(lf, file_path)
+        process_manager.add_process(task_id, p)
+        with status_dict_lock:
+            status_dict[task_id] = models.Status(
+                background_task_id=task_id, status="Starting", file_ref=file_path, result_type="polars"
+            )
+        try:
+            handle_task(task_id, p, progress, error_message, q)
+            with status_dict_lock:
+                status = status_dict[task_id]
+            assert status.status == "Completed", status.error_message
+            assert status.number_of_records == 7
+            # element 0 stays the byte-identical scan_ipc plan, b64-encoded at the REST boundary
+            restored = pl.LazyFrame.deserialize(io.BytesIO(b64decode(status.results)))
+            assert restored.collect().equals(lf.collect())
+        finally:
+            if p.is_alive():
+                p.terminate()
+                p.join()
+            with status_dict_lock:
+                status_dict.pop(task_id, None)
+            process_manager.remove_process(task_id)
+
+
+class TestHandleTaskTerminalStatus:
+    """handle_task must always resolve a finished child to a terminal status.
+
+    A failing child sets progress=-1 and can exit *before* the monitor loop
+    observes it; the post-loop resolution must still surface a terminal Error.
+    Otherwise the status is left at "Processing" and core's poller hangs forever
+    (regression for the deadline-less REST offload hang).
+    """
+
+    def test_failed_child_yields_terminal_error(self, tmp_path):
+        task_id = "test-handle-task-failed-child"
+        file_path = str(tmp_path / "fail.arrow")
+        progress = mp_context.Value("i", 0)
+        error_message = mp_context.Array("c", 1024)
+        q = mp_context.Queue(maxsize=1)
+        # Garbage bytes: the child's LazyFrame.deserialize raises, so it sets
+        # progress=-1 and exits (racing handle_task's monitor loop).
+        p = mp_context.Process(
+            target=funcs.store,
+            kwargs=dict(
+                polars_serializable_object=b"not-a-serialized-lazyframe",
+                progress=progress,
+                error_message=error_message,
+                queue=q,
+                file_path=file_path,
+                flowfile_flow_id=-1,
+                flowfile_node_id=-1,
+            ),
+        )
+        p.start()
+        process_manager.add_process(task_id, p)
+        with status_dict_lock:
+            status_dict[task_id] = models.Status(
+                background_task_id=task_id, status="Starting", file_ref=file_path, result_type="polars"
+            )
+        try:
+            handle_task(task_id, p, progress, error_message, q)
+            with status_dict_lock:
+                status = status_dict[task_id]
+            assert status.status == "Error", f"expected terminal Error, got {status.status!r}"
+        finally:
+            if p.is_alive():
+                p.terminate()
+                p.join()
+            with status_dict_lock:
+                status_dict.pop(task_id, None)
+            process_manager.remove_process(task_id)
+
+    def test_wedged_child_times_out_to_error(self, monkeypatch):
+        # A child that stays alive but never signals completion must be terminated
+        # at the wall-clock deadline and reported as a terminal Error.
+        monkeypatch.setattr("flowfile_worker.spawner._TASK_TIMEOUT", 0.5)
+        task_id = "test-handle-task-timeout"
+        progress = mp_context.Value("i", 0)  # never advances
+        error_message = mp_context.Array("c", 1024)
+        q = mp_context.Queue(maxsize=1)
+        p = mp_context.Process(target=time.sleep, args=(30,))  # wedged child
+        p.start()
+        process_manager.add_process(task_id, p)
+        with status_dict_lock:
+            status_dict[task_id] = models.Status(
+                background_task_id=task_id, status="Starting", file_ref="x", result_type="polars"
+            )
+        try:
+            handle_task(task_id, p, progress, error_message, q)
+            with status_dict_lock:
+                status = status_dict[task_id]
+            assert status.status == "Error", f"expected Error, got {status.status!r}"
+            assert "time limit" in (status.error_message or "")
+            assert status.error_kind == "environment"
+            assert not p.is_alive(), "wedged child should have been terminated"
+        finally:
+            if p.is_alive():
+                p.terminate()
+                p.join()
+            with status_dict_lock:
+                status_dict.pop(task_id, None)
+            process_manager.remove_process(task_id)
+
+
+class TestWsMonitorTimeout:
+    """_monitor_progress (WS path) must terminate a wedged child at the deadline
+    and report a terminal Error, mirroring handle_task."""
+
+    @pytest.mark.asyncio
+    async def test_wedged_child_times_out_to_error(self, monkeypatch):
+        monkeypatch.setattr("flowfile_worker.streaming._TASK_TIMEOUT", 0.5)
+        task_id = "test-ws-monitor-timeout"
+        progress = mp_context.Value("i", 0)  # never advances
+        error_message = mp_context.Array("c", 1024)
+        p = mp_context.Process(target=time.sleep, args=(30,))  # wedged child
+        p.start()
+        websocket = AsyncMock()
+        with status_dict_lock:
+            status_dict[task_id] = models.Status(
+                background_task_id=task_id, status="Processing", file_ref="x", result_type="polars"
+            )
+        try:
+            had_error = await _monitor_progress(websocket, p, progress, error_message, task_id)
+            p.join(timeout=5)
+            assert had_error is True
+            with status_dict_lock:
+                assert status_dict[task_id].status == "Error"
+            err_frames = [
+                c.args[0]
+                for c in websocket.send_json.call_args_list
+                if c.args and c.args[0].get("type") == "error"
+            ]
+            assert err_frames and "time limit" in err_frames[-1]["error_message"]
+            assert err_frames[-1]["error_kind"] == "environment"
+            assert not p.is_alive(), "wedged child should have been terminated"
+        finally:
+            if p.is_alive():
+                p.terminate()
+                p.join()
+            with status_dict_lock:
+                status_dict.pop(task_id, None)
+
+
+class TestWsHeartbeat:
+    """_monitor_progress must re-send progress periodically even when the value
+    is unchanged: core treats these frames as liveness heartbeats and aborts
+    the receive after prolonged silence (FLOWFILE_WORKER_WS_TIMEOUT)."""
+
+    @pytest.mark.asyncio
+    async def test_unchanged_progress_still_heartbeats(self, monkeypatch):
+        monkeypatch.setattr("flowfile_worker.streaming._HEARTBEAT_INTERVAL", 0.05)
+        # Let the monitor exit via the task deadline after several heartbeats.
+        monkeypatch.setattr("flowfile_worker.streaming._TASK_TIMEOUT", 0.5)
+        task_id = "test-ws-heartbeat"
+        progress = mp_context.Value("i", 0)  # never advances
+        error_message = mp_context.Array("c", 1024)
+        p = mp_context.Process(target=time.sleep, args=(30,))
+        p.start()
+        websocket = AsyncMock()
+        with status_dict_lock:
+            status_dict[task_id] = models.Status(
+                background_task_id=task_id, status="Processing", file_ref="x", result_type="polars"
+            )
+        try:
+            await _monitor_progress(websocket, p, progress, error_message, task_id)
+            progress_frames = [
+                c.args[0]
+                for c in websocket.send_json.call_args_list
+                if c.args and c.args[0].get("type") == "progress"
+            ]
+            # Initial send plus repeated heartbeats despite the value never changing.
+            assert len(progress_frames) >= 3, f"expected heartbeats, got {len(progress_frames)} progress frame(s)"
+            assert all(f["progress"] == 0 for f in progress_frames)
+        finally:
+            if p.is_alive():
+                p.terminate()
+                p.join()
+            with status_dict_lock:
+                status_dict.pop(task_id, None)

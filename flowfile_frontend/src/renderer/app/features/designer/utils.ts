@@ -1,59 +1,83 @@
-import axios from "axios";
 import { NodeTemplate } from "./types";
 import { flowfileCorebaseURL } from "../../../config/constants";
+import { fetchNodeTemplates } from "../../composables/useNodes";
 
-// List of built-in icons that are bundled with the app
-const BUILTIN_ICONS = new Set([
-  "Output2.png",
-  "airbyte.png",
-  "cloud_storage_reader.png",
-  "cloud_storage_writer.png",
-  "cross_join.png",
+// First-party node glyphs. Built-in nodes reference these .svg names directly
+// (configs/node_store/nodes.py image="<name>"); SVG renders crisply in-app.
+const SVG_NODE_ICONS = [
+  "api_response.svg",
+  "apply_model.svg",
   "catalog_reader.svg",
   "catalog_writer.svg",
-  "kafka_source.svg",
-  "google_analytics.svg",
+  "cloud_storage_reader.svg",
+  "cloud_storage_writer.svg",
+  "cross_join.svg",
+  "data_cleansing.svg",
   "database_reader.svg",
   "database_writer.svg",
   "dynamic_rename.svg",
-  "explore_data.png",
-  "external_source.png",
-  "filter.png",
-  "formula.png",
-  "fuzzy_match.png",
-  "google_sheet.png",
-  "graph_solver.png",
-  "group_by.png",
-  "input_data.png",
-  "join.png",
-  "manual_input.png",
-  "old_join.png",
-  "output.png",
-  "pivot.png",
-  "polars_code.png",
-  "python_code.svg",
-  "sql_query.svg",
-  "record_count.png",
-  "record_id.png",
-  "random_split.svg",
-  "sample.png",
-  "select.png",
-  "sort.png",
-  "summarize.png",
-  "text_to_rows.png",
-  "union.png",
-  "unique.png",
-  "unpivot.png",
-  "user-defined-icon.png",
-  "view.png",
-  "train_model.svg",
-  "apply_model.svg",
   "evaluate_model.svg",
+  "explode_hierarchy.svg",
+  "explore_data.svg",
+  "external_source.svg",
+  "filter.svg",
+  "flow_input.svg",
+  "flow_output.svg",
+  "formula.svg",
+  "fuzzy_match.svg",
+  "gate.svg",
+  "google_analytics.svg",
+  "graph_solver.svg",
+  "group_by.svg",
+  "input_data.svg",
+  "join.svg",
+  "kafka_source.svg",
+  "list_files.svg",
+  "manual_input.svg",
+  "multi_field_formula.svg",
+  "output.svg",
+  "pivot.svg",
+  "polars_code.svg",
+  "python_code.svg",
+  "random_split.svg",
+  "record_count.svg",
+  "record_id.svg",
+  "rest_api_reader.svg",
+  "run_flow.svg",
+  "sample.svg",
+  "select.svg",
+  "sort.svg",
+  "sql_query.svg",
+  "text_to_rows.svg",
+  "train_model.svg",
+  "union.svg",
+  "unique.svg",
+  "unpivot.svg",
   "wait_for.svg",
-]);
+  "window_functions.svg",
+];
 
-// Default fallback icon
-const DEFAULT_ICON = "user-defined-icon.png";
+// Brand/connector marks aren't offered as generic operation glyphs.
+const NON_STANDARD_SVG = new Set(["google_analytics.svg", "kafka_source.svg"]);
+
+const DEFAULT_ICON = "user-defined-icon.png"; // persisted contract key (state.py / codegen)
+const DEFAULT_ICON_ASSET = "user-defined-icon.svg"; // bundled artwork for that key
+
+// Standard glyphs offered to custom-node authors. These render as SVG in-app like
+// every other node; the community store requires PNG, but that conversion is
+// backend-only — publish.py maps a picked glyph to its bundled PNG twin in
+// flowfile_core/.../community_nodes/standard_icons/. No PNG ships in this bundle.
+export const STANDARD_NODE_ICONS: string[] = SVG_NODE_ICONS.filter(
+  (name) => !NON_STANDARD_SVG.has(name),
+).sort();
+
+const BUILTIN_ICONS = new Set<string>([
+  "airbyte.png",
+  "google_sheet.png",
+  "view.png",
+  DEFAULT_ICON,
+  ...SVG_NODE_ICONS,
+]);
 
 /**
  * Check if an icon is a built-in icon
@@ -67,16 +91,14 @@ export const isBuiltinIcon = (name: string): boolean => {
  * Returns a static asset URL for built-in icons, or an API URL for custom icons
  */
 export const getImageUrl = (name: string): string => {
-  if (!name) {
-    return new URL(`./assets/icons/${DEFAULT_ICON}`, import.meta.url).href;
+  if (!name || name === DEFAULT_ICON) {
+    return new URL(`./assets/icons/${DEFAULT_ICON_ASSET}`, import.meta.url).href;
   }
 
-  // If it's a built-in icon, use the static asset
   if (isBuiltinIcon(name)) {
     return new URL(`./assets/icons/${name}`, import.meta.url).href;
   }
 
-  // Otherwise, it's a custom icon served from the backend API (use full URL)
   return `${flowfileCorebaseURL}user_defined_components/icon/${name}`;
 };
 
@@ -84,7 +106,7 @@ export const getImageUrl = (name: string): string => {
  * Get the URL for the default fallback icon
  */
 export const getDefaultIconUrl = (): string => {
-  return new URL(`./assets/icons/${DEFAULT_ICON}`, import.meta.url).href;
+  return new URL(`./assets/icons/${DEFAULT_ICON_ASSET}`, import.meta.url).href;
 };
 
 /**
@@ -94,8 +116,4 @@ export const getCustomIconUrl = (name: string): string => {
   return `${flowfileCorebaseURL}user_defined_components/icon/${name}`;
 };
 
-export const fetchNodes = async (): Promise<NodeTemplate[]> => {
-  const response = await axios.get("/node_list");
-  const listNodes = response.data as NodeTemplate[];
-  return listNodes;
-};
+export const fetchNodes = async (): Promise<NodeTemplate[]> => fetchNodeTemplates();

@@ -6,23 +6,33 @@ Defines a ``CatalogRepository`` :pep:`544` Protocol and provides a concrete
 
 from __future__ import annotations
 
+from collections.abc import Collection
+from datetime import datetime, timedelta
 from typing import Protocol, runtime_checkable
 
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
+from flowfile_core.auth import sharing
 from flowfile_core.database.models import (
+    ApiConsumer,
+    ApiConsumerEndpoint,
+    CatalogCdcCursor,
     CatalogDashboard,
     CatalogNamespace,
+    CatalogNotebook,
     CatalogTable,
     CatalogTableReadLink,
     CatalogVisualization,
+    FlowApiEndpoint,
+    FlowApiKey,
     FlowFavorite,
     FlowFollow,
     FlowRegistration,
     FlowRun,
     FlowSchedule,
     GlobalArtifact,
+    NotificationRule,
     RunType,
     ScheduleTriggerTable,
     TableFavorite,
@@ -61,13 +71,23 @@ class CatalogRepository(Protocol):
 
     def count_children(self, namespace_id: int) -> int: ...
 
+    def get_root_namespace(self, namespace_id: int) -> CatalogNamespace | None: ...
+
+    def count_physical_tables_under_namespace(self, namespace_id: int) -> int: ...
+
     # -- Flow registration operations ----------------------------------------
 
     def get_flow(self, registration_id: int) -> FlowRegistration | None: ...
 
     def get_flow_by_name(self, name: str, namespace_id: int) -> FlowRegistration | None: ...
 
+    def get_flow_by_uuid(self, flow_uuid: str) -> FlowRegistration | None: ...
+
+    def list_flows_by_name(self, name: str, namespace_id: int | None = None) -> list[FlowRegistration]: ...
+
     def get_flow_by_path(self, flow_path: str) -> FlowRegistration | None: ...
+
+    def count_flows_by_path(self, flow_path: str) -> int: ...
 
     def list_flows(
         self,
@@ -90,6 +110,8 @@ class CatalogRepository(Protocol):
     # -- Artifact operations -------------------------------------------------
 
     def list_artifacts_for_namespace(self, namespace_id: int) -> list[GlobalArtifact]: ...
+
+    def artifact_version_counts_for_namespace(self, namespace_id: int) -> dict[str, int]: ...
 
     def list_artifacts_for_flow(self, registration_id: int) -> list[GlobalArtifact]: ...
 
@@ -164,6 +186,8 @@ class CatalogRepository(Protocol):
 
     def get_table(self, table_id: int) -> CatalogTable | None: ...
 
+    def get_table_fresh(self, table_id: int) -> CatalogTable | None: ...
+
     def get_table_by_name(self, name: str, namespace_id: int | None) -> CatalogTable | None: ...
 
     def list_tables_by_name(self, name: str) -> list[CatalogTable]: ...
@@ -177,6 +201,29 @@ class CatalogRepository(Protocol):
     def update_table(self, table: CatalogTable) -> CatalogTable: ...
 
     def delete_table(self, table_id: int) -> None: ...
+
+    def set_cdc_enabled(self, table_id: int, enabled_version: int | None) -> CatalogTable | None: ...
+
+    def get_cdc_cursor(self, table_id: int, consumer_key: str) -> CatalogCdcCursor | None: ...
+
+    def list_cdc_cursors(self, table_id: int) -> list[CatalogCdcCursor]: ...
+
+    def upsert_cdc_cursor(
+        self,
+        table_id: int,
+        consumer_key: str,
+        last_version: int,
+        *,
+        last_commit_timestamp: datetime | None = None,
+        owner_id: int | None = None,
+        consumer_label: str | None = None,
+        table_path: str | None = None,
+        last_run_id: int | None = None,
+    ) -> CatalogCdcCursor: ...
+
+    def reset_cdc_cursor(self, table_id: int, consumer_key: str, last_version: int) -> CatalogCdcCursor | None: ...
+
+    def delete_cdc_cursor(self, table_id: int, consumer_key: str) -> bool: ...
 
     def count_tables_in_namespace(self, namespace_id: int) -> int: ...
 
@@ -220,7 +267,7 @@ class CatalogRepository(Protocol):
 
     def bulk_get_tables_for_flows(self, flow_ids: list[int]) -> dict[int, list[CatalogTable]]: ...
 
-    def upsert_read_link(self, table_id: int, registration_id: int) -> None: ...
+    def replace_read_links(self, registration_id: int, table_ids: Collection[int]) -> None: ...
 
     def list_readers_for_table(self, table_id: int) -> list[FlowRegistration]: ...
 
@@ -268,6 +315,10 @@ class CatalogRepository(Protocol):
 
     def update_visualization(self, viz: CatalogVisualization) -> CatalogVisualization: ...
 
+    def stamp_visualization_updated_at(
+        self, viz_id: int, expected: datetime | None, stamp: datetime
+    ) -> bool: ...
+
     def delete_visualization(self, viz_id: int) -> None: ...
 
     # -- Dashboards ----------------------------------------------------------
@@ -280,7 +331,25 @@ class CatalogRepository(Protocol):
 
     def update_dashboard(self, dashboard: CatalogDashboard) -> CatalogDashboard: ...
 
+    def bump_dashboard_layout_version(self, dashboard_id: int, expected: int | None) -> bool: ...
+
     def delete_dashboard(self, dashboard_id: int) -> None: ...
+
+    # -- Notebooks -----------------------------------------------------------
+
+    def list_notebooks(self) -> list[CatalogNotebook]: ...
+
+    def get_notebook(self, notebook_id: int) -> CatalogNotebook | None: ...
+
+    def get_notebook_by_name(self, namespace_id: int | None, name: str) -> CatalogNotebook | None: ...
+
+    def create_notebook(self, notebook: CatalogNotebook) -> CatalogNotebook: ...
+
+    def update_notebook(self, notebook: CatalogNotebook) -> CatalogNotebook: ...
+
+    def delete_notebook(self, notebook_id: int) -> None: ...
+
+    def count_notebooks_in_namespace(self, namespace_id: int) -> int: ...
 
     def list_table_trigger_schedules(self) -> list[FlowSchedule]: ...
 
@@ -309,8 +378,21 @@ class SQLAlchemyCatalogRepository:
     def get_namespace(self, namespace_id: int) -> CatalogNamespace | None:
         return self._db.get(CatalogNamespace, namespace_id)
 
-    def get_namespace_by_name(self, name: str, parent_id: int | None) -> CatalogNamespace | None:
-        return self._db.query(CatalogNamespace).filter_by(name=name, parent_id=parent_id).first()
+    def get_namespace_by_name(
+        self, name: str, parent_id: int | None, owner_id: int | None = None, include_public: bool = False
+    ) -> CatalogNamespace | None:
+        """Resolve a namespace by (name, parent). With ``owner_id`` the lookup is owner-scoped (a row
+        owned by another user is invisible). When ``include_public`` is also set and the owner has no
+        such row, fall back to an existing ``is_public=True`` row of that name/parent owned by anyone
+        (the seeded ``General``/``default``/... system namespaces) so a non-seed user importing a
+        project can resolve the public namespace for READ/placement — the caller must never mutate it."""
+        q = self._db.query(CatalogNamespace).filter_by(name=name, parent_id=parent_id)
+        if owner_id is not None:
+            owned = q.filter(CatalogNamespace.owner_id == owner_id).first()
+            if owned is not None or not include_public:
+                return owned
+            return q.filter(CatalogNamespace.is_public.is_(True)).first()
+        return q.first()
 
     def list_namespaces(self, parent_id: int | None = None) -> list[CatalogNamespace]:
         q = self._db.query(CatalogNamespace)
@@ -345,11 +427,32 @@ class SQLAlchemyCatalogRepository:
     def delete_namespace(self, namespace_id: int) -> None:
         ns = self._db.get(CatalogNamespace, namespace_id)
         if ns is not None:
+            sharing.delete_grants_for_resource(self._db, "catalog_namespace", namespace_id)
             self._db.delete(ns)
             self._db.commit()
 
     def count_children(self, namespace_id: int) -> int:
         return self._db.query(CatalogNamespace).filter_by(parent_id=namespace_id).count()
+
+    def get_root_namespace(self, namespace_id: int) -> CatalogNamespace | None:
+        """Walk parent links to the level-0 catalog (returns the row itself when already a root)."""
+        ns = self._db.get(CatalogNamespace, namespace_id)
+        seen: set[int] = set()
+        while ns is not None and ns.parent_id is not None and ns.id not in seen:
+            seen.add(ns.id)
+            ns = self._db.get(CatalogNamespace, ns.parent_id)
+        return ns
+
+    def count_physical_tables_under_namespace(self, namespace_id: int) -> int:
+        """Count physical tables in a catalog and its child schemas (storage-immutability check)."""
+        # Catalog hierarchy is capped at depth 1 (catalog -> schema); grandchildren are not possible.
+        child_ids = [r[0] for r in self._db.query(CatalogNamespace.id).filter_by(parent_id=namespace_id).all()]
+        ids = [namespace_id, *child_ids]
+        return (
+            self._db.query(CatalogTable)
+            .filter(CatalogTable.namespace_id.in_(ids), CatalogTable.table_type == "physical")
+            .count()
+        )
 
     # -- Flow registration operations ----------------------------------------
 
@@ -359,8 +462,24 @@ class SQLAlchemyCatalogRepository:
     def get_flow_by_name(self, name: str, namespace_id: int) -> FlowRegistration | None:
         return self._db.query(FlowRegistration).filter_by(name=name, namespace_id=namespace_id).first()
 
+    def get_flow_by_uuid(self, flow_uuid: str) -> FlowRegistration | None:
+        return self._db.query(FlowRegistration).filter_by(flow_uuid=flow_uuid).first()
+
+    def list_flows_by_name(self, name: str, namespace_id: int | None = None) -> list[FlowRegistration]:
+        """Every registration called ``name`` (optionally in one namespace), lowest id first.
+
+        ``(name, namespace_id)`` is not unique, so callers must treat more than one row as ambiguous.
+        """
+        q = self._db.query(FlowRegistration).filter_by(name=name)
+        if namespace_id is not None:
+            q = q.filter_by(namespace_id=namespace_id)
+        return q.order_by(FlowRegistration.id).all()
+
     def get_flow_by_path(self, flow_path: str) -> FlowRegistration | None:
         return self._db.query(FlowRegistration).filter_by(flow_path=flow_path).first()
+
+    def count_flows_by_path(self, flow_path: str) -> int:
+        return self._db.query(FlowRegistration).filter_by(flow_path=flow_path).count()
 
     def list_flows(
         self,
@@ -391,9 +510,80 @@ class SQLAlchemyCatalogRepository:
         return reg
 
     def delete_flow(self, registration_id: int) -> None:
-        # Clean up related records first
         self._db.query(FlowFavorite).filter_by(registration_id=registration_id).delete()
         self._db.query(FlowFollow).filter_by(registration_id=registration_id).delete()
+        # Read-lineage links don't cascade either; a stale one would attribute this
+        # flow's reads to whichever future registration reuses the SQLite rowid.
+        self._db.query(CatalogTableReadLink).filter_by(registration_id=registration_id).delete()
+        # Schedules don't FK-cascade; a flow can't have schedules without the flow, so drop them
+        # (and their trigger-table links) — otherwise they'd be orphaned on the flow's deletion.
+        schedule_ids = [
+            row[0] for row in self._db.query(FlowSchedule.id).filter_by(registration_id=registration_id).all()
+        ]
+        if schedule_ids:
+            self._db.query(ScheduleTriggerTable).filter(ScheduleTriggerTable.schedule_id.in_(schedule_ids)).delete(
+                synchronize_session=False
+            )
+            self._db.query(NotificationRule).filter(NotificationRule.schedule_id.in_(schedule_ids)).delete(
+                synchronize_session=False
+            )
+            self._db.query(FlowSchedule).filter(FlowSchedule.registration_id == registration_id).delete(
+                synchronize_session=False
+            )
+        # Notification rules scoped to this flow don't cascade either; a stale rule would
+        # alert the old owner's webhook about whichever future flow reuses the rowid.
+        self._db.query(NotificationRule).filter(NotificationRule.registration_id == registration_id).delete(
+            synchronize_session=False
+        )
+        # Remove published API endpoints and their keys. SQLite FK enforcement is
+        # off so these don't cascade: a leftover key would stay enabled (a real
+        # revocation gap) and the unique slug would stay occupied, blocking
+        # republish. Delete keys first (they reference the endpoint), then endpoints.
+        endpoint_ids = [
+            row[0]
+            for row in self._db.query(FlowApiEndpoint.id)
+            .filter(FlowApiEndpoint.registration_id == registration_id)
+            .all()
+        ]
+        if endpoint_ids:
+            # Implicit (per-endpoint) consumers granted only to these endpoints are
+            # garbage-collected; shared consumers just lose the grant (their keys have
+            # a NULL endpoint_id and survive). Same explicit-delete reasoning: SQLite
+            # FK enforcement is off, so grants/keys/consumers don't cascade on their own.
+            granted_consumer_ids = [
+                row[0]
+                for row in self._db.query(ApiConsumerEndpoint.consumer_id)
+                .filter(ApiConsumerEndpoint.endpoint_id.in_(endpoint_ids))
+                .distinct()
+                .all()
+            ]
+            self._db.query(ApiConsumerEndpoint).filter(ApiConsumerEndpoint.endpoint_id.in_(endpoint_ids)).delete(
+                synchronize_session=False
+            )
+            self._db.query(FlowApiKey).filter(FlowApiKey.endpoint_id.in_(endpoint_ids)).delete(
+                synchronize_session=False
+            )
+            self._db.query(FlowApiEndpoint).filter(FlowApiEndpoint.id.in_(endpoint_ids)).delete(
+                synchronize_session=False
+            )
+            if granted_consumer_ids:
+                orphan_implicit_ids = [
+                    row[0]
+                    for row in self._db.query(ApiConsumer.id)
+                    .filter(
+                        ApiConsumer.id.in_(granted_consumer_ids),
+                        ApiConsumer.is_implicit.is_(True),
+                        ~ApiConsumer.id.in_(self._db.query(ApiConsumerEndpoint.consumer_id)),
+                    )
+                    .all()
+                ]
+                if orphan_implicit_ids:
+                    self._db.query(FlowApiKey).filter(FlowApiKey.consumer_id.in_(orphan_implicit_ids)).delete(
+                        synchronize_session=False
+                    )
+                    self._db.query(ApiConsumer).filter(ApiConsumer.id.in_(orphan_implicit_ids)).delete(
+                        synchronize_session=False
+                    )
         # Hard-delete any soft-deleted artifacts referencing this flow
         self._db.query(GlobalArtifact).filter_by(
             source_registration_id=registration_id,
@@ -405,6 +595,9 @@ class SQLAlchemyCatalogRepository:
         self._db.query(FlowRun).filter_by(registration_id=registration_id).update(
             {"registration_id": None}, synchronize_session=False
         )
+        # Drop sharing grants on this flow (SQLite reuses rowids; a stale grant
+        # would otherwise attach to a future flow created with the same id).
+        sharing.delete_grants_for_resource(self._db, "flow", registration_id)
         flow = self._db.get(FlowRegistration, registration_id)
         if flow is not None:
             self._db.delete(flow)
@@ -419,9 +612,7 @@ class SQLAlchemyCatalogRepository:
         makes the equality unsatisfiable — no rows match, no explicit guard
         needed at call sites.
         """
-        uuid_subq = (
-            self._db.query(FlowRegistration.flow_uuid).filter_by(id=registration_id).scalar_subquery()
-        )
+        uuid_subq = self._db.query(FlowRegistration.flow_uuid).filter_by(id=registration_id).scalar_subquery()
         return FlowRun.flow_uuid == uuid_subq
 
     def _apply_run_filters(
@@ -431,6 +622,7 @@ class SQLAlchemyCatalogRepository:
         registration_id: int | None = None,
         schedule_id: int | None = None,
         run_type: RunType | None = None,
+        search: str | None = None,
     ):
         """Apply the standard run filters to a FlowRun query."""
         if registration_id is not None:
@@ -439,6 +631,8 @@ class SQLAlchemyCatalogRepository:
             q = q.filter(FlowRun.schedule_id == schedule_id)
         if run_type is not None:
             q = q.filter(FlowRun.run_type == run_type)
+        if search:
+            q = q.filter(FlowRun.flow_name.ilike(f"%{search}%"))
         return q
 
     def count_flows_in_namespace(self, namespace_id: int) -> int:
@@ -455,14 +649,38 @@ class SQLAlchemyCatalogRepository:
     # -- Artifact operations -------------------------------------------------
 
     def list_artifacts_for_namespace(self, namespace_id: int) -> list[GlobalArtifact]:
-        """List active artifacts belonging to a namespace."""
-        return (
+        """One row per artifact name in a namespace: its latest active version.
+
+        An artifact with no active version falls back to its newest non-deleted row so
+        a failed or pending publish stays visible (flagged unavailable) instead of
+        vanishing from the tree.
+        """
+        rows = (
             self._db.query(GlobalArtifact)
             .filter_by(namespace_id=namespace_id)
             .filter(GlobalArtifact.status != "deleted")
             .order_by(GlobalArtifact.name, GlobalArtifact.version.desc())
             .all()
         )
+        latest: dict[str, GlobalArtifact] = {}
+        for row in rows:
+            current = latest.get(row.name)
+            if current is None or (current.status != "active" and row.status == "active"):
+                latest[row.name] = row
+        return list(latest.values())
+
+    def artifact_version_counts_for_namespace(self, namespace_id: int) -> dict[str, int]:
+        """name -> version count in a namespace: active versions, or the non-deleted group
+        size when an artifact has none (a failed publish's rows still count as versions)."""
+        active = func.sum(case((GlobalArtifact.status == "active", 1), else_=0))
+        rows = (
+            self._db.query(GlobalArtifact.name, active, func.count(GlobalArtifact.id))
+            .filter_by(namespace_id=namespace_id)
+            .filter(GlobalArtifact.status != "deleted")
+            .group_by(GlobalArtifact.name)
+            .all()
+        )
+        return {name: (active_count or group_size) for name, active_count, group_size in rows}
 
     def list_artifacts_for_flow(self, registration_id: int) -> list[GlobalArtifact]:
         """List active artifacts produced by a specific flow."""
@@ -512,12 +730,14 @@ class SQLAlchemyCatalogRepository:
         run_type: RunType | None = None,
         limit: int = 50,
         offset: int = 0,
+        search: str | None = None,
     ) -> list[FlowRun]:
         q = self._apply_run_filters(
             self._db.query(FlowRun),
             registration_id=registration_id,
             schedule_id=schedule_id,
             run_type=run_type,
+            search=search,
         )
         return q.order_by(FlowRun.started_at.desc()).offset(offset).limit(limit).all()
 
@@ -550,6 +770,7 @@ class SQLAlchemyCatalogRepository:
         registration_id: int | None = None,
         schedule_id: int | None = None,
         run_type: RunType | None = None,
+        search: str | None = None,
     ) -> dict[str, int]:
         from sqlalchemy import case, func
 
@@ -563,6 +784,7 @@ class SQLAlchemyCatalogRepository:
             registration_id=registration_id,
             schedule_id=schedule_id,
             run_type=run_type,
+            search=search,
         )
         row = q.one()
         return {"total": row.total, "success": row.success, "failed": row.failed, "running": row.running}
@@ -634,8 +856,22 @@ class SQLAlchemyCatalogRepository:
     def get_table(self, table_id: int) -> CatalogTable | None:
         return self._db.get(CatalogTable, table_id)
 
-    def get_table_by_name(self, name: str, namespace_id: int | None) -> CatalogTable | None:
-        return self._db.query(CatalogTable).filter_by(name=name, namespace_id=namespace_id).first()
+    def get_table_fresh(self, table_id: int) -> CatalogTable | None:
+        """Re-read the row from the DB, bypassing the session identity map.
+
+        Virtual-table resolution re-stamps ``source_table_versions`` in a
+        separate session; a plain ``get`` here would return the stale
+        pre-resolution attributes.
+        """
+        return self._db.get(CatalogTable, table_id, populate_existing=True)
+
+    def get_table_by_name(
+        self, name: str, namespace_id: int | None, owner_id: int | None = None
+    ) -> CatalogTable | None:
+        q = self._db.query(CatalogTable).filter_by(name=name, namespace_id=namespace_id)
+        if owner_id is not None:
+            q = q.filter(CatalogTable.owner_id == owner_id)
+        return q.first()
 
     def list_tables_by_name(self, name: str) -> list[CatalogTable]:
         return (
@@ -666,13 +902,116 @@ class SQLAlchemyCatalogRepository:
         return table
 
     def delete_table(self, table_id: int) -> None:
+        """Delete a table row with its read links, favourites, change cursors, visualizations,
+        grants and ``prediction_table_id`` references, in one transaction. Schedule trigger rows
+        are cleaned per-schedule elsewhere and are deliberately not touched here.
+
+        ``prediction_table_id`` has no DB-level FK, so surviving references are nulled in this
+        same transaction rather than by a follow-up commit: SQLite reuses rowids, so a reference
+        that outlived the delete would later resolve to an unrelated table.
+        """
         self._db.query(CatalogTableReadLink).filter_by(table_id=table_id).delete()
         self._db.query(TableFavorite).filter_by(table_id=table_id).delete()
+        self._db.query(CatalogCdcCursor).filter_by(table_id=table_id).delete()
+        # Drop grants on the table's visualizations before the bulk delete (this is a
+        # second viz-delete path that bypasses delete_visualization).
+        viz_ids = [row[0] for row in self._db.query(CatalogVisualization.id).filter_by(catalog_table_id=table_id)]
+        for viz_id in viz_ids:
+            sharing.delete_grants_for_resource(self._db, "visualization", viz_id)
         self._db.query(CatalogVisualization).filter_by(catalog_table_id=table_id).delete()
+        sharing.delete_grants_for_resource(self._db, "catalog_table", table_id)
+        # Self-assigning updated_at keeps it in the SET clause, suppressing onupdate — losing a
+        # prediction reference is not a data change and must not fire table-trigger schedules.
+        self._db.query(CatalogTable).filter(CatalogTable.prediction_table_id == table_id).update(
+            {CatalogTable.prediction_table_id: None, CatalogTable.updated_at: CatalogTable.updated_at},
+            synchronize_session=False,
+        )
         table = self._db.get(CatalogTable, table_id)
         if table is not None:
             self._db.delete(table)
-            self._db.commit()
+        self._db.commit()
+
+    # -- Change tracking (CDC) -----------------------------------------------
+
+    def set_cdc_enabled(self, table_id: int, enabled_version: int | None) -> CatalogTable | None:
+        """Mark a table as change-tracked, recording *enabled_version* as the cursor floor.
+
+        An already-recorded floor is kept: it is the version the feed genuinely became readable
+        at, while a later call reports whatever head happens to be by then.
+        """
+        table = self._db.get(CatalogTable, table_id)
+        if table is None:
+            return None
+        # Self-assigning updated_at suppresses onupdate — enabling tracking is not a data change
+        # and must not fire table-trigger schedules.
+        values = {CatalogTable.cdc_enabled: True, CatalogTable.updated_at: CatalogTable.updated_at}
+        if table.cdc_enabled_version is None and enabled_version is not None:
+            values[CatalogTable.cdc_enabled_version] = enabled_version
+        self._db.query(CatalogTable).filter(CatalogTable.id == table_id).update(values, synchronize_session=False)
+        self._db.commit()
+        self._db.refresh(table)
+        return table
+
+    def get_cdc_cursor(self, table_id: int, consumer_key: str) -> CatalogCdcCursor | None:
+        return self._db.query(CatalogCdcCursor).filter_by(table_id=table_id, consumer_key=consumer_key).first()
+
+    def list_cdc_cursors(self, table_id: int) -> list[CatalogCdcCursor]:
+        q = self._db.query(CatalogCdcCursor).filter_by(table_id=table_id)
+        return q.order_by(CatalogCdcCursor.consumer_key).all()
+
+    def upsert_cdc_cursor(
+        self,
+        table_id: int,
+        consumer_key: str,
+        last_version: int,
+        *,
+        last_commit_timestamp: datetime | None = None,
+        owner_id: int | None = None,
+        consumer_label: str | None = None,
+        table_path: str | None = None,
+        last_run_id: int | None = None,
+    ) -> CatalogCdcCursor:
+        """Create or advance the cursor for ``(table_id, consumer_key)``.
+
+        Every field but ``last_version`` is descriptive; ``None`` leaves an existing value alone
+        so a run that cannot resolve a label does not erase one recorded earlier.
+        """
+        cursor = self.get_cdc_cursor(table_id, consumer_key)
+        if cursor is None:
+            cursor = CatalogCdcCursor(table_id=table_id, consumer_key=consumer_key, last_version=last_version)
+            self._db.add(cursor)
+        else:
+            cursor.last_version = last_version
+        if last_commit_timestamp is not None:
+            cursor.last_commit_timestamp = last_commit_timestamp
+        if owner_id is not None:
+            cursor.owner_id = owner_id
+        if consumer_label is not None:
+            cursor.consumer_label = consumer_label
+        if table_path is not None:
+            cursor.table_path = table_path
+        if last_run_id is not None:
+            cursor.last_run_id = last_run_id
+        cursor.updated_at = datetime.now()
+        self._db.commit()
+        self._db.refresh(cursor)
+        return cursor
+
+    def reset_cdc_cursor(self, table_id: int, consumer_key: str, last_version: int) -> CatalogCdcCursor | None:
+        """Move an existing cursor to *last_version*. Returns ``None`` when it does not exist."""
+        cursor = self.get_cdc_cursor(table_id, consumer_key)
+        if cursor is None:
+            return None
+        cursor.last_version = last_version
+        cursor.updated_at = datetime.now()
+        self._db.commit()
+        self._db.refresh(cursor)
+        return cursor
+
+    def delete_cdc_cursor(self, table_id: int, consumer_key: str) -> bool:
+        deleted = self._db.query(CatalogCdcCursor).filter_by(table_id=table_id, consumer_key=consumer_key).delete()
+        self._db.commit()
+        return bool(deleted)
 
     def count_tables_in_namespace(self, namespace_id: int) -> int:
         return self._db.query(CatalogTable).filter_by(namespace_id=namespace_id).count()
@@ -786,7 +1125,6 @@ class SQLAlchemyCatalogRepository:
         if not uuids:
             return {fid: (0, None) for fid in flow_ids}
 
-        # Query 1: counts per flow_uuid
         count_rows = (
             self._db.query(FlowRun.flow_uuid, func.count(FlowRun.id).label("cnt"))
             .filter(FlowRun.flow_uuid.in_(uuids))
@@ -795,7 +1133,6 @@ class SQLAlchemyCatalogRepository:
         )
         counts = {uuid: cnt for uuid, cnt in count_rows}
 
-        # Query 2: last run per flow_uuid using a subquery for max started_at
         subq = (
             self._db.query(
                 FlowRun.flow_uuid,
@@ -845,13 +1182,23 @@ class SQLAlchemyCatalogRepository:
             result.setdefault(table.source_registration_id, []).append(table)
         return result
 
-    def upsert_read_link(self, table_id: int, registration_id: int) -> None:
-        """Record that a flow reads from a catalog table (idempotent)."""
-        existing = (
-            self._db.query(CatalogTableReadLink).filter_by(table_id=table_id, registration_id=registration_id).first()
-        )
-        if not existing:
+    def replace_read_links(self, registration_id: int, table_ids: Collection[int]) -> None:
+        """Make a flow's read links exactly ``table_ids``.
+
+        Prunes links to tables the flow no longer reads and inserts the missing
+        ones, so a removed catalog_reader stops showing up as read lineage. An
+        empty collection drops every link for the registration.
+        """
+        wanted = set(table_ids)
+        links = self._db.query(CatalogTableReadLink).filter(CatalogTableReadLink.registration_id == registration_id)
+        existing = {link.table_id for link in links.all()}
+        stale = existing - wanted
+        missing = wanted - existing
+        if stale:
+            links.filter(CatalogTableReadLink.table_id.in_(stale)).delete(synchronize_session=False)
+        for table_id in missing:
             self._db.add(CatalogTableReadLink(table_id=table_id, registration_id=registration_id))
+        if stale or missing:
             self._db.commit()
 
     def list_readers_for_table(self, table_id: int) -> list[FlowRegistration]:
@@ -935,6 +1282,9 @@ class SQLAlchemyCatalogRepository:
 
     def delete_schedule(self, schedule_id: int) -> None:
         self._db.query(ScheduleTriggerTable).filter_by(schedule_id=schedule_id).delete()
+        # Rules scoped to this schedule die with it — a stale rule would alert the old
+        # owner's webhook about whichever future schedule reuses the SQLite rowid.
+        self._db.query(NotificationRule).filter_by(schedule_id=schedule_id).delete()
         schedule = self._db.get(FlowSchedule, schedule_id)
         if schedule is not None:
             self._db.delete(schedule)
@@ -1035,9 +1385,34 @@ class SQLAlchemyCatalogRepository:
         self._db.refresh(viz)
         return viz
 
+    def stamp_visualization_updated_at(
+        self, viz_id: int, expected: datetime | None, stamp: datetime
+    ) -> bool:
+        """Atomic CAS guard: stamp updated_at iff it still equals ``expected``.
+
+        Runs as a conditional UPDATE so two concurrent writers cannot both pass
+        the check; rowcount 0 means the token went stale (or the row vanished).
+        Uncommitted — the caller's normal commit/rollback settles it.
+        """
+        q = self._db.query(CatalogVisualization).filter(CatalogVisualization.id == viz_id)
+        if expected is not None:
+            if expected.microsecond:
+                q = q.filter(CatalogVisualization.updated_at == expected)
+            else:
+                # Legacy CURRENT_TIMESTAMP rows store no fractional part; match the second.
+                low = expected.strftime("%Y-%m-%d %H:%M:%S")
+                high = (expected + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+                q = q.filter(
+                    CatalogVisualization.updated_at >= low,
+                    CatalogVisualization.updated_at < high,
+                )
+        rows = q.update({CatalogVisualization.updated_at: stamp}, synchronize_session=False)
+        return rows > 0
+
     def delete_visualization(self, viz_id: int) -> None:
         viz = self._db.get(CatalogVisualization, viz_id)
         if viz is not None:
+            sharing.delete_grants_for_resource(self._db, "visualization", viz_id)
             self._db.delete(viz)
             self._db.commit()
 
@@ -1060,8 +1435,57 @@ class SQLAlchemyCatalogRepository:
         self._db.refresh(dashboard)
         return dashboard
 
+    def bump_dashboard_layout_version(self, dashboard_id: int, expected: int | None) -> bool:
+        """Atomic CAS guard: increment the write counter iff it still equals ``expected``.
+
+        Conditional UPDATE so two concurrent writers cannot both pass; rowcount 0
+        means a stale token (or, with no token, a concurrently deleted row).
+        Uncommitted — the caller's normal commit/rollback settles it.
+        """
+        q = self._db.query(CatalogDashboard).filter(CatalogDashboard.id == dashboard_id)
+        if expected is not None:
+            q = q.filter(func.coalesce(CatalogDashboard.layout_version, 1) == expected)
+        rows = q.update(
+            {CatalogDashboard.layout_version: func.coalesce(CatalogDashboard.layout_version, 1) + 1},
+            synchronize_session=False,
+        )
+        return rows > 0
+
     def delete_dashboard(self, dashboard_id: int) -> None:
         dashboard = self._db.get(CatalogDashboard, dashboard_id)
         if dashboard is not None:
+            sharing.delete_grants_for_resource(self._db, "dashboard", dashboard_id)
             self._db.delete(dashboard)
             self._db.commit()
+
+    # -- Notebooks -----------------------------------------------------------
+
+    def list_notebooks(self) -> list[CatalogNotebook]:
+        return self._db.query(CatalogNotebook).order_by(CatalogNotebook.updated_at.desc()).all()
+
+    def get_notebook(self, notebook_id: int) -> CatalogNotebook | None:
+        return self._db.get(CatalogNotebook, notebook_id)
+
+    def get_notebook_by_name(self, namespace_id: int | None, name: str) -> CatalogNotebook | None:
+        return self._db.query(CatalogNotebook).filter_by(namespace_id=namespace_id, name=name).first()
+
+    def create_notebook(self, notebook: CatalogNotebook) -> CatalogNotebook:
+        self._db.add(notebook)
+        self._db.commit()
+        self._db.refresh(notebook)
+        return notebook
+
+    def update_notebook(self, notebook: CatalogNotebook) -> CatalogNotebook:
+        self._db.commit()
+        self._db.refresh(notebook)
+        return notebook
+
+    def delete_notebook(self, notebook_id: int) -> None:
+        notebook = self._db.get(CatalogNotebook, notebook_id)
+        if notebook is not None:
+            sharing.delete_grants_for_resource(self._db, "catalog_notebook", notebook_id)
+            self._db.delete(notebook)
+            self._db.commit()
+
+    def count_notebooks_in_namespace(self, namespace_id: int) -> int:
+        return self._db.query(CatalogNotebook).filter_by(namespace_id=namespace_id).count()

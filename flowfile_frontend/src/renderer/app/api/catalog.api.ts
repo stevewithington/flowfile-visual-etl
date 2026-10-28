@@ -1,19 +1,32 @@
 // Catalog API Service - Handles all catalog-related HTTP requests
 import axios from "../services/axios.config";
+import type { AxiosRequestConfig } from "axios";
 import type {
   ActiveFlowRun,
+  ArtifactPruneResult,
+  ArtifactWithVersions,
   CatalogNamespace,
+  CatalogOverview,
   CatalogStats,
   CatalogTable,
   CatalogTableCreate,
+  CatalogTableEditsRequest,
+  CatalogTableEditsResponse,
+  CatalogTableKeyColumnRequest,
+  CatalogTableKeyColumnResponse,
   CatalogTablePreview,
   CatalogTableUpdate,
+  CdcCursor,
+  CdcCursorResetRequest,
+  CdcCursorResetTarget,
   ColumnStatsResponse,
   CatalogVisualization,
   Dashboard,
   DashboardCreatePayload,
   DashboardUpdatePayload,
   DeltaTableHistory,
+  FlowCode,
+  FlowCodeFormat,
   FlowRegistration,
   FlowRegistrationCreate,
   FlowRegistrationUpdate,
@@ -22,14 +35,24 @@ import type {
   FlowSchedule,
   FlowScheduleCreate,
   FlowScheduleUpdate,
+  CronValidationRequest,
+  CronValidationResult,
   GlobalArtifact,
   NamespaceCreate,
   NamespaceTree,
   NamespaceUpdate,
+  OptimizeTableRequest,
+  OptimizeTableResponse,
   PaginatedFlowRuns,
+  PromotedArtifactVersion,
   QueryVirtualTableCreate,
+  QueryVirtualTableUpdate,
   SchedulerStatus,
   SqlQueryResult,
+  SubflowInterface,
+  TableCdcStatus,
+  VacuumTableRequest,
+  VacuumTableResponse,
   VirtualFlowTableCreate,
   VirtualFlowTableUpdate,
   VisualizationComputeResponse,
@@ -38,6 +61,12 @@ import type {
   VisualizationUpdatePayload,
   VizSourceDescriptor,
 } from "../types";
+
+// A namespace-qualified artifact ref ("catalog.schema::name") already carries its
+// namespace, so namespace_id is only sent alongside a bare name.
+function artifactRefParams(ref: string, namespaceId: number | null): Record<string, any> {
+  return !ref.includes("::") && namespaceId !== null ? { namespace_id: namespaceId } : {};
+}
 
 export class CatalogApi {
   // ====== Namespaces ======
@@ -92,12 +121,37 @@ export class CatalogApi {
     return response.data;
   }
 
-  static async deleteFlow(id: number): Promise<void> {
-    await axios.delete(`/catalog/flows/${id}`);
+  static async deleteFlow(id: number, deleteFile = false): Promise<void> {
+    await axios.delete(`/catalog/flows/${id}`, { params: { delete_file: deleteFile } });
+  }
+
+  static async cleanupNamespaceFlows(
+    namespaceId: number,
+  ): Promise<{ deleted: number; kept: number }> {
+    const response = await axios.post<{ deleted: number; kept: number }>(
+      `/catalog/namespaces/${namespaceId}/cleanup_flows`,
+    );
+    return response.data;
   }
 
   static async runFlow(flowId: number): Promise<FlowRun> {
     const response = await axios.post<FlowRun>(`/catalog/flows/${flowId}/run`);
+    return response.data;
+  }
+
+  /** The registered flow as text (its file, its notebook cells, or a code export), read without opening it. */
+  static async getFlowCode(registrationId: number, format: FlowCodeFormat): Promise<FlowCode> {
+    const response = await axios.get<FlowCode>(`/catalog/flows/${registrationId}/code`, {
+      params: { format },
+    });
+    return response.data;
+  }
+
+  /** Subflow interface (flow_input/flow_output ports + typed parameters) for run_flow. */
+  static async getFlowInterface(registrationId: number): Promise<SubflowInterface> {
+    const response = await axios.get<SubflowInterface>(
+      `/catalog/flows/${registrationId}/interface`,
+    );
     return response.data;
   }
 
@@ -139,12 +193,14 @@ export class CatalogApi {
     offset = 0,
     scheduleId?: number | null,
     runType?: string | null,
+    search?: string | null,
   ): Promise<PaginatedFlowRuns> {
     const params: Record<string, any> = { limit, offset };
     if (registrationId !== undefined && registrationId !== null)
       params.registration_id = registrationId;
     if (scheduleId !== undefined && scheduleId !== null) params.schedule_id = scheduleId;
     if (runType) params.run_type = runType;
+    if (search) params.search = search;
     const response = await axios.get<PaginatedFlowRuns>("/catalog/runs", { params });
     return response.data;
   }
@@ -183,6 +239,56 @@ export class CatalogApi {
     return response.data;
   }
 
+  /** One artifact row by id — resolves links carrying a non-latest version's id. */
+  static async getArtifactById(
+    artifactId: number,
+  ): Promise<Pick<GlobalArtifact, "id" | "name" | "namespace_id">> {
+    const response = await axios.get<Pick<GlobalArtifact, "id" | "name" | "namespace_id">>(
+      `/artifacts/${artifactId}`,
+    );
+    return response.data;
+  }
+
+  /** One page of a model's version history, newest first. */
+  static async getArtifactVersions(
+    ref: string,
+    namespaceId: number | null,
+    limit = 25,
+    offset = 0,
+  ): Promise<ArtifactWithVersions> {
+    const response = await axios.get<ArtifactWithVersions>(
+      `/artifacts/by-name/${encodeURIComponent(ref)}/versions`,
+      { params: { limit, offset, ...artifactRefParams(ref, namespaceId) } },
+    );
+    return response.data;
+  }
+
+  /** Delete one version row. `force` overrides the latest-version guard. */
+  static async deleteArtifactVersion(artifactId: number, force = false): Promise<void> {
+    await axios.delete(`/artifacts/${artifactId}`, { params: { force } });
+  }
+
+  /** Copy an older version forward so it becomes the new latest version. */
+  static async promoteArtifactVersion(artifactId: number): Promise<PromotedArtifactVersion> {
+    const response = await axios.post<PromotedArtifactVersion>(`/artifacts/${artifactId}/promote`);
+    return response.data;
+  }
+
+  /** Keep the newest `keep` versions and drop the rest. `dryRun` deletes nothing. */
+  static async pruneArtifactVersions(
+    ref: string,
+    namespaceId: number | null,
+    keep: number,
+    dryRun: boolean,
+  ): Promise<ArtifactPruneResult> {
+    const response = await axios.post<ArtifactPruneResult>(
+      `/artifacts/by-name/${encodeURIComponent(ref)}/prune`,
+      null,
+      { params: { keep, dry_run: dryRun, ...artifactRefParams(ref, namespaceId) } },
+    );
+    return response.data;
+  }
+
   // ====== Table Favorites ======
 
   static async getTableFavorites(): Promise<CatalogTable[]> {
@@ -207,6 +313,44 @@ export class CatalogApi {
     return response.data;
   }
 
+  /** Resolve a catalog table by name (+ optional namespace). Returns null when
+   *  no such table exists (404), so callers can use it as an existence check.
+   *  Other failures (network, 5xx) are rethrown so they aren't mistaken for
+   *  "table does not exist". */
+  static async resolveTableByName(
+    name: string,
+    namespaceId?: number | null,
+  ): Promise<CatalogTable | null> {
+    try {
+      const params: Record<string, any> = { q: name };
+      if (namespaceId !== undefined && namespaceId !== null) params.namespace_id = namespaceId;
+      const response = await axios.get<{ table: CatalogTable }>("/catalog/tables/resolve", {
+        params,
+      });
+      return response.data.table;
+    } catch (e: any) {
+      if (e?.response?.status === 404) return null;
+      throw e;
+    }
+  }
+
+  /** 404, 409 and transport failures all mean "unresolved": a lookup must never surface a toast. */
+  static async resolveTableStrict(
+    name: string,
+    namespaceId?: number | null,
+  ): Promise<CatalogTable | null> {
+    try {
+      const params: Record<string, any> = { q: name, strict: true };
+      if (namespaceId !== undefined && namespaceId !== null) params.namespace_id = namespaceId;
+      const response = await axios.get<{ table: CatalogTable }>("/catalog/tables/resolve", {
+        params,
+      });
+      return response.data?.table ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   static async getTable(tableId: number): Promise<CatalogTable> {
     const response = await axios.get<CatalogTable>(`/catalog/tables/${tableId}`);
     return response.data;
@@ -222,8 +366,14 @@ export class CatalogApi {
     return response.data;
   }
 
-  static async deleteTable(id: number): Promise<void> {
-    await axios.delete(`/catalog/tables/${id}`);
+  static async deleteTable(id: number, deleteFile = false): Promise<void> {
+    await axios.delete(`/catalog/tables/${id}`, { params: { delete_file: deleteFile } });
+  }
+
+  // Delete all versions of a model (global artifact) by name within its namespace.
+  static async deleteArtifact(name: string, namespaceId: number | null): Promise<void> {
+    const params = namespaceId !== null ? { namespace_id: namespaceId } : {};
+    await axios.delete(`/artifacts/by-name/${encodeURIComponent(name)}`, { params });
   }
 
   static async getTablePreview(
@@ -238,8 +388,93 @@ export class CatalogApi {
     return response.data;
   }
 
-  static async getTableHistory(tableId: number): Promise<DeltaTableHistory> {
-    const response = await axios.get<DeltaTableHistory>(`/catalog/tables/${tableId}/history`);
+  static async getTableHistory(tableId: number, limit?: number): Promise<DeltaTableHistory> {
+    const url = `/catalog/tables/${tableId}/history`;
+    const params: Record<string, any> = {};
+    if (typeof limit === "number") params.limit = limit;
+    const response = await axios.get<DeltaTableHistory>(url, { params });
+    return response.data;
+  }
+
+  static async optimizeTable(
+    tableId: number,
+    zOrderColumns?: string[] | null,
+  ): Promise<OptimizeTableResponse> {
+    const body: OptimizeTableRequest = { z_order_columns: zOrderColumns ?? null };
+    const response = await axios.post<OptimizeTableResponse>(
+      `/catalog/tables/${tableId}/optimize`,
+      body,
+    );
+    return response.data;
+  }
+
+  static async vacuumTable(
+    tableId: number,
+    retentionHours: number,
+    dryRun: boolean,
+    force = false,
+  ): Promise<VacuumTableResponse> {
+    const body: VacuumTableRequest = {
+      retention_hours: retentionHours,
+      dry_run: dryRun,
+      force,
+    };
+    const response = await axios.post<VacuumTableResponse>(
+      `/catalog/tables/${tableId}/vacuum`,
+      body,
+    );
+    return response.data;
+  }
+
+  /** Change-tracking status: the table's enablement plus every consumer cursor on it. */
+  static async getTableCdc(tableId: number): Promise<TableCdcStatus> {
+    const response = await axios.get<TableCdcStatus>(`/catalog/tables/${tableId}/cdc`);
+    return response.data;
+  }
+
+  static async enableTableCdc(tableId: number): Promise<TableCdcStatus> {
+    const response = await axios.post<TableCdcStatus>(`/catalog/tables/${tableId}/cdc/enable`);
+    return response.data;
+  }
+
+  static async resetCdcCursor(
+    tableId: number,
+    consumerKey: string,
+    to: CdcCursorResetTarget,
+  ): Promise<CdcCursor> {
+    const body: CdcCursorResetRequest = { consumer_key: consumerKey, to };
+    const response = await axios.post<CdcCursor>(
+      `/catalog/tables/${tableId}/cdc/cursors/reset`,
+      body,
+    );
+    return response.data;
+  }
+
+  static async deleteCdcCursor(tableId: number, consumerKey: string): Promise<void> {
+    await axios.delete(`/catalog/tables/${tableId}/cdc/cursors/${encodeURIComponent(consumerKey)}`);
+  }
+
+  /** Apply row-level edits (keyed upserts / deletes / new columns) to a catalog table. */
+  static async applyTableEdits(
+    tableId: number,
+    body: CatalogTableEditsRequest,
+  ): Promise<CatalogTableEditsResponse> {
+    const response = await axios.post<CatalogTableEditsResponse>(
+      `/catalog/tables/${tableId}/edits`,
+      body,
+    );
+    return response.data;
+  }
+
+  /** Rewrite a table with a sequential row-id column (escape hatch for keyless tables). */
+  static async addTableKeyColumn(
+    tableId: number,
+    body: CatalogTableKeyColumnRequest,
+  ): Promise<CatalogTableKeyColumnResponse> {
+    const response = await axios.post<CatalogTableKeyColumnResponse>(
+      `/catalog/tables/${tableId}/key-column`,
+      body,
+    );
     return response.data;
   }
 
@@ -265,18 +500,12 @@ export class CatalogApi {
     return response.data;
   }
 
-  static async updateVirtualTable(
-    id: number,
-    body: VirtualFlowTableUpdate,
-  ): Promise<CatalogTable> {
+  static async updateVirtualTable(id: number, body: VirtualFlowTableUpdate): Promise<CatalogTable> {
     const response = await axios.put<CatalogTable>(`/catalog/virtual-tables/${id}`, body);
     return response.data;
   }
 
-  static async resolveVirtualTable(
-    tableId: number,
-    limit = 100,
-  ): Promise<CatalogTablePreview> {
+  static async resolveVirtualTable(tableId: number, limit = 100): Promise<CatalogTablePreview> {
     const response = await axios.post<CatalogTablePreview>(
       `/catalog/virtual-tables/${tableId}/resolve`,
       null,
@@ -289,6 +518,14 @@ export class CatalogApi {
 
   static async createQueryVirtualTable(body: QueryVirtualTableCreate): Promise<CatalogTable> {
     const response = await axios.post<CatalogTable>("/catalog/query-virtual-tables", body);
+    return response.data;
+  }
+
+  static async updateQueryVirtualTable(
+    id: number,
+    body: QueryVirtualTableUpdate,
+  ): Promise<CatalogTable> {
+    const response = await axios.put<CatalogTable>(`/catalog/query-virtual-tables/${id}`, body);
     return response.data;
   }
 
@@ -309,6 +546,16 @@ export class CatalogApi {
 
   static async createSchedule(body: FlowScheduleCreate): Promise<FlowSchedule> {
     const response = await axios.post<FlowSchedule>("/catalog/schedules", body);
+    return response.data;
+  }
+
+  /** Validate a cron expression against the backend's croniter rules (single
+   * source of truth for the builder's Custom-mode submit gate). */
+  static async validateCron(body: CronValidationRequest): Promise<CronValidationResult> {
+    const response = await axios.post<CronValidationResult>(
+      "/catalog/schedules/validate-cron",
+      body,
+    );
     return response.data;
   }
 
@@ -356,6 +603,14 @@ export class CatalogApi {
 
   static async getStats(): Promise<CatalogStats> {
     const response = await axios.get<CatalogStats>("/catalog/stats");
+    return response.data;
+  }
+
+  /** One round-trip for everything the catalog screen needs on mount. */
+  static async getOverview(runsLimit = 25): Promise<CatalogOverview> {
+    const response = await axios.get<CatalogOverview>("/catalog/overview", {
+      params: { runs_limit: runsLimit },
+    });
     return response.data;
   }
 
@@ -417,10 +672,12 @@ export class CatalogApi {
   static async updateVisualization(
     vizId: number,
     payload: VisualizationUpdatePayload,
+    config?: AxiosRequestConfig,
   ): Promise<CatalogVisualization> {
     const response = await axios.put<CatalogVisualization>(
       `/catalog/visualizations/${vizId}`,
       payload,
+      config,
     );
     return response.data;
   }
@@ -450,9 +707,7 @@ export class CatalogApi {
   }
 
   /** Get the field schema for a saved viz's source (worker-cached). */
-  static async getSavedVisualizationFields(
-    vizId: number,
-  ): Promise<VisualizationFieldsResponse> {
+  static async getSavedVisualizationFields(vizId: number): Promise<VisualizationFieldsResponse> {
     const response = await axios.post<VisualizationFieldsResponse>(
       `/catalog/visualizations/${vizId}/fields`,
     );
@@ -500,12 +755,28 @@ export class CatalogApi {
     return response.data;
   }
 
-  static async updateDashboard(id: number, payload: DashboardUpdatePayload): Promise<Dashboard> {
-    const response = await axios.put<Dashboard>(`/catalog/dashboards/${id}`, payload);
+  static async updateDashboard(
+    id: number,
+    payload: DashboardUpdatePayload,
+    config?: AxiosRequestConfig,
+  ): Promise<Dashboard> {
+    const response = await axios.put<Dashboard>(`/catalog/dashboards/${id}`, payload, config);
     return response.data;
   }
 
   static async deleteDashboard(id: number): Promise<void> {
     await axios.delete(`/catalog/dashboards/${id}`);
+  }
+
+  // ====== Demo catalog ======
+
+  static async seedDemoCatalog(): Promise<Record<string, unknown>> {
+    const response = await axios.post<Record<string, unknown>>("/catalog/seed-demo");
+    return response.data;
+  }
+
+  static async removeDemoCatalog(): Promise<Record<string, unknown>> {
+    const response = await axios.post<Record<string, unknown>>("/catalog/remove-demo");
+    return response.data;
   }
 }

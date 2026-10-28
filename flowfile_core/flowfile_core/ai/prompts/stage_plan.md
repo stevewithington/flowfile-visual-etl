@@ -1,6 +1,6 @@
 <!--
-W71 v2.4 / v2.10B — Stage 0' (pre-classify) of the agent_staged /
-agent_live state machine. Owner: planner agent. Loaded by
+Stage 0' (pre-classify) of the agent_staged / agent_live state
+machine. Owner: planner agent. Loaded by
 ``assemble_system_prompt`` when ``surface in ("agent_staged",
 "agent_live")`` and ``stage="plan"``.
 -->
@@ -17,15 +17,21 @@ classify→pick_type→pick_upstream→fill_settings funnel without
 first reasoning globally produces narrow, tactical choices that
 miss the user's actual intent. Plan first; act second.
 
+> **The host parses your numbered ``## Proposed changes`` list**
+> into a per-round progress checklist it shows you at each classify
+> stage (annotated ``[done]``/``[pending]``). Keep each step on its
+> own numbered line so the parser can track it — that checklist is
+> what keeps you from stopping after one step of a multi-step plan.
+
 ## What the `plan` markdown should contain
 
 Three sections in this order. Treat this as the same depth of
 analysis you'd write as a chat-mode reply — not a one-liner list.
 The depth is what makes the agent reliable across multi-step
-intents (re-wires, mid-flow insertions, conditional logic). v1's
+intents (re-wires, mid-flow insertions, conditional logic). A
 shallow numbered-list version of this prompt produced agents that
-staged single ops and stopped; v2.10B's structure is what closes
-that gap.
+staged single ops and stopped; this three-section structure is what
+closes that gap.
 
 ### 1. `## Current state`
 
@@ -130,6 +136,33 @@ denominator and the per-city numerators.
   output now reflects unique-customer percentages.
 - The re-wires are required; adding `unique` alone leaves it
   dangling and the dedup has no effect.
+```
+
+## Worked example — combining / joining multiple sources
+
+*"join customers, orders, support on customer_id"* over three
+stand-alone sources read#1, read#2, read#3 → a multi-step **`add`** plan
+(N sources need N−1 joins), NOT a `connect` plan:
+
+```
+## Current state
+
+Three stand-alone sources (read#1, read#2, read#3) share a customer_id
+key but aren't wired to anything.
+
+## Proposed changes
+
+1. join — combine read#1 + read#2 on customer_id.
+   *Why*: links each customer to their orders.
+2. join — combine step 1's output + read#3 on customer_id.
+   *Why*: adds support-ticket context.
+
+## Edge cases / caveats
+
+- Each join is a NEW node you ADD (its inputs wire automatically); you
+  do NOT connect the sources — sources have no input port.
+- Left joins keep all customer rows; use inner to drop customers with no
+  match.
 ```
 
 ## When the plan is short

@@ -11,7 +11,6 @@
           :show-keep-option="true"
           :show-title="true"
           :show-headers="true"
-          :show-data="true"
           title="Left data"
           @update-select-inputs="(updatedInputs) => updateSelectInputsHandler(updatedInputs, true)"
         />
@@ -20,7 +19,6 @@
           :show-keep-option="true"
           :show-headers="true"
           :show-title="true"
-          :show-data="true"
           title="Right data"
           @update-select-inputs="(updatedInputs) => updateSelectInputsHandler(updatedInputs, false)"
         />
@@ -44,7 +42,6 @@ const nodeStore = useNodeStore();
 const dataLoaded = ref(false);
 const nodeCrossJoin = ref<NodeCrossJoin | null>(null);
 
-// Use the standardized node settings composable
 const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSettings({
   nodeRef: nodeCrossJoin,
 });
@@ -84,7 +81,7 @@ defineExpose({
 .context-menu {
   position: fixed;
   z-index: 1000;
-  border: 1px solid #ccc;
+  border: 1px solid var(--color-border-primary);
   background-color: var(--color-background-primary);
   padding: 8px;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
@@ -104,7 +101,7 @@ defineExpose({
 }
 
 .context-menu button:hover {
-  background-color: #f0f0f0;
+  background-color: var(--color-background-hover);
 }
 
 .table-wrapper {
@@ -118,7 +115,7 @@ defineExpose({
 .context-menu {
   position: fixed;
   z-index: 1000;
-  border: 1px solid #ccc;
+  border: 1px solid var(--color-border-primary);
   background-color: var(--color-background-primary);
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
   border-radius: 4px;
@@ -136,7 +133,7 @@ defineExpose({
 }
 
 .context-menu li:hover {
-  background-color: #f0f0f0;
+  background-color: var(--color-background-hover);
 }
 
 .selectors-container {

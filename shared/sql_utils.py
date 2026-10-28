@@ -2,12 +2,19 @@
 Shared SQL URI construction and conversion utilities.
 
 Used by both flowfile_core and flowfile_worker to avoid duplicating
-URI-building logic across services.
+URI-building logic across services. Per-dialect behavior lives in
+``shared.db_dialects``; this module is the stable entry point.
 """
 
 from __future__ import annotations
 
-from urllib.parse import quote_plus
+import logging
+
+from shared.db_dialects import POSTGRES_FAMILY, get_dialect_or_generic, iter_dialects
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["POSTGRES_FAMILY", "SQLALCHEMY_DRIVER_MAP", "construct_sql_uri", "get_sqlalchemy_uri"]
 
 
 def construct_sql_uri(
@@ -18,6 +25,8 @@ def construct_sql_uri(
     password: str | None = None,
     database: str | None = None,
     url: str | None = None,
+    ssl_enabled: bool = False,
+    connect_timeout: int | None = None,
     **kwargs,
 ) -> str:
     """
@@ -31,6 +40,8 @@ def construct_sql_uri(
         password: Database password as a plain string (caller handles decryption)
         database: Database name
         url: Complete database URL (overrides other parameters if provided)
+        ssl_enabled: Adds sslmode=require for postgres-family databases
+        connect_timeout: Connection timeout in seconds (postgres-family only)
         **kwargs: Additional connection parameters appended as query string
 
     Returns:
@@ -39,54 +50,25 @@ def construct_sql_uri(
     Raises:
         ValueError: If insufficient information is provided
     """
-    # If URL is explicitly provided, return it directly
     if url:
         return url
 
-    # For SQLite, we handle differently since it uses a file path
-    if database_type.lower() == "sqlite":
-        # For SQLite, database is the path to the file
-        path = database or host or "./database.db"
-        # Strip sqlite:/// prefix if the full URI was passed as the path
-        if path.startswith("sqlite:///"):
-            path = path[len("sqlite:///"):]
-        return f"sqlite:///{path}"
-
-    # Validate that minimum required fields are present for other databases
-    if not host:
-        raise ValueError("Host is required to create a URI")
-
-    # Create credential part if username is provided
-    credentials = ""
-    if username:
-        credentials = username
-        if password:
-            encoded_password = quote_plus(password)
-            credentials += f":{encoded_password}"
-        credentials += "@"
-
-    # Add port if specified
-    port_section = f":{port}" if port else ""
-
-    # Create base URI
-    if database:
-        base_uri = f"{database_type}://{credentials}{host}{port_section}/{database}"
-    else:
-        base_uri = f"{database_type}://{credentials}{host}{port_section}"
-
-    # Add any additional connection parameters
-    if kwargs:
-        params = "&".join(f"{key}={quote_plus(str(value))}" for key, value in kwargs.items())
-        base_uri += f"?{params}"
-
-    return base_uri
+    return get_dialect_or_generic(database_type).build_uri(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        database=database,
+        ssl_enabled=ssl_enabled,
+        connect_timeout=connect_timeout,
+        **kwargs,
+    )
 
 
 # Mapping from base database URI schemes to SQLAlchemy-compatible schemes with driver suffixes.
 # connectorx uses base schemes (e.g. mysql://) while SQLAlchemy needs driver-specific schemes.
-SQLALCHEMY_DRIVER_MAP = {
-    "mysql": "mysql+pymysql",
-}
+# Built from the dialect registry; kept as a module constant for backward compatibility.
+SQLALCHEMY_DRIVER_MAP = {d.name: d.sqlalchemy_driver for d in iter_dialects() if d.sqlalchemy_driver}
 
 
 def get_sqlalchemy_uri(uri: str) -> str:

@@ -12,6 +12,8 @@
           filterable
           placeholder="Select columns to group by..."
           style="width: 100%"
+          :loading="loading"
+          loading-text="Loading columns…"
           @change="emitUpdate"
         >
           <el-option
@@ -34,6 +36,8 @@
           clearable
           placeholder="Select column to order by..."
           style="width: 100%"
+          :loading="loading"
+          loading-text="Loading columns…"
           @change="emitUpdate"
         >
           <el-option
@@ -53,6 +57,7 @@
     <div class="column-list-wrapper">
       <div class="listbox-subtitle">Available Columns</div>
       <ul class="listbox">
+        <li v-if="loading && !filteredColumns.length" class="loading-row">Loading columns…</li>
         <li
           v-for="(column, index) in filteredColumns"
           :key="column.name"
@@ -154,6 +159,10 @@ const props = defineProps({
     type: Array as PropType<FileColumn[]>,
     default: () => [],
   },
+  loading: {
+    type: Boolean,
+    default: false,
+  },
 });
 
 const emit = defineEmits(["update:modelValue"]);
@@ -175,18 +184,20 @@ const firstSelectedIndex = ref<number | null>(null);
 const allColumns = computed(() => props.incomingColumns);
 
 const filteredColumns = computed(() => {
-  if (!props.schema.data_types || props.schema.data_types === "ALL") {
+  const dataTypes = props.schema.data_types;
+  if (!dataTypes || dataTypes === "ALL") {
     return props.incomingColumns;
   }
-  if (Array.isArray(props.schema.data_types)) {
-    return props.incomingColumns.filter((column) =>
-      props.schema.data_types.includes(column.data_type),
+  if (Array.isArray(dataTypes)) {
+    // Match on a column's concrete dtype ("Int64") or its group ("Numeric").
+    return props.incomingColumns.filter(
+      (column) =>
+        dataTypes.includes(column.data_type) || dataTypes.includes(column.data_type_group),
     );
   }
   return props.incomingColumns;
 });
 
-// Initialize local value from props
 watch(
   () => props.modelValue,
   (newValue) => {
@@ -206,7 +217,6 @@ const emitUpdate = () => {
   emit("update:modelValue", { ...localValue.value });
 };
 
-// Generate output name from template
 const generateOutputName = (column: string, action: string): string => {
   return props.schema.output_name_template.replace("{column}", column).replace("{action}", action);
 };
@@ -284,6 +294,13 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-4);
+}
+
+.loading-row {
+  color: var(--color-text-secondary);
+  font-style: italic;
+  cursor: default;
+  pointer-events: none;
 }
 
 .config-section {

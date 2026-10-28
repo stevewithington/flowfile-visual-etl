@@ -7,12 +7,12 @@ Cases:
   ``pop_session`` return None for a different user_id than the owner.
 * ``test_clear_for_tests_wipes_all`` — fixture cleanup works.
 * ``test_capture_snapshot_basic`` — snapshot a flow with one node;
-  ``node_ids`` and ``node_types`` populated (W45 — hash fields removed).
+  ``node_ids`` and ``node_types`` populated (hash fields removed).
 * ``test_detect_drift_no_change`` — fresh snapshot vs same flow → None.
 * ``test_detect_drift_external_addition_fires`` — user adds a node
   post-snapshot the agent didn't stage → ``external_added_node_ids`` populated.
 * ``test_detect_drift_agent_staged_addition_is_not_drift`` — agent's own
-  staged node is excluded from the external-added bucket (W45 Q1).
+  staged node is excluded from the external-added bucket.
 * ``test_detect_drift_missing_node`` — delete a node post-snapshot →
   ``missing_node_ids`` populated.
 * ``test_capture_snapshot_records_node_types`` — node_type captured per id.
@@ -88,9 +88,7 @@ def _reset_session_store() -> Iterator[None]:
     sessions.clear_for_tests()
 
 
-# --------------------------------------------------------------------------- #
-# Store round-trip #
-# --------------------------------------------------------------------------- #
+# Store round-trip
 
 
 def test_agent_session_w57_fields_default_to_empty_lists() -> None:
@@ -138,9 +136,7 @@ def test_session_store_user_id_namespacing() -> None:
     owner = _make_session(user_id=1)
     sessions.register_session(owner)
 
-    # Wrong user_id → no read.
     assert sessions.get_session(owner.session_id, user_id=2) is None
-    # Wrong user_id → no pop.
     assert sessions.pop_session(owner.session_id, user_id=2) is None
     # Owner can still read after the failed cross-user pop attempt.
     assert sessions.get_session(owner.session_id, user_id=1) is owner
@@ -170,9 +166,7 @@ def test_list_sessions_for_user() -> None:
     assert {s.session_id for s in user2_sessions} == {s2.session_id}
 
 
-# --------------------------------------------------------------------------- #
-# Snapshot capture #
-# --------------------------------------------------------------------------- #
+# Snapshot capture
 
 
 def test_capture_snapshot_basic() -> None:
@@ -192,9 +186,7 @@ def test_capture_snapshot_records_node_types() -> None:
     assert snap.node_types == {1: "manual_input", 2: "manual_input"}
 
 
-# --------------------------------------------------------------------------- #
-# Drift detection (W45 — id-set only) #
-# --------------------------------------------------------------------------- #
+# Drift detection (id-set only)
 
 
 def test_detect_drift_no_change() -> None:
@@ -276,13 +268,11 @@ def test_drift_detail_is_empty() -> None:
     assert not detail3.is_empty()
 
 
-# --------------------------------------------------------------------------- #
-# Lazy litellm contract #
-# --------------------------------------------------------------------------- #
+# Lazy litellm contract
 
 
 def test_lazy_litellm_contract() -> None:
-    # Importing sessions must not pull litellm — same posture every workstream
+    # Importing sessions must not pull litellm — same posture every AI module
     # since has documented. If a prior test already imported litellm,
     # drop and re-import to verify the contract holds.
     sys.modules.pop("litellm", None)
@@ -295,7 +285,6 @@ def test_lazy_litellm_contract() -> None:
 def test_session_touch_updates_timestamp() -> None:
     sess = _make_session()
     before = sess.updated_at
-    # Force a different instant.
     import time
 
     time.sleep(0.001)
@@ -312,9 +301,7 @@ def test_session_default_status_is_running() -> None:
     assert sess.diff_id is None
 
 
-# --------------------------------------------------------------------------- #
-# staged_results hygiene on resume #
-# --------------------------------------------------------------------------- #
+# staged_results hygiene on resume
 
 
 def _staged_add_entry(
@@ -343,7 +330,7 @@ def _staged_add_entry(
 
 
 def test_revalidate_staged_results_drops_collision_with_live() -> None:
-    """AC4 — a staged add whose node_id is now live (user-added during pause) is dropped."""
+    """A staged add whose node_id is now live (user-added during pause) is dropped."""
     sess = _make_session()
     # Pre-pause: agent staged node 3 with upstream from live node 1.
     sess.staged_results = [_staged_add_entry(node_id=3, upstream_node_ids=[1])]
@@ -365,7 +352,7 @@ def test_revalidate_staged_results_drops_collision_with_live() -> None:
 
 
 def test_revalidate_staged_results_drops_dead_upstream_reference() -> None:
-    """AC3 — a staged add referencing an upstream id that's no longer live is dropped."""
+    """A staged add referencing an upstream id that's no longer live is dropped."""
     sess = _make_session()
     # Pre-pause: agent staged node 7 chained off live node 5 (which we'll delete).
     sess.staged_results = [_staged_add_entry(node_id=7, upstream_node_ids=[5])]
@@ -419,3 +406,35 @@ def test_revalidate_staged_results_passes_through_non_add_entries() -> None:
 
     assert dropped == []
     assert kept == [connect_entry]
+
+
+def test_revalidate_prunes_plan_ledger_ops_for_dropped_nodes() -> None:
+    """Drift-resume drops a staged add whose id is now live; its plan-ledger
+    ``add_*`` op is pruned, while the surviving add op and a connect op
+    (node_id None) are left intact."""
+    sess = _make_session()
+    # Staged: node 3 (will be dropped, id now live) and node 4 (survives).
+    sess.staged_results = [
+        _staged_add_entry(node_id=3, upstream_node_ids=[1]),
+        _staged_add_entry(node_id=4, upstream_node_ids=[1]),
+    ]
+    sess.staged_node_ids = [3, 4]
+    sess.plan_completed_ops = [
+        sessions.CompletedOpEntry(tool_name="flowfile.graph.add_filter", node_id=3, summary="a"),
+        sessions.CompletedOpEntry(tool_name="flowfile.graph.add_filter", node_id=4, summary="b"),
+        sessions.CompletedOpEntry(tool_name="flowfile.graph.connect", node_id=None, summary="c"),
+    ]
+
+    # During pause the user manually created node 3 → collision drop.
+    flow = _flow_with_orders()
+    _add_orders(flow, node_id=3)
+
+    kept, dropped = sessions.revalidate_staged_results_against_live(sess, flow)
+
+    assert len(dropped) == 1
+    assert dropped[0][1] == "live_id_collision"
+    remaining = [(op.tool_name, op.node_id) for op in sess.plan_completed_ops]
+    assert remaining == [
+        ("flowfile.graph.add_filter", 4),
+        ("flowfile.graph.connect", None),
+    ]

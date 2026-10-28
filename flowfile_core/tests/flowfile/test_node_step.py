@@ -131,7 +131,6 @@ def test_hash_change_data_with_old_data():
             {"name": "Courtney", "city": "Chicago"},
         ],
     )
-    # this should not have impacted the
     data = graph.get_node_data(2, True).main_output.data
     assert len(data) > 0, "Data should be present, cause we did not run yet"
 
@@ -182,3 +181,12 @@ def test_add_connection_tracks_output_handle():
     assert node._input_output_handles[1] == "output-1"
     edges = node.get_edge_input()
     assert edges[0].sourceHandle == "output-1"
+
+
+@pytest.mark.parametrize(
+    "input_type, expected",
+    [("main", "input-0"), ("right", "input-1"), ("left", "input-2"), ("input-1", "input-1"), ("input-3", "input-3")],
+)
+def test_create_from_simple_input_target_handle(input_type, expected):
+    connection = input_schema.NodeConnection.create_from_simple_input(1, 2, input_type=input_type)
+    assert connection.input_connection.connection_class == expected

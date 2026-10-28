@@ -1,13 +1,4 @@
 <script setup lang="ts">
-// Right-aligned designer header cluster.
-//
-// Layout: [Ask AI ⌘K] [<> Code] [▶ Run] | [⚙] [👁/—]
-//
-// Ask AI / Code / Run / Settings live here so the cluster reads as one
-// unified action set, matching the target mockup. The results toggle
-// (formerly in status.vue) tucks in at the right end as an icon-only
-// button — too useful to drop, small enough to coexist.
-//
 // Keyboard shortcuts (Cmd+E, Cmd+,) reach this cluster via DesignerView's
 // canvas event handlers binding `@run` / `@open-settings` to the
 // rightCluster ref's exposed runFlow / openSettings methods.
@@ -17,17 +8,18 @@ import { View, Minus } from "@element-plus/icons-vue";
 import { useNodeStore } from "../../../stores/column-store";
 import { useEditorStore } from "../../../stores/editor-store";
 import { useItemStore } from "../../common/DraggableItem/stateStore";
-import { useTutorialStore } from "../../../stores/tutorial-store";
+import { usePopout } from "../../../composables/usePopout";
 import AiAssistantTrigger from "../../../features/ai/AiAssistantTrigger.vue";
 import RunButton from "./run.vue";
 import PopOver from "../../../features/designer/editor/PopOver.vue";
+import ShareLinkDialog from "../../sharing/ShareLinkDialog.vue";
 
 const nodeStore = useNodeStore();
 const editorStore = useEditorStore();
-const tutorialStore = useTutorialStore();
 const draggableItemStore = useItemStore();
 
 const runButton = ref<InstanceType<typeof RunButton> | null>(null);
+const showShareLink = ref(false);
 
 const showFlowResult = computed(() => nodeStore.showFlowResult);
 
@@ -35,11 +27,6 @@ const emit = defineEmits(["open-settings"]);
 
 const toggleCodeGenerator = (): void => {
   nodeStore.toggleCodeGenerator();
-  if (tutorialStore.isActive && tutorialStore.currentStep?.id === "generate-code") {
-    setTimeout(() => {
-      tutorialStore.nextStep();
-    }, 300);
-  }
 };
 
 const openSettings = (): void => {
@@ -53,10 +40,14 @@ const runFlow = (): void => {
 const toggleResults = (): void => {
   editorStore.showFlowResult = !editorStore.showFlowResult;
   editorStore.isShowingLogViewer = editorStore.showFlowResult;
-  if (editorStore.isShowingLogViewer) {
-    draggableItemStore.bringToFront("logViewer");
-    draggableItemStore.bringToFront("flowresults");
+  if (!editorStore.isShowingLogViewer) return;
+  // The logs live in their own window: show that one; the dock stays closed for them.
+  if (editorStore.isPoppedOut("logs", nodeStore.flow_id)) {
+    void usePopout("logs").focus(nodeStore.flow_id);
+  } else {
+    draggableItemStore.bringToFront("bottomDock");
   }
+  draggableItemStore.bringToFront("rightDrawer");
 };
 
 defineExpose({
@@ -90,6 +81,17 @@ defineExpose({
 
     <span class="cluster-separator" aria-hidden="true" />
 
+    <pop-over content="Share as a browser link" placement="bottom">
+      <button
+        class="action-btn action-btn--icon-only"
+        type="button"
+        aria-label="Share flow as a browser link"
+        @click="showShareLink = true"
+      >
+        <span class="material-icons btn-icon" aria-hidden="true">link</span>
+      </button>
+    </pop-over>
+
     <pop-over content="Flow settings (⌘,)" placement="bottom">
       <button
         class="action-btn action-btn--icon-only"
@@ -115,6 +117,8 @@ defineExpose({
         <el-icon v-else><Minus /></el-icon>
       </button>
     </pop-over>
+
+    <share-link-dialog v-if="showShareLink" v-model="showShareLink" />
   </div>
 </template>
 

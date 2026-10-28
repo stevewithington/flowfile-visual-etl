@@ -1,11 +1,23 @@
 <template>
-  <div class="canvas" :class="{ 'canvas-edit': mode === 'edit' }">
+  <div
+    ref="canvasRef"
+    class="canvas"
+    :class="{
+      'canvas-edit': mode === 'edit',
+      'canvas-view': mode === 'view',
+      'canvas-drop-active': dragOver,
+    }"
+    @dragover="onCanvasDragOver"
+    @dragleave="onCanvasDragLeave"
+    @drop="onCanvasDrop"
+  >
     <div v-if="!layout.tiles.length && mode === 'view'" class="canvas-empty">
       <el-empty description="This dashboard has no tiles." />
     </div>
 
     <GridLayout
       v-else
+      ref="gridRef"
       v-model:layout="gridItems"
       :col-num="layout.grid.cols"
       :row-height="layout.grid.row_height"
@@ -24,8 +36,8 @@
         :y="item.y"
         :w="item.w"
         :h="item.h"
-        :min-w="2"
-        :min-h="2"
+        :min-w="tileById[item.i]?.type === 'separator' ? 1 : Math.max(2, layout.grid.cols / 6)"
+        :min-h="tileById[item.i]?.type === 'viz' || tileById[item.i]?.type === 'kpi' ? 2 : 1"
         drag-allow-from=".tile-handle"
       >
         <DashboardTile
@@ -35,6 +47,7 @@
           :filters="layout.filters"
           :viz-refresh-nonce="vizRefreshNonceFor(tileById[item.i].viz_id ?? -1)"
           :tile-datasource="tileDatasource"
+          :grid-cols="layout.grid.cols"
           @remove="onRemoveTile(item.i)"
           @edit-viz="emit('edit-viz', tileById[item.i].viz_id ?? null)"
           @update:tile="onUpdateTile"
@@ -45,10 +58,22 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, ref, watch, type ComponentPublicInstance } from "vue";
 import { GridItem, GridLayout } from "grid-layout-plus";
 import DashboardTile from "./DashboardTile.vue";
-import type { DashboardLayout, DashboardTile as DashboardTileType } from "../../types";
+import {
+  useDashboardDragAndDrop,
+  KPI_MIME,
+  SEPARATOR_MIME,
+  TEXT_MIME,
+  VIZ_MIME,
+} from "../../composables/useDashboardDragAndDrop";
+import { computeDropCell } from "./gridDrop";
+import type {
+  DashboardLayout,
+  DashboardTile as DashboardTileType,
+  SeparatorOrientation,
+} from "../../types";
 
 const props = defineProps<{
   layout: DashboardLayout;
@@ -64,7 +89,112 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "update:layout", value: DashboardLayout): void;
   (e: "edit-viz", vizId: number | null): void;
+  (e: "add-viz-at", payload: { vizId: number; x: number; y: number }): void;
+  (e: "add-text-at", payload: { x: number; y: number }): void;
+  (e: "add-kpi-at", payload: { x: number; y: number }): void;
+  (
+    e: "add-separator-at",
+    payload: { x: number; y: number; orientation: SeparatorOrientation },
+  ): void;
 }>();
+
+const { isDraggingViz, isDraggingText, isDraggingSeparator, isDraggingKpi } =
+  useDashboardDragAndDrop();
+const canvasRef = ref<HTMLElement | null>(null);
+const gridRef = ref<ComponentPublicInstance | null>(null);
+const dragOver = ref(false);
+
+const dragHasOurPayload = (e: DragEvent): boolean => {
+  if (
+    isDraggingViz.value ||
+    isDraggingText.value ||
+    isDraggingSeparator.value ||
+    isDraggingKpi.value
+  ) {
+    return true;
+  }
+  const types = e.dataTransfer?.types;
+  return (
+    !!types &&
+    (types.includes(VIZ_MIME) ||
+      types.includes(TEXT_MIME) ||
+      types.includes(SEPARATOR_MIME) ||
+      types.includes(KPI_MIME))
+  );
+};
+
+const onCanvasDragOver = (e: DragEvent) => {
+  if (props.mode !== "edit") return;
+  // Payload is unreadable during dragover, so gate on our shared flags (and the
+  // advertised MIME types) to ignore unrelated file/text drags.
+  if (!dragHasOurPayload(e)) return;
+  e.preventDefault(); // required so the subsequent `drop` fires
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+  dragOver.value = true;
+};
+
+const onCanvasDragLeave = (e: DragEvent) => {
+  const target = e.currentTarget;
+  if (
+    target instanceof HTMLElement &&
+    e.relatedTarget instanceof Node &&
+    target.contains(e.relatedTarget)
+  ) {
+    return; // moving between children, still inside the canvas
+  }
+  dragOver.value = false;
+};
+
+const onCanvasDrop = (e: DragEvent) => {
+  dragOver.value = false;
+  if (props.mode !== "edit") return;
+  const dt = e.dataTransfer;
+  if (!dt) return;
+  const isText = dt.types.includes(TEXT_MIME);
+  const isSeparator = dt.types.includes(SEPARATOR_MIME);
+  const isKpi = dt.types.includes(KPI_MIME);
+  const orientation: SeparatorOrientation =
+    dt.getData(SEPARATOR_MIME) === "vertical" ? "vertical" : "horizontal";
+  const rawViz = dt.getData(VIZ_MIME);
+  const vizId = rawViz ? Number(rawViz) : NaN;
+  const isViz = Number.isFinite(vizId);
+  if (!isText && !isSeparator && !isKpi && !isViz) return;
+  e.preventDefault();
+
+  // Text and horizontal separators span the full width, viz tiles half, KPIs a
+  // quarter, vertical separators two columns; the width drives the x-clamp so a
+  // tile never overflows the grid.
+  const cols = props.layout.grid.cols;
+  const w = isViz
+    ? cols / 2
+    : isKpi
+      ? cols / 4
+      : isSeparator && orientation === "vertical"
+        ? 2
+        : cols;
+  const layoutEl =
+    (gridRef.value?.$el as HTMLElement | undefined) ??
+    canvasRef.value?.querySelector<HTMLElement>(".vgl-layout") ??
+    null;
+  // Grid not mounted — let the parent append at the next free row (y < 0).
+  let cell = { x: 0, y: -1 };
+  if (layoutEl) {
+    const rect = layoutEl.getBoundingClientRect();
+    cell = computeDropCell({
+      rect: { left: rect.left, top: rect.top, width: rect.width },
+      clientX: e.clientX,
+      clientY: e.clientY,
+      cols: props.layout.grid.cols,
+      rowHeight: props.layout.grid.row_height,
+      margin: 8,
+      w,
+    });
+  }
+  if (isText) emit("add-text-at", { x: cell.x, y: cell.y });
+  else if (isSeparator) emit("add-separator-at", { x: cell.x, y: cell.y, orientation });
+  else if (isKpi) emit("add-kpi-at", { x: cell.x, y: cell.y });
+  else emit("add-viz-at", { vizId, x: cell.x, y: cell.y });
+};
 
 const vizRefreshNonceFor = (vizId: number): number => props.vizRefreshNonces?.[vizId] ?? 0;
 
@@ -149,8 +279,13 @@ const onUpdateTile = (next: DashboardTileType) => {
   width: 100%;
   height: 100%;
   overflow: auto;
-  padding: 8px 8px 48px;
+  padding: var(--spacing-2) 0 48px;
   background: var(--el-fill-color-blank);
+}
+/* The grid insets tiles by its own 8px margin; pull that back so the first
+ * column lines up with the page header. */
+.canvas-view {
+  margin: 0 calc(-1 * var(--spacing-2));
 }
 /* grid-layout-plus's drag/drop placeholder leaks past the end of a
  * gesture (z-index 2 > items at z-index 0), so it tinted the dropped
@@ -164,6 +299,10 @@ const onUpdateTile = (next: DashboardTileType) => {
   :deep(.vgl-layout:not(:has(.vgl-item--dragging, .vgl-item--resizing)))
   .vgl-item--placeholder {
   display: none;
+}
+.canvas-drop-active {
+  outline: 2px dashed var(--el-color-primary);
+  outline-offset: -4px;
 }
 .canvas-edit {
   background: repeating-linear-gradient(

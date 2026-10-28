@@ -1,11 +1,33 @@
 <template>
   <el-card class="run-card" shadow="hover">
     <div class="clearfix">
-      <span>Flow: {{ runInformation?.flow_id }}</span>
-      <span class="flow-summary">
-        - {{ runInformation?.success ? "Succeeded" : "Failed" }}, Nodes:
-        {{ runInformation?.nodes_completed }}/{{ runInformation?.number_of_nodes }}
+      <span>Flow: {{ runInformation?.flow_id }}:</span>
+      <span class="flow-summary" :class="runStatusClass">{{ runStatusText }}</span>
+      <span v-if="hasRun && nodeBreakdown.length" class="node-breakdown">
+        <span v-for="part in nodeBreakdown" :key="part.label" :class="part.className">
+          {{ part.count }} {{ part.label }}
+        </span>
       </span>
+    </div>
+
+    <!-- Performance-mode notice: per-step data isn't stored in Performance mode -->
+    <div v-if="showPerfNotice" class="perf-mode-notice">
+      <el-icon class="perf-mode-notice__icon"><InfoFilled /></el-icon>
+      <span class="perf-mode-notice__text">
+        This flow ran in <strong>Performance</strong> mode, so data for each step isn't stored. To
+        inspect the data step by step, select Development as
+        <button type="button" class="perf-mode-notice__link" @click="openFlowSettings">
+          execution mode
+        </button>
+        and run again.
+      </span>
+      <button
+        class="perf-mode-notice__dismiss"
+        aria-label="Dismiss notice"
+        @click="perfNoticeDismissed = true"
+      >
+        ×
+      </button>
     </div>
     <br />
     <div>
@@ -14,7 +36,7 @@
           v-for="node in runInformation?.node_step_result"
           :key="node.node_id"
           :timestamp="formatTimestamp(node.start_timestamp)"
-          :color="calculateColor(node.success)"
+          :color="calculateColor(node)"
           @click="navigateToNode(`node-${node.node_id}`)"
         >
           <el-card class="node-card">
@@ -37,13 +59,15 @@
                 Status:
                 <span
                   :class="{
-                    running: node.success === null,
-                    success: node.success === true,
-                    failure: node.success === false,
+                    running: !node.skipped && node.success === null,
+                    success: !node.skipped && node.success === true,
+                    failure: !node.skipped && node.success === false,
+                    skipped: node.skipped,
                   }"
                 >
-                  {{ node.success === null ? "Running" : node.success ? "Success" : "Failure" }}
+                  {{ statusLabel(node) }}
                 </span>
+                <span v-if="node.skipped" class="skipped-hint">gated off, not run</span>
               </p>
               <p v-if="node.success === false" class="failure">Error: {{ node.error }}</p>
               <el-button
@@ -66,34 +90,93 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, defineProps } from "vue";
-import { format } from "date-fns"; // Assuming date-fns is added for date formatting
+import { ref, computed, watch } from "vue";
+import { format } from "date-fns";
+import { InfoFilled } from "@element-plus/icons-vue";
 import { useNodeStore } from "../../../stores/column-store";
 import { useAiStore } from "../../../stores/ai-store";
+import { useEditorStore } from "../../../stores/editor-store";
+import { useDrawerStore } from "../../../stores/drawer-store";
 
 interface RunNode {
   node_id: number;
   node_name?: string;
   error?: string;
   success?: boolean;
+  // Deliberately skipped behind a closed gate: succeeds without running.
+  skipped?: boolean;
 }
-
-const props = defineProps({
-  tableViewer: {
-    type: Object,
-    required: false,
-    default: null,
-  },
-  onClick: {
-    type: Function,
-    required: true,
-  },
-});
 
 const nodeStore = useNodeStore();
 const aiStore = useAiStore();
+const editorStore = useEditorStore();
+const drawerStore = useDrawerStore();
 const runInformation = computed(() => nodeStore.currentRunResult);
 const selectedNode = ref<Element | null>(null);
+
+const openFlowSettings = () => editorStore.requestOpenFlowSettings();
+
+// Flow status. The backend leaves `success` null while the flow is running
+// and sets `is_running`, so we never render a running flow as "Failed". A
+// flow that never ran reports `run_type: "init"` — render that as "Not run
+// yet" instead of "Failed", and skip the meaningless 0/0 node count.
+const hasRun = computed(() => {
+  const info = runInformation.value;
+  return !!info && info.run_type !== "init";
+});
+
+const runStatusText = computed(() => {
+  const info = runInformation.value;
+  if (!info) return "";
+  if (info.is_running) return "Running";
+  if (!hasRun.value) return "No results yet";
+  return info.success ? "Succeeded" : "Failed";
+});
+
+// Per-state node counts; nodes blocked by an upstream failure have no result row.
+const nodeBreakdown = computed(() => {
+  const info = runInformation.value;
+  if (!info) return [];
+  const rows = info.node_step_result ?? [];
+  const succeeded = rows.filter((r) => r.success === true && !r.skipped).length;
+  const failed = rows.filter((r) => r.success === false).length;
+  const gatedOff = rows.filter((r) => r.skipped).length;
+  const running = info.is_running
+    ? rows.filter((r) => r.success == null && r.is_running).length
+    : 0;
+  const remaining = Math.max(info.number_of_nodes - succeeded - failed - gatedOff - running, 0);
+  return [
+    { count: succeeded, label: "succeeded", className: "success" },
+    { count: failed, label: "failed", className: "failure" },
+    { count: gatedOff, label: "gated off", className: "skipped" },
+    { count: running, label: "running", className: "running" },
+    { count: remaining, label: info.is_running ? "waiting" : "not run", className: "skipped" },
+  ].filter((part) => part.count > 0);
+});
+
+const runStatusClass = computed(() => ({
+  running: !!runInformation.value?.is_running,
+  success: !runInformation.value?.is_running && runInformation.value?.success === true,
+  failure: !runInformation.value?.is_running && runInformation.value?.success === false,
+}));
+
+// Performance mode skips per-step example data, so after a successful run we
+// nudge the user toward Development mode to inspect step-by-step data.
+const perfNoticeDismissed = ref(false);
+const showPerfNotice = computed(
+  () =>
+    !perfNoticeDismissed.value &&
+    runInformation.value?.success === true &&
+    runInformation.value?.execution_mode === "Performance",
+);
+
+// Reset the dismissal whenever a new run starts so the notice can reappear.
+watch(
+  () => runInformation.value?.is_running,
+  (isRunning) => {
+    if (isRunning) perfNoticeDismissed.value = false;
+  },
+);
 
 const onFixWithAi = (node: RunNode) => {
   // — open the AI drawer and stream a server-built explanation +
@@ -112,9 +195,16 @@ const formatTimestamp = (timestamp: number) => {
   return format(new Date(timestamp * 1000), "yyyy-MM-dd HH:mm:ss");
 };
 
-const calculateColor = (success: boolean | undefined) => {
-  if (success === null) return "var(--color-info)";
-  return success ? "var(--color-success)" : "var(--color-danger)";
+const statusLabel = (node: RunNode) => {
+  if (node.skipped) return "Skipped";
+  if (node.success === null) return "Running";
+  return node.success ? "Success" : "Failure";
+};
+
+const calculateColor = (node: RunNode) => {
+  if (node.skipped) return "var(--color-text-tertiary)";
+  if (node.success === null) return "var(--color-info)";
+  return node.success ? "var(--color-success)" : "var(--color-danger)";
 };
 const formatRunTime = (runTimeMs: number, startTimestamp: number, isRunning: boolean) => {
   let ms = runTimeMs;
@@ -131,7 +221,6 @@ const formatRunTime = (runTimeMs: number, startTimestamp: number, isRunning: boo
 };
 
 const navigateToNode = (nodeId: string) => {
-  // Assuming you've assigned IDs to each node's root element in a way that incorporates the nodeId
   console.log(nodeId, "nodeId");
   if (selectedNode.value) {
     if (selectedNode.value?.classList.contains("selected")) {
@@ -141,11 +230,7 @@ const navigateToNode = (nodeId: string) => {
 
   const elementId = `#${nodeId}`;
   const nodeComponent = document.querySelector(elementId);
-  console.log(nodeComponent, "nodeComponent");
-  if (props.onClick) {
-    props.onClick(nodeId.slice(5));
-    //props.tableViewer.downloadData(nodeId.slice(5))
-  }
+  drawerStore.selectNodeForPreview(Number(nodeId.slice(5)));
   if (nodeComponent) {
     if (!nodeComponent.classList.contains("selected")) {
       nodeComponent.classList.add("selected");
@@ -176,6 +261,64 @@ const navigateToNode = (nodeId: string) => {
   font-weight: bold;
   color: var(--color-text-primary);
 }
+.node-breakdown {
+  margin-left: 10px;
+  font-size: 13px;
+}
+.node-breakdown > span:not(:first-child)::before {
+  content: "·";
+  margin: 0 6px;
+  color: var(--color-text-tertiary);
+}
+.perf-mode-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-info, #909399);
+  border-radius: 8px;
+  background-color: var(--color-info-light-9, rgba(144, 147, 153, 0.1));
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--color-text-primary);
+}
+.perf-mode-notice__icon {
+  flex-shrink: 0;
+  font-size: 16px;
+  margin-top: 1px;
+  color: var(--color-text-secondary);
+}
+.perf-mode-notice__text {
+  flex: 1;
+}
+.perf-mode-notice__link {
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  font-weight: 600;
+  color: var(--color-accent, var(--el-color-primary));
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.perf-mode-notice__link:hover {
+  opacity: 0.8;
+}
+.perf-mode-notice__dismiss {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  padding: 0 2px;
+}
+.perf-mode-notice__dismiss:hover {
+  color: var(--color-text-primary);
+}
 .node-card {
   padding: 15px;
 }
@@ -187,6 +330,14 @@ const navigateToNode = (nodeId: string) => {
 }
 .failure {
   color: var(--color-danger);
+}
+.skipped {
+  color: var(--color-text-tertiary);
+}
+.skipped-hint {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
 }
 .fix-with-ai-btn {
   margin-top: 6px;

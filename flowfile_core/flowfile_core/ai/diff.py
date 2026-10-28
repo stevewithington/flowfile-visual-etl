@@ -4,20 +4,13 @@ Composes the per-op ``staged_node_payload`` shapes that the executor
 emits under ``mode="stage"`` into a single :class:`GraphDiff`
 artefact, and applies / rejects them atomically.
 
-Atomicity rests on two existing seams:
-
-1. ``flow.capture_history_snapshot(HistoryActionType.BATCH, ...)``
-   taken *before* any mutation gives the user a single undo point
-   covering the whole batch.
-2. ``flow.flow_settings.track_history = False`` short-circuits the
-   per-method ``with_history_capture`` decorator in ``flow_graph.py``
-   so the ``add_<node_type>`` calls fired during the batch don't push
-   their own snapshots.
-
-If any op raises mid-batch, ``flow.undo()`` rolls the BATCH snapshot
-back and the diff is left in the store for the user to fix-and-retry
-or explicitly reject. Drift detection runs *before* the snapshot so a
-drift'd diff doesn't pollute the undo stack.
+Atomicity rests on one seam: :func:`apply_diff` runs every op inside a
+single ``flow.transaction(...)``. The transaction records the whole batch
+as one undo point (nested ``add_<node_type>`` calls record nothing of
+their own) and, if any op raises mid-batch, restores the pre-batch graph
+without touching the undo/redo stacks; the diff is left in the store for
+the user to fix-and-retry or explicitly reject. Drift detection runs
+*before* the transaction so a drift'd diff never touches the graph.
 
 The store is repository-backed (in-memory in tests, disk-backed under
 ``{user_dir}/ai_sessions/{flow_id}/`` in production) without changing
@@ -53,9 +46,7 @@ from shared.storage_config import storage
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------- #
-# Per-op staged payload shapes                                                 #
-# --------------------------------------------------------------------------- #
+# Per-op staged payload shapes
 
 
 class StagedInsertionContext(BaseModel):
@@ -125,9 +116,7 @@ class StagedSettingsUpdate(BaseModel):
     audit_id: int | None = None
 
 
-# --------------------------------------------------------------------------- #
-# GraphDiff bundle                                                             #
-# --------------------------------------------------------------------------- #
+# GraphDiff bundle
 
 
 class GraphDiff(BaseModel):
@@ -174,9 +163,7 @@ class ApplyResult(BaseModel):
     audit_ids: list[int] = Field(default_factory=list)
 
 
-# --------------------------------------------------------------------------- #
-# Errors                                                                       #
-# --------------------------------------------------------------------------- #
+# Errors
 
 
 class DiffDriftError(Exception):
@@ -214,9 +201,7 @@ class DiffInconsistentError(Exception):
         super().__init__(f"diff has inconsistent connection endpoints: {self.missing_endpoints}")
 
 
-# --------------------------------------------------------------------------- #
-# DiffStore — repository-backed. Public surface stable across backends         #
-# --------------------------------------------------------------------------- #
+# DiffStore — repository-backed. Public surface stable across backends
 
 
 def _build_default_repo() -> DiffRepository:
@@ -277,9 +262,7 @@ def clear_for_tests() -> None:
     set_diff_repo(InMemoryDiffRepository())
 
 
-# --------------------------------------------------------------------------- #
-# Audit-id walker                                                              #
-# --------------------------------------------------------------------------- #
+# Audit-id walker
 
 
 _GRAPH_PREFIX = "flowfile.graph."
@@ -320,17 +303,9 @@ class AppliedNodeRecord(BaseModel):
     tool_name: str = Field(min_length=1)
     audit_id: int | None = None
     node_id: int
-    """The id assigned by the executor / planner — the live node id
-    in ``flow.nodes`` after the apply succeeds."""
     node_type: str = Field(min_length=1)
     rationale: str = ""
     output_schema: list[dict[str, Any]] = Field(default_factory=list)
-    """The real (Performance-mode runtime) or sample-derived
-    (Development-mode) output schema captured in the post-apply
-    observation. Same shape as
-    ``StagedToolEntry.staged_node_payload['predicted_output_schema']``
-    so frontend rendering can branch on the surface alone, not the
-    record shape."""
 
 
 def bundle_staged_results(staged: list[StagedToolEntry]) -> GraphDiff:
@@ -501,9 +476,7 @@ def collect_audit_ids(diff: GraphDiff) -> list[int]:
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Drift detection                                                              #
-# --------------------------------------------------------------------------- #
+# Drift detection
 
 
 def validate_diff_against_flow(flow, diff: GraphDiff) -> None:
@@ -589,22 +562,20 @@ def validate_diff_against_flow(flow, diff: GraphDiff) -> None:
         raise DiffInconsistentError(inconsistent)
 
 
-# --------------------------------------------------------------------------- #
-# Apply orchestrator                                                           #
-# --------------------------------------------------------------------------- #
+# Apply orchestrator
 
 
 def apply_diff(flow, diff: GraphDiff) -> ApplyResult:
     """Atomically apply every op in ``diff`` to ``flow`` under one history snapshot.
 
     On success, the undo stack grows by exactly **1** entry — the
-    :data:`HistoryActionType.BATCH` snapshot taken before the batch — so
-    the user undoes the whole AI suggestion in one click.
+    :data:`HistoryActionType.BATCH` step for the whole batch — so the user
+    undoes the whole AI suggestion in one click.
 
-    On failure, ``flow.undo()`` rolls back the snapshot and the graph is
-    left indistinguishable from its pre-apply state. The diff itself stays
-    in the :data:`_DIFFS` store; the route layer decides whether to surface
-    the error as 422 (mid-batch raise), 409 (drift detected), or other.
+    On failure the transaction restores the pre-apply graph and leaves the
+    undo/redo stacks untouched. The diff itself stays in the :data:`_DIFFS`
+    store; the route layer decides whether to surface the error as 422
+    (mid-batch raise), 409 (drift detected), or other.
     """
     validate_diff_against_flow(flow, diff)
 
@@ -616,10 +587,6 @@ def apply_diff(flow, diff: GraphDiff) -> ApplyResult:
         + len(diff.connections_removed)
     )
     description = f"AI diff: {diff.rationale}" if diff.rationale else f"AI diff ({op_count} ops)"
-    flow.capture_history_snapshot(HistoryActionType.BATCH, description)
-
-    prior_track = flow.flow_settings.track_history
-    flow.flow_settings.track_history = False
 
     applied_node_ids: list[int] = []
     modified_node_ids: list[int] = []
@@ -627,15 +594,15 @@ def apply_diff(flow, diff: GraphDiff) -> ApplyResult:
     removed_node_ids: list[int] = []
     removed_connection_count = 0
 
-    try:
-        # Lazy import: ``flow_graph`` pulls in heavy machinery that other
-        # AI modules (executor, audit, providers) deliberately keep out of
-        # their import-time graph; this ``diff`` module imports lightly so
-        # tests can stub ``flow_graph`` symbols where needed.
-        from fastapi import HTTPException
+    # Lazy import: ``flow_graph`` pulls in heavy machinery that other
+    # AI modules (executor, audit, providers) deliberately keep out of
+    # their import-time graph; this ``diff`` module imports lightly so
+    # tests can stub ``flow_graph`` symbols where needed.
+    from fastapi import HTTPException
 
-        from flowfile_core.flowfile.flow_graph import add_connection, delete_connection
+    from flowfile_core.flowfile.flow_graph import add_connection, delete_connection
 
+    with flow.transaction(description, HistoryActionType.BATCH):
         for add in diff.additions:
             ctx = InsertionContext(**add.insertion_context.model_dump())
             settings_cls = get_settings_class_for_node_type(add.node_type)
@@ -696,10 +663,11 @@ def apply_diff(flow, diff: GraphDiff) -> ApplyResult:
                 # Narrow catch: only the "Connection does not exist" 422 gets
                 # swallowed. ``add_connection``'s cycle-detection 422 lives in
                 # the other loop and is unaffected; any other HTTPException
-                # (genuine errors) bubbles up to the outer rollback.
+                # (genuine errors) bubbles up to the transaction rollback.
                 if exc.status_code == 422 and "Connection does not exist" in str(exc.detail):
                     logger.info(
-                        "apply_diff: connection %s -> %s (%s) already absent; skipping redundant connections_removed op",
+                        "apply_diff: connection %s -> %s (%s) already absent; "
+                        "skipping redundant connections_removed op",
                         connection.output_connection.node_id,
                         connection.input_connection.node_id,
                         connection.input_connection.connection_class,
@@ -707,14 +675,6 @@ def apply_diff(flow, diff: GraphDiff) -> ApplyResult:
                     continue
                 raise
             removed_connection_count += 1
-    except Exception:
-        try:
-            flow.undo()
-        except Exception as undo_exc:
-            logger.error("rollback after partial apply failed for diff %s: %s", diff.diff_id, undo_exc)
-        raise
-    finally:
-        flow.flow_settings.track_history = prior_track
 
     return ApplyResult(
         diff_id=diff.diff_id,

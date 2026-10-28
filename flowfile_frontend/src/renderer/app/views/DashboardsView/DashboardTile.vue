@@ -1,12 +1,18 @@
 <template>
   <div
+    ref="rootEl"
     class="tile"
     :class="{
       'tile-text': isText,
       'tile-text-view': isText && mode === 'view',
+      'tile-separator': isSeparator,
+      'tile-separator-vertical': isSeparator && isVertical,
+      'tile-separator-edit': isSeparator && mode === 'edit',
     }"
+    :style="tileStyle"
+    @contextmenu="onTileContextMenu"
   >
-    <div v-if="!isText" class="tile-header" :class="{ 'tile-handle': mode === 'edit' }">
+    <div v-if="isViz" class="tile-header" :class="{ 'tile-handle': mode === 'edit' }">
       <span class="tile-title">{{ headerTitle }}</span>
       <div class="tile-header-actions">
         <span v-if="lastError" class="tile-error" :title="lastError"
@@ -31,13 +37,25 @@
       </div>
     </div>
 
-    <div v-if="isText && mode === 'edit' && !textEditing" class="tile-text-actions" @mousedown.stop>
+    <div v-if="!isViz && mode === 'edit' && !textEditing" class="tile-text-actions" @mousedown.stop>
       <el-dropdown trigger="click" @click.stop>
         <el-icon class="tile-menu"><MoreFilled /></el-icon>
         <template #dropdown>
           <el-dropdown-menu>
-            <el-dropdown-item @click="toggleTextEdit">
+            <el-dropdown-item v-if="isText" @click="toggleTextEdit">
               <el-icon><EditPen /></el-icon> Edit text
+            </el-dropdown-item>
+            <el-dropdown-item v-if="isKpi" @click="kpiRef?.openSettings()">
+              <el-icon><Odometer /></el-icon> Edit KPI
+            </el-dropdown-item>
+            <el-dropdown-item v-if="isSeparator || isKpi" @click="openStyleMenu">
+              <el-icon><Brush /></el-icon> Style
+            </el-dropdown-item>
+            <el-dropdown-item
+              v-if="isSeparator"
+              @click="setOrientation(isVertical ? 'horizontal' : 'vertical')"
+            >
+              <el-icon><Switch /></el-icon> Make {{ isVertical ? "horizontal" : "vertical" }}
             </el-dropdown-item>
             <el-dropdown-item divided @click="emit('remove')">
               <el-icon><Delete /></el-icon> Remove from dashboard
@@ -47,8 +65,9 @@
       </el-dropdown>
     </div>
 
-    <div class="tile-body" :class="{ 'tile-handle': isText && mode === 'edit' && !textEditing }">
-      <template v-if="isText">
+    <div class="tile-body" :class="{ 'tile-handle': !isViz && mode === 'edit' && !textEditing }">
+      <div v-if="isSeparator" class="tile-separator-line" :style="separatorLineStyle" />
+      <template v-else-if="isText">
         <textarea
           v-if="mode === 'edit' && textEditing"
           ref="textareaEl"
@@ -59,23 +78,32 @@
         />
         <div
           v-else-if="!renderedHtml"
-          class="tile-state tile-text-empty"
+          class="tile-text-empty"
           :title="mode === 'edit' ? 'Double-click to edit' : undefined"
           @dblclick="enterTextEdit"
-        >
-          <el-icon><EditPen /></el-icon>
-          <span>{{ mode === "edit" ? "Double-click to add content." : "Empty text block" }}</span>
-        </div>
+        />
         <!-- eslint-disable vue/no-v-html -- renderedHtml is DOMPurify-sanitised marked output -->
         <div
           v-else
           class="text-rendered"
+          :class="{ 'tile-text-colored': !!tile.text_color }"
+          :style="textStyle"
           :title="mode === 'edit' ? 'Double-click to edit' : undefined"
           @dblclick="enterTextEdit"
           v-html="renderedHtml"
         />
         <!-- eslint-enable vue/no-v-html -->
       </template>
+      <KpiTile
+        v-else-if="isKpi"
+        ref="kpiRef"
+        :tile="tile"
+        :mode="mode"
+        :filters="filters"
+        :tile-datasource="tileDatasource"
+        :viz-refresh-nonce="vizRefreshNonce"
+        @update:tile="emit('update:tile', $event)"
+      />
       <template v-else>
         <div
           class="tile-viz-body"
@@ -113,6 +141,126 @@
         </div>
       </template>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="colorMenu.visible"
+        ref="colorMenuEl"
+        class="tile-color-menu"
+        :style="{ left: `${colorMenu.x}px`, top: `${colorMenu.y}px` }"
+      >
+        <template v-if="isSeparator">
+          <div class="tile-color-menu-title">Line</div>
+          <div class="tile-color-swatches">
+            <button
+              v-for="preset in textPresets"
+              :key="preset.value ?? 'line-none'"
+              type="button"
+              class="tile-color-swatch"
+              :class="{
+                'is-none': preset.value === null,
+                'is-active': (tile.line_color ?? null) === preset.value,
+              }"
+              :style="preset.value ? { background: preset.value } : undefined"
+              :title="preset.label"
+              @click="setLineColor(preset.value)"
+            >
+              <el-icon v-if="preset.value === null"><Close /></el-icon>
+            </button>
+            <label class="tile-color-swatch tile-color-custom" title="Custom color">
+              <input
+                type="color"
+                :value="tile.line_color || '#000000'"
+                @change="setLineColor(($event.target as HTMLInputElement).value)"
+              />
+            </label>
+          </div>
+          <div class="tile-color-menu-title">Thickness</div>
+          <div class="tile-color-swatches">
+            <button
+              v-for="t in thicknessOptions"
+              :key="t"
+              type="button"
+              class="tile-color-swatch tile-thickness"
+              :class="{ 'is-active': separatorThickness === t }"
+              :title="`${t}px`"
+              @click="setThickness(t)"
+            >
+              {{ t }}
+            </button>
+          </div>
+          <div class="tile-color-menu-title">Orientation</div>
+          <div class="tile-color-swatches">
+            <el-button
+              size="small"
+              :type="isVertical ? undefined : 'primary'"
+              @click="setOrientation('horizontal')"
+            >
+              Horizontal
+            </el-button>
+            <el-button
+              size="small"
+              :type="isVertical ? 'primary' : undefined"
+              @click="setOrientation('vertical')"
+            >
+              Vertical
+            </el-button>
+          </div>
+        </template>
+        <template v-else>
+          <div class="tile-color-menu-title">Background</div>
+          <div class="tile-color-swatches">
+            <button
+              v-for="preset in bgPresets"
+              :key="preset.value ?? 'bg-none'"
+              type="button"
+              class="tile-color-swatch"
+              :class="{
+                'is-none': preset.value === null,
+                'is-active': (tile.bg_color ?? null) === preset.value,
+              }"
+              :style="preset.value ? { background: preset.value } : undefined"
+              :title="preset.label"
+              @click="setBg(preset.value)"
+            >
+              <el-icon v-if="preset.value === null"><Close /></el-icon>
+            </button>
+            <label class="tile-color-swatch tile-color-custom" title="Custom color">
+              <input
+                type="color"
+                :value="tile.bg_color || '#ffffff'"
+                @change="setBg(($event.target as HTMLInputElement).value)"
+              />
+            </label>
+          </div>
+          <div class="tile-color-menu-title">Text</div>
+          <div class="tile-color-swatches">
+            <button
+              v-for="preset in textPresets"
+              :key="preset.value ?? 'text-none'"
+              type="button"
+              class="tile-color-swatch"
+              :class="{
+                'is-none': preset.value === null,
+                'is-active': (tile.text_color ?? null) === preset.value,
+              }"
+              :style="preset.value ? { background: preset.value } : undefined"
+              :title="preset.label"
+              @click="setTextColor(preset.value)"
+            >
+              <el-icon v-if="preset.value === null"><Close /></el-icon>
+            </button>
+            <label class="tile-color-swatch tile-color-custom" title="Custom color">
+              <input
+                type="color"
+                :value="tile.text_color || '#000000'"
+                @change="setTextColor(($event.target as HTMLInputElement).value)"
+              />
+            </label>
+          </div>
+        </template>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -121,15 +269,19 @@
 //   - Move :deep() markdown styles (~lines 399-484) to an external _markdown.css import
 //   - TextTile.vue (~62-88) and VizTile.vue (~91-108) child components
 //   - useDashboardTileViz composable: viz loading (~lines 155-234)
-import { computed, nextTick, onMounted, ref, toRef, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, toRef, watch } from "vue";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import {
+  Brush,
+  Close,
   Delete,
   Edit,
   EditPen,
   MoreFilled,
+  Odometer,
   Rank,
+  Switch,
   Warning,
   WarningFilled,
 } from "@element-plus/icons-vue";
@@ -137,8 +289,15 @@ import { CatalogApi } from "../../api/catalog.api";
 import {
   useDashboardComputation,
   filtersTargetingTile,
+  type TileField,
 } from "../../composables/useDashboardComputation";
-import type { CatalogVisualization, DashboardFilter, DashboardTile } from "../../types";
+import type {
+  CatalogVisualization,
+  DashboardFilter,
+  DashboardTile,
+  SeparatorOrientation,
+} from "../../types";
+import KpiTile from "./KpiTile.vue";
 import VueGraphicRenderer from "../../components/nodes/node-types/elements/exploreData/vueGraphicWalker/VueGraphicRenderer.vue";
 
 const props = defineProps<{
@@ -150,6 +309,8 @@ const props = defineProps<{
   vizRefreshNonce?: number;
   /** Resolver for the tile's underlying CatalogTable id (used to gate datasource-bound filters). */
   tileDatasource?: (tileId: string) => number | null;
+  /** Column count of the hosting grid; a horizontal separator spans all of them. */
+  gridCols?: number;
 }>();
 
 const emit = defineEmits<{
@@ -159,6 +320,59 @@ const emit = defineEmits<{
 }>();
 
 const isText = computed(() => props.tile.type === "text");
+const isSeparator = computed(() => props.tile.type === "separator");
+const isKpi = computed(() => props.tile.type === "kpi");
+const isViz = computed(() => props.tile.type === "viz");
+const rootEl = ref<HTMLElement | null>(null);
+const kpiRef = ref<InstanceType<typeof KpiTile> | null>(null);
+
+// ---- separator branch ----
+const isVertical = computed(() => props.tile.orientation === "vertical");
+const thicknessOptions = [1, 2, 3, 4, 6, 8];
+const separatorThickness = computed(() => props.tile.thickness ?? 1);
+const separatorLineStyle = computed(() => {
+  const size = `${separatorThickness.value}px`;
+  const background = props.tile.line_color || undefined;
+  return isVertical.value
+    ? { width: size, height: "100%", background }
+    : { height: size, width: "100%", background };
+});
+
+const setLineColor = (value: string | null) => {
+  const next = value ?? null;
+  if (next !== (props.tile.line_color ?? null)) {
+    emit("update:tile", { ...props.tile, line_color: next });
+  }
+};
+
+const setThickness = (value: number) => {
+  if (value !== separatorThickness.value) emit("update:tile", { ...props.tile, thickness: value });
+};
+
+// Flipping orientation also swaps the footprint: a full-width row becomes a one-column bar.
+const setOrientation = (orientation: SeparatorOrientation) => {
+  if (orientation === (props.tile.orientation ?? "horizontal")) return;
+  const vertical = orientation === "vertical";
+  const cols = props.gridCols ?? 48;
+  const w = vertical ? 2 : cols;
+  emit("update:tile", {
+    ...props.tile,
+    orientation,
+    x: Math.max(0, Math.min(props.tile.x, cols - w)),
+    w,
+    h: vertical ? Math.max(props.tile.h, 4) : 1,
+  });
+};
+
+const openStyleMenu = () => {
+  const rect = rootEl.value?.getBoundingClientRect();
+  if (!rect) return;
+  colorMenu.value = {
+    visible: true,
+    x: Math.max(8, Math.min(rect.right - 240, window.innerWidth - 240)),
+    y: Math.min(rect.bottom + 4, window.innerHeight - 200),
+  };
+};
 
 // ---- viz branch (unchanged behaviour) ----
 const viz = ref<CatalogVisualization | null>(null);
@@ -170,7 +384,7 @@ const vizMissing = ref(false);
 // jump straight into the chart editor. Edit mode already exposes "Edit chart"
 // in the tile dropdown, and dragging dominates there, so we don't compete.
 const vizClickable = computed(
-  () => !isText.value && props.mode === "view" && props.tile.viz_id != null && !vizMissing.value,
+  () => isViz.value && props.mode === "view" && props.tile.viz_id != null && !vizMissing.value,
 );
 
 const onVizDblclick = (e: MouseEvent) => {
@@ -182,10 +396,18 @@ const onVizDblclick = (e: MouseEvent) => {
 const tileRef = toRef(props, "tile");
 const filtersRef = toRef(props, "filters");
 
+// Cross-source filters only apply where a type-compatible column exists; unknown until loaded.
+const tileFields = computed<TileField[] | null>(() =>
+  loading.value
+    ? null
+    : fields.value.map((f) => ({ fid: String(f.fid), semanticType: f.semanticType })),
+);
+
 const { computation, lastError } = useDashboardComputation({
   tile: tileRef,
   filters: filtersRef,
   tileDatasource: (id) => props.tileDatasource?.(id) ?? null,
+  tileFields: () => tileFields.value,
   onMissing: () => {
     vizMissing.value = true;
   },
@@ -208,6 +430,7 @@ const filterKey = computed(() => {
     props.filters,
     props.tile.id,
     (id) => props.tileDatasource?.(id) ?? null,
+    tileFields.value,
   );
   return JSON.stringify(targeted.map((f) => [f.id, f.state]));
 });
@@ -216,7 +439,7 @@ const rendererKey = computed(
 );
 
 const reloadViz = async () => {
-  if (isText.value) {
+  if (!isViz.value) {
     loading.value = false;
     return;
   }
@@ -299,6 +522,95 @@ const toggleTextEdit = async () => {
 };
 
 const headerTitle = computed(() => vizName.value);
+
+const tileStyle = computed(() =>
+  (isText.value || isKpi.value) && props.tile.bg_color
+    ? { background: props.tile.bg_color }
+    : undefined,
+);
+const textStyle = computed(() =>
+  isText.value && props.tile.text_color ? { color: props.tile.text_color } : undefined,
+);
+
+const bgPresets: { label: string; value: string | null }[] = [
+  { label: "Default", value: null },
+  { label: "Slate", value: "#f1f5f9" },
+  { label: "Amber", value: "#fef3c7" },
+  { label: "Green", value: "#dcfce7" },
+  { label: "Blue", value: "#dbeafe" },
+  { label: "Purple", value: "#ede9fe" },
+  { label: "Rose", value: "#fee2e2" },
+];
+const textPresets: { label: string; value: string | null }[] = [
+  { label: "Default", value: null },
+  { label: "Black", value: "#0f172a" },
+  { label: "Gray", value: "#64748b" },
+  { label: "Red", value: "#dc2626" },
+  { label: "Green", value: "#16a34a" },
+  { label: "Blue", value: "#2563eb" },
+  { label: "Purple", value: "#7c3aed" },
+];
+
+const colorMenu = ref({ visible: false, x: 0, y: 0 });
+const colorMenuEl = ref<HTMLElement | null>(null);
+
+const closeColorMenu = () => {
+  colorMenu.value = { ...colorMenu.value, visible: false };
+};
+
+const onTileContextMenu = (e: MouseEvent) => {
+  if (isViz.value || props.mode !== "edit" || textEditing.value) return;
+  e.preventDefault();
+  colorMenu.value = {
+    visible: true,
+    x: Math.min(e.clientX, window.innerWidth - 240),
+    y: Math.min(e.clientY, window.innerHeight - 160),
+  };
+};
+
+const setBg = (value: string | null) => {
+  const next = value ?? null;
+  if (next !== (props.tile.bg_color ?? null))
+    emit("update:tile", { ...props.tile, bg_color: next });
+};
+
+const setTextColor = (value: string | null) => {
+  const next = value ?? null;
+  if (next !== (props.tile.text_color ?? null)) {
+    emit("update:tile", { ...props.tile, text_color: next });
+  }
+};
+
+const onDocPointerDown = (e: MouseEvent) => {
+  if (colorMenuEl.value && !colorMenuEl.value.contains(e.target as Node)) closeColorMenu();
+};
+const onDocKeyDown = (e: KeyboardEvent) => {
+  if (e.key === "Escape") closeColorMenu();
+};
+
+watch(
+  () => colorMenu.value.visible,
+  (open) => {
+    if (open) {
+      document.addEventListener("mousedown", onDocPointerDown, true);
+      document.addEventListener("keydown", onDocKeyDown);
+      window.addEventListener("scroll", closeColorMenu, true);
+      window.addEventListener("resize", closeColorMenu);
+    } else {
+      document.removeEventListener("mousedown", onDocPointerDown, true);
+      document.removeEventListener("keydown", onDocKeyDown);
+      window.removeEventListener("scroll", closeColorMenu, true);
+      window.removeEventListener("resize", closeColorMenu);
+    }
+  },
+);
+
+onBeforeUnmount(() => {
+  document.removeEventListener("mousedown", onDocPointerDown, true);
+  document.removeEventListener("keydown", onDocKeyDown);
+  window.removeEventListener("scroll", closeColorMenu, true);
+  window.removeEventListener("resize", closeColorMenu);
+});
 </script>
 
 <style scoped>
@@ -333,6 +645,36 @@ const headerTitle = computed(() => vizName.value);
 .tile-text-view {
   border: none;
   background: transparent;
+}
+.tile-separator {
+  border: none;
+  background: transparent;
+}
+.tile-separator .tile-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 8px;
+}
+.tile-separator-vertical .tile-body {
+  padding: 8px 0;
+}
+.tile-separator-line {
+  width: 100%;
+  height: 1px;
+  background: var(--el-border-color);
+}
+.tile-thickness {
+  font-size: 11px;
+  font-weight: 600;
+}
+.tile-separator-edit {
+  border-radius: 4px;
+  outline: 1px dashed transparent;
+  transition: outline-color 0.12s ease;
+}
+.tile-separator-edit:hover {
+  outline-color: var(--el-color-primary-light-5);
 }
 .tile-header {
   display: flex;
@@ -433,7 +775,7 @@ const headerTitle = computed(() => vizName.value);
   gap: 6px;
 }
 .tile-text-empty {
-  font-style: italic;
+  height: 100%;
 }
 .tile-missing {
   color: var(--el-color-warning);
@@ -461,6 +803,65 @@ const headerTitle = computed(() => vizName.value);
   font-size: 14px;
   line-height: 1.5;
   color: var(--el-text-color-primary);
+}
+.text-rendered.tile-text-colored :deep(*) {
+  color: inherit;
+}
+
+.tile-color-menu {
+  position: fixed;
+  z-index: 3000;
+  padding: 8px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 6px;
+  background: var(--el-bg-color-overlay);
+  box-shadow: var(--el-box-shadow-light);
+}
+.tile-color-menu-title {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  margin-bottom: 6px;
+}
+.tile-color-swatches {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.tile-color-swatch {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--el-border-color);
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--el-text-color-secondary);
+  background: var(--el-bg-color);
+}
+.tile-color-swatch:hover {
+  border-color: var(--el-color-primary);
+}
+.tile-color-swatch.is-active {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 1px;
+}
+.tile-color-custom {
+  position: relative;
+  overflow: hidden;
+  background: conic-gradient(red, magenta, blue, cyan, lime, yellow, red);
+}
+.tile-color-custom input[type="color"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
+  opacity: 0;
+  cursor: pointer;
 }
 .text-rendered :deep(h1) {
   font-size: 22px;

@@ -1,7 +1,10 @@
+import ast
 import os
 import re
+from contextvars import ContextVar
+from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, ClassVar, Literal, get_args
 
 import polars as pl
 from pydantic import (
@@ -12,12 +15,18 @@ from pydantic import (
     StringConstraints,
     ValidationInfo,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
+from flowfile_core.flowfile.param_types import FlowParameter
 from flowfile_core.schemas import transform_schema
 from flowfile_core.schemas.analysis_schemas import graphic_walker_schemas as gs_schemas
+from flowfile_core.schemas.change_feed import _PARAM_REF_RE as _PARAM_REF_RE
+from flowfile_core.schemas.change_feed import ChangeFeedReadSettings
 from flowfile_core.schemas.cloud_storage_schemas import CloudStorageReadSettings, CloudStorageWriteSettings
+from flowfile_core.schemas.delta_write import MERGE_MODES, validate_delta_write_rules
+from flowfile_core.schemas.sharing_schema import AccessInfo
 from flowfile_core.schemas.yaml_types import (
     NodeCrossJoinYaml,
     NodeFuzzyMatchYaml,
@@ -28,6 +37,25 @@ from flowfile_core.schemas.yaml_types import (
 )
 from flowfile_core.types import DataTypeStr
 from flowfile_core.utils.utils import ensure_similarity_dicts, standardize_col_dtype
+from shared.path_utils import default_scan_extension, ensure_glob_pattern, file_name, is_cloud_path, is_url
+
+keep_paths_as_written: ContextVar[bool] = ContextVar("keep_paths_as_written", default=False)
+"""While set in a context, ``set_absolute_filepath`` keeps a path as written: no ``~``, working directory or links.
+
+A canvas notebook session in a kernel sets it: the kernel mounts no host folder and opens none of these paths
+(core reads the file for it), and core recomputes the absolute path on the host when it checks a push.
+"""
+
+
+def _already_named(path: str, name: str | None) -> bool:
+    """Whether ``path`` already names the file ``name``, so the name is not appended to it: the name is the tail of
+    the path's parts, or text inside its last part. A join appends ``file_name(name)``, since a name written by a
+    Linux kernel for a Windows path may be that whole path."""
+    if not name:
+        return True
+    tail = Path(name).parts
+    return name in Path(path).name or Path(path).parts[-len(tail) :] == tail
+
 
 SecretRef = Annotated[
     str, StringConstraints(min_length=1, max_length=100), Field(description="An ID referencing an encrypted secret.")
@@ -123,6 +151,7 @@ class InputCsvTable(InputTableBase):
     row_delimiter: str = "\n"
     quote_char: str = '"'
     infer_schema_length: int = 10_000
+    infer_schema: bool = True
     truncate_ragged_lines: bool = False
     ignore_errors: bool = False
 
@@ -151,6 +180,14 @@ class InputExcelTable(InputTableBase):
     has_headers: bool = True
     type_inference: bool = False
 
+    @field_validator("sheet_name", mode="before")
+    @classmethod
+    def normalize_sheet_name(cls, v):
+        """A blank sheet name means 'read the first sheet'."""
+        if isinstance(v, str):
+            return v.strip() or None
+        return v
+
     @model_validator(mode="after")
     def validate_range_values(self):
         """Validates that the Excel cell range is logical."""
@@ -164,13 +201,48 @@ class InputExcelTable(InputTableBase):
         return self
 
 
+class InputIpcTable(InputTableBase):
+    """Defines settings for reading an Arrow IPC/Feather file."""
+
+    file_type: Literal["ipc"] = "ipc"
+
+
+class InputNdjsonTable(InputTableBase):
+    """Defines settings for reading a newline-delimited JSON file."""
+
+    file_type: Literal["ndjson"] = "ndjson"
+
+
+class InputAvroTable(InputTableBase):
+    """Defines settings for reading an Avro file."""
+
+    file_type: Literal["avro"] = "avro"
+
+
+class InputIpcStreamTable(InputTableBase):
+    """Defines settings for reading an Arrow IPC *stream* file (``.arrows``).
+
+    Distinct from ``InputIpcTable`` because the stream format has no footer, so polars
+    can only read it eagerly (``read_ipc_stream``); ``scan_ipc`` rejects it.
+    """
+
+    file_type: Literal["ipc_stream"] = "ipc_stream"
+
+
 # Create the discriminated union (similar to OutputTableSettings)
 InputTableSettings = Annotated[
-    InputCsvTable | InputJsonTable | InputParquetTable | InputExcelTable, Field(discriminator="file_type")
+    InputCsvTable
+    | InputJsonTable
+    | InputParquetTable
+    | InputExcelTable
+    | InputIpcTable
+    | InputNdjsonTable
+    | InputAvroTable
+    | InputIpcStreamTable,
+    Field(discriminator="file_type"),
 ]
 
 
-# Now create the main ReceivedTable model
 class ReceivedTable(BaseModel):
     """Model for defining a table received from an external source."""
 
@@ -183,22 +255,40 @@ class ReceivedTable(BaseModel):
     status: str | None = None
     fields: list[MinimalFieldInfo] = Field(default_factory=list)
     abs_file_path: str | None = None
+    scan_mode: Literal["single_file", "directory"] = "single_file"
+    include_file_paths: str | None = None
 
-    file_type: Literal["csv", "json", "parquet", "excel"]
+    file_type: Literal["csv", "json", "parquet", "excel", "ipc", "ndjson", "avro", "ipc_stream"]
 
     table_settings: InputTableSettings
 
+    @field_validator("include_file_paths", mode="before")
     @classmethod
-    def create_from_path(cls, path: str, file_type: Literal["csv", "json", "parquet", "excel"] = "csv"):
+    def normalize_include_file_paths(cls, v):
+        """A blank column name means 'do not add the source-path column'."""
+        if isinstance(v, str):
+            stripped = v.strip()
+            return stripped or None
+        return v
+
+    @classmethod
+    def create_from_path(
+        cls,
+        path: str,
+        file_type: Literal["csv", "json", "parquet", "excel", "ipc", "ndjson", "avro", "ipc_stream"] = "csv",
+    ):
         """Creates an instance from a file path string."""
         filename = Path(path).name
 
-        # Create appropriate table_settings based on file_type
         settings_map = {
             "csv": InputCsvTable(),
             "json": InputJsonTable(),
             "parquet": InputParquetTable(),
             "excel": InputExcelTable(),
+            "ipc": InputIpcTable(),
+            "ndjson": InputNdjsonTable(),
+            "avro": InputAvroTable(),
+            "ipc_stream": InputIpcStreamTable(),
         }
 
         return cls(
@@ -214,13 +304,32 @@ class ReceivedTable(BaseModel):
             return self.path
 
     def set_absolute_filepath(self):
-        """Resolves the path to an absolute file path."""
+        """Resolves the path to an absolute file path (or, in directory mode, to a glob pattern).
+
+        URLs and object-storage URIs are kept verbatim; the reader refuses a cloud URI with an
+        actionable error instead of resolving it into a bogus local path.
+        """
+        if is_url(self.path) or is_cloud_path(self.path):
+            self.abs_file_path = self.path
+            return
+        if keep_paths_as_written.get():
+            resolved = self.path
+            if self.scan_mode == "single_file" and not _already_named(resolved, self.name):
+                resolved = os.path.join(resolved, file_name(self.name))
+            if self.scan_mode == "directory":
+                resolved = ensure_glob_pattern(resolved, default_scan_extension(self.file_type))
+            self.abs_file_path = resolved
+            return
         base_path = Path(self.path).expanduser()
         if not base_path.is_absolute():
             base_path = Path.cwd() / base_path
-        if self.name and self.name not in base_path.name:
-            base_path = base_path / self.name
-        self.abs_file_path = str(base_path.resolve())
+        # In directory mode the name is a node label, not a filename to append.
+        if self.scan_mode == "single_file" and not _already_named(str(base_path), self.name):
+            base_path = base_path / file_name(self.name)
+        resolved = str(base_path.resolve())
+        if self.scan_mode == "directory":
+            resolved = ensure_glob_pattern(resolved, default_scan_extension(self.file_type))
+        self.abs_file_path = resolved
 
     @model_validator(mode="before")
     @classmethod
@@ -254,6 +363,8 @@ class OutputParquetTable(BaseModel):
     """Defines settings for writing a Parquet file."""
 
     file_type: Literal["parquet"] = "parquet"
+    # Polars default for write_parquet/sink_parquet
+    compression: Literal["lz4", "uncompressed", "snappy", "gzip", "brotli", "zstd"] = "zstd"
 
 
 class OutputExcelTable(BaseModel):
@@ -263,9 +374,31 @@ class OutputExcelTable(BaseModel):
     sheet_name: str = "Sheet1"
 
 
+class OutputIpcTable(BaseModel):
+    """Defines settings for writing an Arrow IPC/Feather file."""
+
+    file_type: Literal["ipc"] = "ipc"
+    compression: Literal["uncompressed", "lz4", "zstd"] = "uncompressed"
+
+
+class OutputNdjsonTable(BaseModel):
+    """Defines settings for writing a newline-delimited JSON file."""
+
+    file_type: Literal["ndjson"] = "ndjson"
+    compression: Literal["uncompressed", "gzip", "zstd"] = "uncompressed"
+
+
+class OutputAvroTable(BaseModel):
+    """Defines settings for writing an Avro file."""
+
+    file_type: Literal["avro"] = "avro"
+    compression: Literal["uncompressed", "snappy", "deflate"] = "uncompressed"
+
+
 # Create a discriminated union
 OutputTableSettings = Annotated[
-    OutputCsvTable | OutputParquetTable | OutputExcelTable, Field(discriminator="file_type")
+    OutputCsvTable | OutputParquetTable | OutputExcelTable | OutputIpcTable | OutputNdjsonTable | OutputAvroTable,
+    Field(discriminator="file_type"),
 ]
 
 
@@ -294,7 +427,16 @@ class OutputSettings(BaseModel):
             result["fields"] = self.fields
         # Only include table_settings if it has non-default values beyond file_type
         ts_dict = self.table_settings.model_dump(exclude={"file_type"})
-        if any(v for v in ts_dict.values()):  # Has meaningful settings
+        # Drop compression when it equals the format default so YAML stays minimal
+        # and the "omit table_settings when all-default" invariant still holds.
+        compression_field = type(self.table_settings).model_fields.get("compression")
+        if (
+            "compression" in ts_dict
+            and compression_field is not None
+            and ts_dict["compression"] == compression_field.default
+        ):
+            ts_dict.pop("compression")
+        if any(v for v in ts_dict.values()):
             result["table_settings"] = ts_dict
         return result
 
@@ -308,13 +450,16 @@ class OutputSettings(BaseModel):
         if self.file_type == "csv":
             return self.table_settings.delimiter
 
+    @property
+    def compression(self) -> str | None:
+        return getattr(self.table_settings, "compression", None)
+
     @field_validator("table_settings", mode="before")
     @classmethod
     def validate_table_settings(cls, v, info: ValidationInfo):
         """Ensures table_settings matches the file_type."""
         if v is None:
             file_type = info.data.get("file_type", "csv")
-            # Create default based on file_type
             match file_type:
                 case "csv":
                     return OutputCsvTable()
@@ -322,10 +467,15 @@ class OutputSettings(BaseModel):
                     return OutputParquetTable()
                 case "excel":
                     return OutputExcelTable()
+                case "ipc":
+                    return OutputIpcTable()
+                case "ndjson":
+                    return OutputNdjsonTable()
+                case "avro":
+                    return OutputAvroTable()
                 case _:
                     return OutputCsvTable()
 
-        # If it's a dict, add file_type if missing
         if isinstance(v, dict) and "file_type" not in v:
             v["file_type"] = info.data.get("file_type", "csv")
 
@@ -333,11 +483,15 @@ class OutputSettings(BaseModel):
 
     def set_absolute_filepath(self):
         """Resolves the output directory and name into an absolute path."""
+        if keep_paths_as_written.get():
+            named = _already_named(self.directory, self.name)
+            self.abs_file_path = self.directory if named else os.path.join(self.directory, file_name(self.name))
+            return
         base_path = Path(self.directory)
         if not base_path.is_absolute():
             base_path = Path.cwd() / base_path
-        if self.name and self.name not in base_path.name:
-            base_path = base_path / self.name
+        if not _already_named(str(base_path), self.name):
+            base_path = base_path / file_name(self.name)
         self.abs_file_path = str(base_path.resolve())
 
     @model_validator(mode="after")
@@ -359,6 +513,7 @@ class NodeBase(BaseModel):
     cache_results: bool | None = False
     pos_x: float | None = 0
     pos_y: float | None = 0
+    group_id: int | None = None  # Visual group membership (organizational only; no execution impact)
     is_setup: bool | None = True
     description: str | None = ""
     node_reference: str | None = None  # Unique reference identifier for code generation (lowercase, no spaces)
@@ -472,6 +627,16 @@ class NodeFilter(NodeSingleInput):
     # single-output behaviour for existing flows.
     split_mode: bool = False
 
+    @property
+    def output_names(self) -> list[str] | None:
+        """Declared output handles, so the canvas can build both without the drawer.
+
+        The template's ``output`` stays 1 for backwards compatibility; the canvas
+        sizes the handle list off ``max(output, len(output_names))``. Matches the
+        keys ``FlowDataEngine.filter_split`` produces at run time.
+        """
+        return ["pass", "fail"] if self.split_mode else None
+
     def get_default_description(self) -> str:
         """Describes the filter condition."""
         fi = self.filter_input
@@ -522,14 +687,40 @@ class NodeTextToRows(NodeSingleInput):
         return f"Split {t.column_to_split} by '{delim}'"
 
 
-class NodeSample(NodeSingleInput):
-    """Settings for a node that samples a subset of the data."""
+SampleMethod = Literal["first", "random", "random_fraction"]
 
+
+class NodeSample(NodeSingleInput):
+    """Settings for a node that samples a subset of the data.
+
+    ``sample_method`` selects between a cheap top-N slice and a uniform random
+    sample. It defaults to ``"first"`` so flows saved before random sampling
+    existed (which only carry ``sample_size``) keep their exact behaviour.
+    ``fraction`` is a percentage and only read by ``"random_fraction"``;
+    ``seed`` only by the two random methods, where ``None`` means a fresh
+    permutation on every run.
+    """
+
+    sample_method: SampleMethod = "first"
     sample_size: int = 1000
+    fraction: float = 10.0
+    seed: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_sample(self) -> "NodeSample":
+        # sample_size is deliberately unvalidated: the pre-existing UI allowed 0
+        # and saved flows carrying it must keep loading.
+        if self.sample_method == "random_fraction" and not 0 < self.fraction <= 100:
+            raise ValueError("fraction must be greater than 0 and at most 100")
+        return self
 
     def get_default_description(self) -> str:
-        """Describes the sample size."""
-        return f"Sample {self.sample_size} rows"
+        """Describes the sampling method and size."""
+        if self.sample_method == "random":
+            return f"Random {self.sample_size} rows"
+        if self.sample_method == "random_fraction":
+            return f"Random {self.fraction:g}% of rows"
+        return f"First {self.sample_size} rows"
 
 
 class RandomSplitGroup(BaseModel):
@@ -756,9 +947,26 @@ class RawData(BaseModel):
             "order. len(data) must equal len(columns); each inner list has the same "
             "length (one entry per row). For two rows of {name, age}, emit "
             '[["Alice", "Bob"], [30, 25]] — NOT [["Alice", 30], ["Bob", 25]]. '
-            "Reading rows back is data[col_idx][row_idx]."
+            "Reading rows back is `data[col_idx][row_idx]`."
         ),
     )
+
+    @staticmethod
+    def _infer_data_type(column_values: list) -> str:
+        # standardize_col_dtype leaves int/float columns mixed on purpose, so promote
+        # them to Float64 — typing by the first value would truncate floats on cast.
+        types = {type(v) for v in column_values if v is not None}
+        if not types:
+            return str(pl.String())
+        if types == {int, float}:
+            return str(pl.Float64())
+        value_type = next(iter(types))
+        # Nested values have no flat dtype name; the inner type is inferred at construction.
+        if issubclass(value_type, list | tuple):
+            return "List"
+        if issubclass(value_type, dict):
+            return "Struct"
+        return str(pl.DataType.from_python(value_type))
 
     @classmethod
     def from_pylist(cls, pylist: list[dict]):
@@ -767,8 +975,10 @@ class RawData(BaseModel):
             return cls(columns=[], data=[])
         pylist = ensure_similarity_dicts(pylist)
         values = [standardize_col_dtype([vv for vv in c]) for c in zip(*(r.values() for r in pylist), strict=False)]
-        data_types = (pl.DataType.from_python(type(next((v for v in column_values), None))) for column_values in values)
-        columns = [MinimalFieldInfo(name=c, data_type=str(next(data_types))) for c in pylist[0].keys()]
+        columns = [
+            MinimalFieldInfo(name=name, data_type=cls._infer_data_type(column_values))
+            for name, column_values in zip(pylist[0].keys(), values, strict=True)
+        ]
         return cls(columns=columns, data=values)
 
     @classmethod
@@ -777,8 +987,10 @@ class RawData(BaseModel):
         if len(pydict) == 0:
             return cls(columns=[], data=[])
         values = [standardize_col_dtype(column_values) for column_values in pydict.values()]
-        data_types = (pl.DataType.from_python(type(next((v for v in column_values), None))) for column_values in values)
-        columns = [MinimalFieldInfo(name=c, data_type=str(next(data_types))) for c in pydict.keys()]
+        columns = [
+            MinimalFieldInfo(name=name, data_type=cls._infer_data_type(column_values))
+            for name, column_values in zip(pydict.keys(), values, strict=True)
+        ]
         return cls(columns=columns, data=values)
 
     def to_pylist(self) -> list[dict]:
@@ -824,16 +1036,71 @@ class NodeRead(NodeBase):
         return f"{name} ({rf.file_type})"
 
 
+class NodeListFiles(NodeBase):
+    """Settings for a node that lists the files inside a directory.
+
+    The output schema is fixed (see ``LIST_FILES_SCHEMA`` in the flow graph), so the
+    directory is only ever walked at run time — never during schema prediction.
+    """
+
+    path: str = ""
+    file_types: list[str] = Field(default_factory=list)
+    recursive: bool = False
+    max_depth: int = Field(default=5, ge=1, le=50)
+    include_hidden: bool = False
+    include_files: bool = True
+    include_directories: bool = False
+    max_files: int | None = Field(default=None, ge=1)
+
+    @field_validator("file_types", mode="before")
+    @classmethod
+    def _normalize_file_types(cls, v):
+        """Accepts ``.csv``/``CSV``/``csv`` alike and drops blanks."""
+        if v is None:
+            return []
+        if isinstance(v, str):
+            v = [part for part in re.split(r"[,\s]+", v) if part]
+        return [str(t).strip().lstrip(".").lower() for t in v if str(t).strip().lstrip(".")]
+
+    @model_validator(mode="after")
+    def _at_least_one_entry_kind(self):
+        if not self.include_files and not self.include_directories:
+            raise ValueError("list_files must include files, directories, or both")
+        return self
+
+    def get_default_description(self) -> str:
+        """Describes the directory being listed."""
+        if not self.path:
+            return ""
+        name = Path(self.path).name or self.path
+        bits = [name]
+        if self.file_types:
+            bits.append(", ".join(f".{t}" for t in self.file_types[:3]))
+        if self.recursive:
+            bits.append("recursive")
+        return " · ".join(bits)
+
+
 class DatabaseConnection(BaseModel):
     """Defines the connection parameters for a database."""
 
-    database_type: Literal["sqlite", "postgresql", "mysql"] = "postgresql"
+    database_type: str = "postgresql"
     username: str | None = None
     password_ref: SecretRef | None = None
     host: str | None = None
     port: int | None = None
     database: str | None = None
     url: str | None = None
+
+    @field_validator("database_type")
+    @classmethod
+    def known_database_type(cls, v: str) -> str:
+        from shared.db_dialects import KNOWN_DIALECT_NAMES
+
+        low = v.lower()
+        if low not in KNOWN_DIALECT_NAMES:
+            raise ValueError(f"Unsupported database type '{v}'. Supported types: {', '.join(KNOWN_DIALECT_NAMES)}")
+        return low
 
     @field_validator("password_ref", mode="before")
     @classmethod
@@ -856,6 +1123,12 @@ class FullDatabaseConnection(BaseModel):
     ssl_enabled: bool | None = False
     url: str | None = None
 
+    @field_validator("database_type")
+    @classmethod
+    def normalize_database_type(cls, v: str) -> str:
+        # lowercase only, no vocabulary check: legacy stored types (e.g. redshift) must keep loading
+        return v.lower()
+
 
 class FullDatabaseConnectionInterface(BaseModel):
     """A database connection model intended for UI display, omitting the password."""
@@ -868,6 +1141,8 @@ class FullDatabaseConnectionInterface(BaseModel):
     database: str | None = None
     ssl_enabled: bool | None = False
     url: str | None = None
+    id: int | None = None
+    access: AccessInfo | None = None
 
 
 class DatabaseSettings(BaseModel):
@@ -895,11 +1170,9 @@ class DatabaseSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_table_or_query(self):
-        # Validate that either table_name or query is provided
         if (not self.table_name and not self.query) and self.query_mode == "inline":
             raise ValueError("Either 'table_name' or 'query' must be provided")
 
-        # Validate correct connection information based on connection_mode
         if self.connection_mode == "inline" and self.database_connection is None:
             raise ValueError("When 'connection_mode' is 'inline', 'database_connection' must be provided")
 
@@ -973,7 +1246,14 @@ class NodeCloudStorageReader(NodeBase):
     def get_default_description(self) -> str:
         """Describes the cloud storage source."""
         cs = self.cloud_storage_settings
-        return f"Read {cs.resource_path} ({cs.file_format})"
+        suffix = ""
+        if cs.cdc_mode == "since_version":
+            v = cs.cdc_from_version
+            suffix = f" [changes since {v if isinstance(v, str) else f'v{v}'}]"
+        elif cs.cdc_mode == "since_timestamp":
+            suffix = f" [changes since {cs.cdc_from_timestamp}]"
+        source = cs.resource_path if cs.resource_path.strip() else "(no path set)"
+        return f"Read {source} ({cs.file_format}){suffix}"
 
 
 class NodeCloudStorageWriter(NodeSingleInput):
@@ -984,7 +1264,9 @@ class NodeCloudStorageWriter(NodeSingleInput):
     def get_default_description(self) -> str:
         """Describes the cloud storage write target."""
         cs = self.cloud_storage_settings
-        return f"Write to {cs.resource_path} ({cs.file_format})"
+        mode = "" if cs.write_mode == "overwrite" else f", {cs.write_mode}"
+        target = f"to {cs.resource_path}" if cs.resource_path.strip() else "(no path set)"
+        return f"Write {target} ({cs.file_format}{mode})"
 
 
 class ExternalSource(BaseModel):
@@ -1101,20 +1383,210 @@ class NodeGoogleAnalyticsReader(NodeBase):
         return " | ".join(pieces)
 
 
-class NodeFormula(NodeSingleInput):
-    """Settings for a node that applies a formula to create/modify a column."""
+class RestApiAuthSettings(BaseModel):
+    """Authentication settings for a REST API reader node.
 
-    function: transform_schema.FunctionInput = None
+    The credential (API key / bearer token / basic password, per ``auth_type``)
+    is NOT stored inline. ``secret_name`` references a secret in the user's
+    secret store — created once via the Secrets manager and reusable across
+    nodes — mirroring how the database reader references a stored password. The
+    ``.flowfile`` persists only the reference name, never the credential itself.
+
+    ``secret`` is an optional inline plaintext for programmatic use
+    (``flowfile_frame.read_api``); it is encrypted with the master key and
+    cleared, never persisted.
+    """
+
+    auth_type: Literal["none", "api_key", "bearer", "basic"] = "none"
+    # API key placement
+    api_key_name: str = "X-API-Key"
+    api_key_location: Literal["header", "query"] = "header"
+    # Basic auth username (not secret)
+    basic_username: str = ""
+    # Reference to a stored secret holding the credential value (empty = none).
+    secret_name: str = ""
+    # Optional inline plaintext for programmatic use; encrypted, never persisted.
+    secret: str | None = None
+
+
+class RestApiPaginationSettings(BaseModel):
+    """Pagination strategy and parameters for a REST API reader node."""
+
+    pagination_type: Literal["none", "offset", "page", "cursor"] = "none"
+    # offset / limit
+    offset_param: str = "offset"
+    limit_param: str = "limit"
+    page_size: int = 100
+    # page number
+    page_param: str = "page"
+    start_page: int = 1
+    # cursor / next-page token
+    cursor_param: str = "cursor"
+    cursor_location: Literal["body", "header"] = "body"
+    cursor_response_path: str = ""
+    initial_cursor: str = ""
+    # safety caps
+    max_pages: int = 1000
+    max_records: int | None = None
+    page_delay_seconds: float = 0.0
+
+
+class RestApiSettings(BaseModel):
+    """UI settings for a REST API reader node.
+
+    Secrets are stored inline but encrypted (see ``RestApiAuthSettings``). JSON
+    is the only supported response format; ``record_path`` is a dot-path that
+    locates the record array within the response body (empty = top-level).
+    """
+
+    url: str = ""
+    method: Literal["GET", "POST"] = "GET"
+    headers: dict[str, str] = Field(default_factory=dict)
+    query_params: dict[str, str] = Field(default_factory=dict)
+    json_body: Any | None = None
+    auth: RestApiAuthSettings = Field(default_factory=RestApiAuthSettings)
+    pagination: RestApiPaginationSettings = Field(default_factory=RestApiPaginationSettings)
+    record_path: str = ""
+    timeout_seconds: float = 30.0
+    max_retries: int = 3
+
+
+class NodeRestApiReader(NodeBase):
+    """Settings for a node that reads from a REST API."""
+
+    rest_api_settings: RestApiSettings
+    fields: list[MinimalFieldInfo] | None = None
 
     def get_default_description(self) -> str:
-        """Describes the formula being applied."""
-        if self.function is None:
+        """Describes the REST API request."""
+        s = self.rest_api_settings
+        pieces: list[str] = []
+        if s.url:
+            pieces.append(f"{s.method} {s.url}")
+        if s.pagination and s.pagination.pagination_type != "none":
+            pieces.append(f"paginated: {s.pagination.pagination_type}")
+        return " | ".join(pieces)
+
+
+class NodeFormula(NodeSingleInput):
+    """Settings for a node that applies an ordered list of formulas to create/modify columns.
+
+    Entries are evaluated SEQUENTIALLY: entry N sees the base columns plus the outputs of
+    entries 1..N-1, exactly equivalent to N chained single-formula nodes. This is the
+    deliberate opposite of ``FlowDataEngine.build_multi_field_formula_expressions``, which
+    puts every expression in a SINGLE ``with_columns`` call so each one reads the ORIGINAL
+    input values.
+
+    ``function`` is the legacy single-entry field; ``functions`` is the ordered list and is
+    authoritative. Normalisation fills ``functions`` from ``function`` when only the legacy
+    field was given (so flows saved before multi-entry load unchanged), then mirrors it back
+    onto ``function`` — the SAME object, not a copy — only when there is exactly one entry.
+    On dump the ``function`` key is omitted entirely for zero or 2+ entries, so an older
+    Flowfile fails visibly on a multi-entry node instead of silently running only entry 1.
+    """
+
+    function: transform_schema.FunctionInput | None = None
+    functions: list[transform_schema.FunctionInput] | None = None
+
+    @model_validator(mode="after")
+    def _normalize_entries(self) -> "NodeFormula":
+        if self.functions is None:
+            self.functions = [self.function] if self.function is not None else []
+        self.function = self.functions[0] if len(self.functions) == 1 else None
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_entries(self, handler: Any, _info: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and len(self.entries) != 1:
+            data.pop("function", None)
+        return data
+
+    @property
+    def entries(self) -> list[transform_schema.FunctionInput]:
+        """The ordered formula entries; empty when the node produces nothing."""
+        return self.functions or []
+
+    def active_entries(self) -> list[tuple[int, transform_schema.FunctionInput]]:
+        """The entries with a non-blank expression, each with its 1-based row position.
+
+        Positions count blank rows too, so an error message names the row the user sees.
+        Blank expressions are skipped entirely: no column, no error.
+        """
+        return [
+            (position, entry)
+            for position, entry in enumerate(self.entries, start=1)
+            if entry is not None and (entry.function or "").strip()
+        ]
+
+    @staticmethod
+    def _describe_entry(entry: transform_schema.FunctionInput, max_expression_length: int) -> str:
+        name = entry.field.name if entry.field else ""
+        expr = entry.function or ""
+        if len(expr) > max_expression_length:
+            expr = expr[: max_expression_length - 3] + "..."
+        return f"{name} = {expr}" if name else expr
+
+    def get_default_description(self) -> str:
+        """Describes the formula(s) being applied."""
+        entries = self.entries
+        if not entries:
             return ""
-        name = self.function.field.name if self.function.field else ""
-        expr = self.function.function or ""
+        if len(entries) == 1:
+            return self._describe_entry(entries[0], 60)
+        description = "; ".join(self._describe_entry(entry, 24) for entry in entries[:2])
+        remaining = len(entries) - 2
+        return f"{description}; +{remaining} more" if remaining > 0 else description
+
+
+class NodeMultiFieldFormula(NodeSingleInput):
+    """Settings for a node that applies one formula to many columns at once."""
+
+    multi_field_formula_input: transform_schema.MultiFieldFormulaInput = Field(
+        default_factory=transform_schema.MultiFieldFormulaInput
+    )
+
+    def get_default_description(self) -> str:
+        """Describes the formula, the columns it targets and where the results land."""
+        s = self.multi_field_formula_input
+        expr = (s.formula or "").strip()
+        if not expr:
+            return ""
         if len(expr) > 60:
             expr = expr[:57] + "..."
-        return f"{name} = {expr}" if name else expr
+        if s.selection_mode == "all":
+            scope = "all columns"
+        elif s.selection_mode == "list":
+            scope = f"{len(s.selected_columns)} column(s)"
+        else:
+            scope = f"{s.selected_data_type or '(none)'} columns"
+        description = f"{expr} on {scope}"
+        if s.output_mode == "new":
+            description += f" → {s.output_prefix}*{s.output_suffix}"
+        return description
+
+
+class NodeWindowFunctions(NodeSingleInput):
+    """Settings for a node that adds rolling, cumulative, rank or tile columns."""
+
+    window_input: transform_schema.WindowFunctionsInput = Field(default_factory=transform_schema.WindowFunctionsInput)
+
+    def get_default_description(self) -> str:
+        """Describes the configured window functions."""
+        if self.window_input is None or not self.window_input.window_functions:
+            return ""
+        parts: list[str] = []
+        if self.window_input.partition_by:
+            cols = ", ".join(self.window_input.partition_by[:3])
+            if len(self.window_input.partition_by) > 3:
+                cols += f" (+{len(self.window_input.partition_by) - 3} more)"
+            parts.append(f"By {cols}")
+        ops = self.window_input.window_functions
+        op_strs = [f"{w.function}({w.column or ''})".replace("()", "()") for w in ops[:3]]
+        if len(ops) > 3:
+            op_strs.append(f"+{len(ops) - 3} more")
+        parts.append(", ".join(op_strs))
+        return ": ".join(parts)
 
 
 class NodeGroupBy(NodeSingleInput):
@@ -1248,19 +1720,250 @@ class NodeOutput(NodeSingleInput):
         return result
 
 
+class NodeApiResponse(NodeSingleInput):
+    """Settings for a node that marks its input as the body of an HTTP API response.
+
+    This node is a sink (one input, no output). When the flow is published as an
+    API endpoint, the data flowing into this node is serialized and returned to the
+    caller. During interactive runs it is a pass-through (its result equals its
+    input), so previews keep working.
+    """
+
+    orientation: Literal["records", "columns"] = "records"
+    max_rows: int | None = None
+
+    def get_default_description(self) -> str:
+        """Describes the API response shape."""
+        limit = f", max {self.max_rows} rows" if self.max_rows else ""
+        return f"API response ({self.orientation}{limit})"
+
+
+def _validate_port_name(name: str, kind: str) -> str:
+    """Shared validator for flow_input/flow_output port names."""
+    if not name or not name[0].isalpha() or not all(c.isalnum() or c == "_" for c in name):
+        raise ValueError(f"Invalid {kind} name: {name!r} (must start with a letter; alphanumeric/underscore only)")
+    return name
+
+
+class NodeFlowInput(NodeManualInput):
+    """Named source placeholder inside a subflow.
+
+    Extends NodeManualInput so the sample data reuses the manual-input settings
+    shape and editor. Standalone runs serve ``raw_data_format`` (empty frame when
+    blank); a parent run_flow node injects real data at execution time.
+    """
+
+    input_name: str = "input"
+
+    @field_validator("input_name")
+    @classmethod
+    def _validate_input_name(cls, v: str) -> str:
+        return _validate_port_name(v, "flow input")
+
+    def get_default_description(self) -> str:
+        return f"Subflow input '{self.input_name}'"
+
+
+class NodeFlowOutput(NodeSingleInput):
+    """Named passthrough sink marking a subflow output; multiple allowed per flow."""
+
+    output_name: str = "output"
+
+    @field_validator("output_name")
+    @classmethod
+    def _validate_output_name(cls, v: str) -> str:
+        return _validate_port_name(v, "flow output")
+
+    def get_default_description(self) -> str:
+        return f"Subflow output '{self.output_name}'"
+
+
+class SubflowReference(BaseModel):
+    """Reference to a catalog-registered flow.
+
+    ``flow_uuid`` is the flow's identity and resolves first. ``registration_id`` is
+    install-local, so it resolves only a reference without a uuid. ``namespace`` (the
+    full ``"catalog.schema"`` name) and ``name`` find the flow on an install where
+    neither resolves. Placing the node re-stamps every field from the registration
+    found; ``flow_path`` is display-only.
+    """
+
+    registration_id: int
+    flow_uuid: str | None = None
+    flow_path: str | None = None
+    namespace: str | None = None
+    name: str | None = None
+
+
+class RunFlowParameterBinding(BaseModel):
+    """How one subflow parameter gets its value for a run_flow execution."""
+
+    parameter_name: str
+    source: Literal["default", "constant", "column"] = "default"
+    constant_value: str | None = None
+    column_name: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_source_value(self) -> "RunFlowParameterBinding":
+        if self.source == "constant" and self.constant_value is None:
+            raise ValueError(f"parameter '{self.parameter_name}': constant binding requires constant_value")
+        if self.source == "column" and not self.column_name:
+            raise ValueError(f"parameter '{self.parameter_name}': column binding requires column_name")
+        return self
+
+
+class NodeRunFlow(NodeBase):
+    """Settings for a node that executes a catalog-registered flow as a subflow.
+
+    ``input_slots``/``output_slots`` persist the last-synced subflow interface
+    (flow_input/flow_output names in interface order); connections are keyed to
+    handles positionally against them (handle ``input-{i+1}`` <-> input_slots[i];
+    ``input-0`` is the reserved parameter-data handle).
+    """
+
+    flow_reference: SubflowReference
+    input_slots: list[str] = Field(default_factory=list)
+    output_slots: list[str] = Field(default_factory=list)
+    parameter_specs: list[FlowParameter] = Field(default_factory=list)
+    parameter_bindings: list[RunFlowParameterBinding] = Field(default_factory=list)
+    iteration_mode: Literal["first_value", "iterate"] = "first_value"
+    append_run_metadata: bool = True
+
+    @property
+    def input_names(self) -> list[str]:
+        """Handle labels, index i <-> handle input-i (index 0 = parameter handle).
+
+        An empty label at index 0 tells the frontend to hide the parameter
+        handle (the subflow has no parameters); data handles keep input-1..N.
+        """
+        param_label = "Parameters" if (self.parameter_specs or self.parameter_bindings) else ""
+        return [param_label, *self.input_slots]
+
+    @property
+    def output_names(self) -> list[str]:
+        return list(self.output_slots)
+
+    @model_validator(mode="after")
+    def _validate_slots_and_bindings(self) -> "NodeRunFlow":
+        if len(self.input_slots) > 9:
+            raise ValueError("Subflows with more than 9 data inputs are not supported")
+        if len(self.output_slots) > 10:
+            raise ValueError("Subflows with more than 10 outputs are not supported")
+        if len(set(self.input_slots)) != len(self.input_slots):
+            raise ValueError("input_slots must be unique")
+        if len(set(self.output_slots)) != len(self.output_slots):
+            raise ValueError("output_slots must be unique")
+        binding_names = [b.parameter_name for b in self.parameter_bindings]
+        if len(set(binding_names)) != len(binding_names):
+            raise ValueError("Duplicate parameter bindings")
+        return self
+
+    def get_default_description(self) -> str:
+        name = self.flow_reference.flow_path or f"registration {self.flow_reference.registration_id}"
+        mode = "per row" if self.iteration_mode == "iterate" else "once"
+        return f"Run flow {Path(name).stem if self.flow_reference.flow_path else name} ({mode})"
+
+
+_SCD2_COLUMN_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+class Scd2Settings(BaseModel):
+    """Slowly-changing-dimension type 2 configuration for a catalog write.
+
+    The business key is ``CatalogWriteSettings.merge_keys`` — this block only carries the
+    change-detection scope and the names of the four generated columns. It is persisted verbatim
+    onto the catalog table record (``CatalogTable.scd2_config``) so a reader can filter history
+    without ever reading a writer node's settings — minus ``partition_on_current`` and
+    ``output_mode``, which describe this write rather than the table's shape.
+    """
+
+    compare_columns: list[str] = Field(default_factory=list)  # empty => every non-key, non-system column
+    full_snapshot: bool = False  # True => current keys absent from the input get end-dated
+    partition_on_current: bool = True  # partition new tables by the is-current column (creation-time)
+    # What the writer node emits downstream. Node-local, never persisted on the table record.
+    output_mode: Literal["input", "changed", "current"] = "input"
+    surrogate_key_column: str = "sk"
+    valid_from_column: str = "valid_from"
+    valid_to_column: str = "valid_to"
+    is_current_column: str = "is_current"
+
+    @property
+    def system_columns(self) -> list[str]:
+        """The four generated column names, in the primitive's canonical order."""
+        return [
+            self.surrogate_key_column,
+            self.valid_from_column,
+            self.valid_to_column,
+            self.is_current_column,
+        ]
+
+    @model_validator(mode="after")
+    def _validate_scd2_columns(self) -> "Scd2Settings":
+        cols = self.system_columns
+        if any((not c) or c != c.strip() for c in cols):
+            raise ValueError("SCD2 column names must be non-empty and free of surrounding whitespace")
+        # Server-side mirror of the writer form's CATALOG_NAME_PATTERN: these four names are
+        # generated, not data, and they are spliced into the Delta merge's SQL identifiers.
+        illegal = [c for c in cols if not _SCD2_COLUMN_NAME_RE.match(c)]
+        if illegal:
+            raise ValueError(
+                f"SCD2 column name(s) {illegal} may only contain letters, digits, '_' and '-'. "
+                f"Rename the generated column(s) in the catalog writer settings."
+            )
+        if len(set(cols)) != len(cols):
+            raise ValueError(f"SCD2 column names must be unique, got {cols}")
+        if len(set(self.compare_columns)) != len(self.compare_columns):
+            raise ValueError("compare_columns must not contain duplicates")
+        overlap = sorted(set(self.compare_columns) & set(cols))
+        if overlap:
+            raise ValueError(f"compare_columns may not name SCD2 system columns: {overlap}")
+        return self
+
+
 class CatalogWriteSettings(BaseModel):
-    """Settings for writing data to the catalog."""
+    """Settings for writing data to the catalog.
+
+    The target namespace is referenced name-first: ``namespace_full_name`` (``"catalog.schema"``) is
+    the portable reference that survives recreation on another machine; ``namespace_id`` is a numeric
+    fallback for flows saved before names were stored.
+    """
 
     table_name: str = ""
     namespace_id: int | None = None
+    namespace_full_name: str | None = None
     description: str | None = None
-    write_mode: Literal["overwrite", "error", "append", "upsert", "update", "delete", "virtual"] = "overwrite"
+    write_mode: Literal["overwrite", "error", "append", "upsert", "update", "delete", "scd2", "virtual"] = "overwrite"
     merge_keys: list[str] = Field(default_factory=list)
+    partition_by: list[str] = Field(default_factory=list)
+    # A dangling block on a non-scd2 physical mode is tolerated: the UI keeps it while toggling modes.
+    scd2: Scd2Settings | None = None
+    # Enable-only: True turns the Delta change data feed on (at creation, or on the existing
+    # table); False never turns it off.
+    track_changes: bool = False
 
     @model_validator(mode="after")
     def _validate_merge_keys(self) -> "CatalogWriteSettings":
-        if self.write_mode in ("upsert", "update", "delete") and not self.merge_keys:
-            raise ValueError(f"merge_keys must be non-empty when write_mode is '{self.write_mode}'")
+        validate_delta_write_rules(
+            self.write_mode,
+            self.merge_keys,
+            self.track_changes,
+            keyed_modes=MERGE_MODES | {"scd2"},
+            untracked_modes=frozenset({"overwrite", "virtual", "scd2"}),
+        )
+        if self.partition_by and self.write_mode == "virtual":
+            raise ValueError("partition_by is not allowed for virtual tables")
+        if self.write_mode == "virtual" and self.scd2 is not None:
+            raise ValueError("scd2 settings are not allowed for virtual tables")
+        if self.write_mode == "scd2":
+            cfg = self.scd2 or Scd2Settings()
+            if len(set(self.merge_keys)) != len(self.merge_keys):
+                raise ValueError("merge_keys must not contain duplicates when write_mode is 'scd2'")
+            clash = sorted(set(self.merge_keys) & set(cfg.system_columns))
+            if clash:
+                raise ValueError(f"merge_keys may not name SCD2 system columns: {clash}")
+            hot = sorted(set(self.partition_by) & {cfg.surrogate_key_column, cfg.valid_from_column})
+            if hot:
+                raise ValueError(f"partition_by may not use high-cardinality SCD2 columns: {hot}")
         return self
 
 
@@ -1269,18 +1972,31 @@ class NodeCatalogWriter(NodeSingleInput):
 
     catalog_write_settings: CatalogWriteSettings = Field(default_factory=CatalogWriteSettings)
 
+    @property
+    def output_names(self) -> list[str] | None:
+        """The single output handle an SCD2 write declares, so the canvas can build it.
+
+        SCD2 is the one write mode that hands a frame downstream (the input rows plus the four
+        generated columns); every other mode is a sink, so the template's ``output`` stays 0 and
+        the canvas sizes the handle list off ``max(output, len(output_names))``.
+        """
+        return ["main"] if self.catalog_write_settings.write_mode == "scd2" else None
+
     def get_default_description(self) -> str:
         s = self.catalog_write_settings
         return f"Catalog: {s.table_name}" if s.table_name else "Write to Catalog"
 
 
-class NodeCatalogReader(NodeBase):
+class NodeCatalogReader(ChangeFeedReadSettings, NodeBase):
     """Settings for a node that reads a table from the catalog.
 
     Resolution priority at runtime: ``catalog_table_id`` > ``catalog_full_table_name`` >
     ``(catalog_table_name, catalog_namespace_id)``. The qualified form
     (``catalog_full_table_name`` = ``"schema.table"``) is the preferred human-facing
     identifier when an id isn't available.
+
+    The change feed ("Read" selector) comes from ``ChangeFeedReadSettings``; only valid when the
+    resolved table is change-tracked. ``since_last_run`` is the only mode that keeps a cursor.
     """
 
     catalog_table_id: int | None = None
@@ -1288,8 +2004,43 @@ class NodeCatalogReader(NodeBase):
     catalog_table_name: str | None = None
     catalog_namespace_id: int | None = None
     delta_version: int | None = None
+    # SCD2 history view. Only honoured when the resolved table carries an ``scd2_config`` record;
+    # ``None`` means no filter (every version) and is ignored for non-SCD2 tables.
+    scd2_view: Literal["active", "all", "active_at"] | None = None
+    scd2_as_of: str | None = None  # ISO-8601 instant, required when scd2_view == "active_at"
     sql_query: str | None = None
     is_virtual_optimized: bool | None = None
+    cdc_consumer_name: str | None = None  # names the cursor; without one it is keyed on flow + node
+    cdc_start: Literal["now", "beginning"] = "now"
+
+    @model_validator(mode="after")
+    def _validate_cdc(self) -> "NodeCatalogReader":
+        if self.cdc_consumer_name is not None:
+            name = self.cdc_consumer_name.strip()
+            self.cdc_consumer_name = name or None
+            if name and not re.fullmatch(r"[A-Za-z0-9_.:-]+", name):
+                raise ValueError(f"cdc_consumer_name may only contain letters, digits and _.:- — got {name!r}")
+        if self.cdc_mode == "off":
+            return self
+        if self.sql_query:
+            raise ValueError("Change modes are not available for SQL catalog readers")
+        if self.delta_version is not None:
+            raise ValueError("Change modes cannot be combined with a pinned table version")
+        if self.scd2_view not in (None, "all"):
+            raise ValueError("Change modes are not available for an SCD2 history view")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_scd2_view(self) -> "NodeCatalogReader":
+        if self.scd2_view == "active_at" and not self.scd2_as_of:
+            raise ValueError("scd2_as_of is required when scd2_view is 'active_at'")
+        if self.scd2_as_of:
+            try:
+                # Python 3.10's fromisoformat rejects the trailing "Z" the UI's DateTimePicker emits.
+                datetime.fromisoformat(self.scd2_as_of.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError(f"scd2_as_of must be an ISO-8601 datetime: {self.scd2_as_of!r}") from exc
+        return self
 
     def get_default_description(self) -> str:
         if self.sql_query:
@@ -1300,6 +2051,17 @@ class NodeCatalogReader(NodeBase):
         display = self.catalog_full_table_name or self.catalog_table_name
         if display:
             suffix = f" (v{self.delta_version})" if self.delta_version is not None else ""
+            if self.scd2_view == "active":
+                suffix += " [active]"
+            elif self.scd2_view == "active_at" and self.scd2_as_of:
+                suffix += f" [as of {self.scd2_as_of}]"
+            if self.cdc_mode == "since_last_run":
+                suffix += " [changes since last run]"
+            elif self.cdc_mode == "since_version":
+                v = self.cdc_from_version
+                suffix += f" [changes since {v if isinstance(v, str) else f'v{v}'}]"
+            elif self.cdc_mode == "since_timestamp":
+                suffix += f" [changes since {self.cdc_from_timestamp}]"
             return f"Catalog: {display}{suffix}"
         return "Read from Catalog"
 
@@ -1348,10 +2110,14 @@ class NodeConnection(BaseModel):
         cls,
         from_id: int,
         to_id: int,
-        input_type: InputType = "input-0",
+        input_type: InputType | InputConnectionClass = "input-0",
         output_handle: OutputConnectionClass = "output-0",
     ):
-        """Creates a standard connection between two nodes."""
+        """Creates a standard connection between two nodes.
+
+        ``input_type`` is either a semantic slot (``main``/``right``/``left``) or an
+        explicit target handle (``input-N``), which is used as-is.
+        """
         match input_type:
             case "main":
                 connection_class: InputConnectionClass = "input-0"
@@ -1359,6 +2125,8 @@ class NodeConnection(BaseModel):
                 connection_class: InputConnectionClass = "input-1"
             case "left":
                 connection_class: InputConnectionClass = "input-2"
+            case _ if input_type in get_args(InputConnectionClass):
+                connection_class: InputConnectionClass = input_type
             case _:
                 connection_class: InputConnectionClass = "input-0"
         node_input = NodeInputConnection(node_id=to_id, connection_class=connection_class)
@@ -1387,6 +2155,22 @@ class NodeGraphSolver(NodeSingleInput):
         """Describes the graph solver operation."""
         g = self.graph_solver_input
         return f"{g.col_from} -> {g.col_to} as '{g.output_column_name}'"
+
+
+class NodeExplodeHierarchy(NodeSingleInput):
+    """Settings for a node that explodes a parent -> child hierarchy (bill of materials, chart of accounts).
+
+    Replaces the input with one row per ancestor and descendant anywhere below it, multiplying
+    quantities along each path.
+    """
+
+    explode_hierarchy_input: transform_schema.ExplodeHierarchyInput
+
+    def get_default_description(self) -> str:
+        """Describes the edge columns, the output detail and whether a quantity is rolled up."""
+        h = self.explode_hierarchy_input
+        qty = ", qty" if h.quantity_column else ""
+        return f"{h.parent_column} -> {h.child_column} ({h.output_detail}{qty})"
 
 
 class NodeUnique(NodeSingleInput):
@@ -1440,15 +2224,77 @@ class NodeDynamicRename(NodeSingleInput):
         return f"{rule} on {scope}"
 
 
+class NodeDataCleansing(NodeSingleInput):
+    """Settings for a node that fixes common data quality issues.
+
+    Covers null rows/columns, null replacement, unwanted characters, whitespace and
+    casing in one pass. Every field carries a default, so a freshly dropped node is
+    already valid and useful without opening the drawer.
+    """
+
+    cleansing_input: transform_schema.DataCleansingInput = Field(default_factory=transform_schema.DataCleansingInput)
+
+    def get_default_description(self) -> str:
+        """Describes the enabled cleansing rules and the columns they apply to."""
+        s = self.cleansing_input
+        frame_rules = []
+        if s.remove_null_rows:
+            frame_rules.append("drop null rows")
+        if s.remove_null_columns:
+            frame_rules.append("drop null columns")
+
+        column_rules = []
+        if s.replace_nulls_with_blank:
+            column_rules.append("nulls to blank")
+        if s.replace_nulls_with_zero:
+            column_rules.append("nulls to zero")
+        if s.remove_letters:
+            column_rules.append("remove letters")
+        if s.remove_numbers:
+            column_rules.append("remove numbers")
+        if s.remove_punctuation:
+            column_rules.append("remove punctuation")
+        if s.remove_all_whitespace:
+            column_rules.append("remove whitespace")
+        else:
+            if s.normalize_whitespace:
+                column_rules.append("normalize whitespace")
+            if s.trim_whitespace:
+                column_rules.append("trim whitespace")
+        if s.case_mode != "none":
+            column_rules.append(s.case_mode)
+
+        parts = list(frame_rules)
+        if column_rules:
+            if s.selection_mode == "list":
+                scope = f"{len(s.selected_columns)} column(s)"
+            else:
+                scope = "all columns"
+            parts.append(", ".join(column_rules) + f" on {scope}")
+        return "; ".join(parts)
+
+
 class NodePolarsCode(NodeMultiInput):
     """Settings for a node that executes arbitrary user-provided Polars code."""
 
     polars_code_input: transform_schema.PolarsCodeInput
 
     def get_default_description(self) -> str:
-        """Describes the Polars code snippet."""
+        """Describes the Polars code: a function's docstring line or ``name(params)``, else the snippet's first line."""
+        from flowfile_core.flowfile.flow_data_engine.polars_code_parser import function_form
+
         code = self.polars_code_input.polars_code
-        first_line = code.strip().split("\n")[0] if code else ""
+        entry = function_form(code) if code else None
+        if entry is not None:
+            docstring = (ast.get_docstring(entry) or "").strip()
+            args = entry.args
+            names = [arg.arg for arg in [*args.posonlyargs, *args.args]]
+            names += [f"*{args.vararg.arg}"] if args.vararg else ["*"] if args.kwonlyargs else []
+            names += [arg.arg for arg in args.kwonlyargs] + ([f"**{args.kwarg.arg}"] if args.kwarg else [])
+            params = ", ".join(names)
+            first_line = docstring.split("\n")[0] if docstring else f"{entry.name}({params})"
+        else:
+            first_line = code.strip().split("\n")[0] if code else ""
         if len(first_line) > 80:
             first_line = first_line[:77] + "..."
         return first_line
@@ -1501,23 +2347,56 @@ def _validate_output_names(v: list[str]) -> list[str]:
 
 
 class NodePythonScript(NodeMultiInput):
-    """Node that executes Python code on a kernel container."""
+    """Node that executes Python code on a kernel container.
+
+    ``output_schemas`` optionally declares the columns of each named output (keyed by
+    an entry of ``output_names``), so schema prediction can report them without running
+    the kernel. It is excluded from the node hash: it describes the output rather than
+    changing it, so declaring or editing it never invalidates a cached kernel result.
+    """
+
+    hash_excluded_fields: ClassVar[frozenset[str]] = frozenset({"output_schemas"})
 
     python_script_input: PythonScriptInput = PythonScriptInput()
     output_names: list[str] = Field(default_factory=lambda: ["main"])
+    output_schemas: dict[str, list[MinimalFieldInfo]] | None = None
 
     @field_validator("output_names")
     @classmethod
     def validate_output_names(cls, v: list[str]) -> list[str]:
         return _validate_output_names(v)
 
+    @model_validator(mode="after")
+    def validate_output_schemas(self) -> "NodePythonScript":
+        if not self.output_schemas:
+            return self
+        unknown = sorted(set(self.output_schemas) - set(self.output_names))
+        if unknown:
+            raise ValueError(f"output_schemas declares unknown outputs {unknown}; outputs are {self.output_names}")
+        for output_name, fields in self.output_schemas.items():
+            names = [f.name for f in fields]
+            if len(names) != len(set(names)):
+                raise ValueError(f"output_schemas[{output_name!r}] has duplicate column names")
+        return self
+
 
 class UserDefinedNode(NodeMultiInput):
     """Settings for a node that contains the user defined node information"""
 
-    settings: Any
+    settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
     kernel_id: str | None = None
     output_names: list[str] = Field(default_factory=lambda: ["main"])
+    # sha256 of the node's .py file at add time; source edits invalidate the node hash/cache.
+    node_source_hash: str | None = None
+    settings_format_version: int = 1
+
+    @field_validator("settings", mode="before")
+    @classmethod
+    def _coerce_legacy_settings(cls, v):
+        """Coerce legacy payloads (settings=None / non-dict) into the {section: {component: value}} envelope."""
+        if v is None or not isinstance(v, dict):
+            return {}
+        return {section: (values if isinstance(values, dict) else {"value": values}) for section, values in v.items()}
 
     @field_validator("output_names")
     @classmethod
@@ -1550,6 +2429,7 @@ class TrainModelSettings(BaseModel):
     publish_to_catalog: bool = False
     model_name: str = ""  # required when publish_to_catalog=True
     namespace_id: int | None = None
+    namespace_full_name: str | None = None  # portable "catalog.schema"; resolved name-first, id is fallback
     catalog_description: str | None = None
     catalog_tags: list[str] = Field(default_factory=list)
 
@@ -1591,6 +2471,7 @@ class ApplyModelSettings(BaseModel):
     model_name: str = ""
     model_version: int | None = None
     namespace_id: int | None = None
+    namespace_full_name: str | None = None  # portable "catalog.schema"; resolved name-first, id is fallback
 
     output_column: str = "prediction"
 
@@ -1608,6 +2489,52 @@ class NodeApplyModel(NodeSingleInput):
             ver = f" v{s.model_version}" if s.model_version is not None else ""
             return f"Apply '{s.model_name}'{ver} -> {s.output_column}"
         return "Apply Model"
+
+
+class NodeGate(NodeSingleInput):
+    """Pass-through node gated on a flow-parameter rule or a flowfile formula.
+
+    When the condition holds the input flows through unchanged. When it does
+    not, the gate itself still succeeds ("ran and decided") but every node
+    downstream of it is deliberately skipped — reported as skipped, not
+    failed, so the run stays green and source callbacks (e.g. Kafka offset
+    commits) still fire.
+
+    With ``else_output`` enabled the gate becomes a two-exit router: data
+    exits "then" (output-0) when the condition holds and "else" (output-1)
+    when it does not — exactly one side is live per run, so an if/else needs
+    one gate instead of two hand-maintained complementary conditions. Both
+    handles serve the same passthrough frame; only which downstream runs
+    differs.
+    """
+
+    gate_input: transform_schema.GateInput = Field(default_factory=transform_schema.GateInput)
+    # When True the node emits two outputs: "then" (output-0, live when the
+    # condition holds) and "else" (output-1, live when it does not). Default
+    # preserves single-output behaviour for existing flows.
+    else_output: bool = False
+
+    @property
+    def output_names(self) -> list[str] | None:
+        """Declared output handles, so the canvas can build both without the drawer.
+
+        The template's ``output`` stays 1 for backwards compatibility; the canvas
+        sizes the handle list off ``max(output, len(output_names))``. Unlike
+        filter_split, no NamedOutputs exist at run time — both handles resolve
+        to the same passthrough frame via ``get_output``'s default fallback.
+        """
+        return ["then", "else"] if self.else_output else None
+
+    def get_default_description(self) -> str:
+        gate = self.gate_input
+        if gate.condition_source == "formula":
+            return f"Gate: {gate.formula}" if gate.formula.strip() else "Gate"
+        if not gate.parameter:
+            return "Gate"
+        condition = f"${{{gate.parameter}}} {gate.operator.replace('_', ' ')}"
+        if gate.operator in ("equals", "not_equals", "in", "not_in"):
+            condition = f"{condition} {gate.value}"
+        return f"Gate: {condition}"
 
 
 class NodeWaitFor(NodeMultiInput):

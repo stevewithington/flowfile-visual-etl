@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import datetime
+import decimal
+import math
 from builtins import len as built_in_len
+from collections.abc import Callable, Iterator
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union
 
 import polars as pl
 from polars.expr.string import ExprStringNameSpace
 
+from flowfile_core.flowfile.code_generator.literals import python_literal
 from flowfile_core.schemas import transform_schema
-from flowfile_frame.adding_expr import add_expr_methods
+from flowfile_frame.adding_expr import add_expr_methods, refuse_parameter_argument
 from flowfile_frame.config import logger
 from flowfile_frame.expr_name import ExprNameNameSpace
 from flowfile_frame.list_name_space import ExprListNameSpace
+from flowfile_frame.parameters import Parameter, refuse_parameter_as_column
 
 # --- TYPE CHECKING IMPORTS ---
 if TYPE_CHECKING:
@@ -19,18 +25,23 @@ if TYPE_CHECKING:
 
     ExprType = TypeVar("ExprType", bound="Expr")
     ColumnType = "Column"  # Use string literal instead of direct class reference
-    from polars._typing import IntoExprColumn, PolarsTemporalType
+    from polars._typing import FillNullStrategy, IntoExprColumn, PolarsTemporalType
 
 ExprOrStr = Union["Expr", str]  # noqa: UP007
 ExprOrStrList = list[ExprOrStr]
 ExprStrOrList = Union[ExprOrStr, ExprOrStrList]  # noqa: UP007
 
 
+def _argument_code(value: Any) -> str:
+    """Code for one argument: an ``Expr`` by its repr, anything else as a literal that runs (``float("nan")``)."""
+    return repr(value) if isinstance(value, Expr) else python_literal(value, set())
+
+
 def _repr_args(*args, **kwargs):
-    """Helper to represent arguments for __repr__."""
-    arg_reprs = [a.__repr__() for a in args]
+    """The arguments of a method call as code."""
+    arg_reprs = [_argument_code(a) for a in _frame_value(args)]
     kwarg_reprs = []
-    for k, v in kwargs.items():
+    for k, v in _frame_value(kwargs).items():
         if k == "_function_sources":
             continue
         if isinstance(v, pl.DataType):
@@ -38,7 +49,7 @@ def _repr_args(*args, **kwargs):
         elif isinstance(v, type) and issubclass(v, pl.DataType):
             kwarg_reprs.append(f"{k}=pl.{v.__name__}")
         else:
-            kwarg_reprs.append(f"{k}={repr(v)}")
+            kwarg_reprs.append(f"{k}={_argument_code(v)}")
     return ", ".join(arg_reprs + kwarg_reprs)
 
 
@@ -48,13 +59,11 @@ FF_OPERATOR_MAP = {
     "&": "and", "|": "or",
 }
 
-CAST_FF_MAP = {
-    "Int8": "to_integer", "Int16": "to_integer", "Int32": "to_integer", "Int64": "to_integer",
-    "UInt8": "to_integer", "UInt16": "to_integer", "UInt32": "to_integer", "UInt64": "to_integer",
-    "Float32": "to_float", "Float64": "to_float",
-    "Boolean": "to_boolean",
-    "Utf8": "to_string", "String": "to_string",
-    "Date": "to_date", "Datetime": "to_datetime",
+# Formula functions that are exactly Polars' strict cast (to_boolean parses text and turns null into false).
+CAST_FF_MAP: dict[pl.DataType, str] = {
+    pl.Int64(): "to_integer",
+    pl.Float64(): "to_float",
+    pl.String(): "to_string",
 }
 
 STRING_METHOD_FF_MAP: dict[str, tuple[str, int]] = {
@@ -79,82 +88,203 @@ def _get_ff_repr(value: Any) -> str | None:
     """Get flowfile function representation of a value."""
     if isinstance(value, Expr):
         return value._ff_repr
+    elif isinstance(value, Parameter):
+        return value.ref
     elif isinstance(value, bool):
         return "true" if value else "false"
     elif isinstance(value, int | float):
-        return str(value)
+        return str(value) if math.isfinite(value) else None  # the formula language has no nan / inf
     elif isinstance(value, str):
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
+        # The formula parser has no quote escape: use the quote kind the value lacks.
+        escaped = value.replace("\\", "\\\\")
+        if '"' not in escaped:
+            return f'"{escaped}"'
+        if "'" not in escaped:
+            return f"'{escaped}'"
+        return None
+    elif value is None:
+        return "null"
     else:
         return None
 
 
-def _compute_cast_ff_repr(ff_repr: str | None, pl_dtype: pl.DataType | type) -> str | None:
-    """Compute ff_repr for a cast operation. Shared by Expr.cast() and Column.cast()."""
-    if ff_repr is None:
+def _membership_ff_repr(ff_repr: str | None, values: Any) -> str | None:
+    """``[col] in ("a", "b")`` when ``values`` is a plain sequence of scalar literals, else None."""
+    if ff_repr is None or not isinstance(values, list | tuple | set | frozenset):
         return None
-    dtype_name = None
-    if isinstance(pl_dtype, pl.DataType):
-        dtype_name = type(pl_dtype).__name__
-    elif isinstance(pl_dtype, type) and issubclass(pl_dtype, pl.DataType):
-        dtype_name = pl_dtype.__name__
-    if dtype_name and dtype_name in CAST_FF_MAP:
-        return f"{CAST_FF_MAP[dtype_name]}({ff_repr})"
-    return None
+    if not all(isinstance(v, bool | int | float | str) for v in values):
+        return None
+    return f"{ff_repr} in ({', '.join(_get_ff_repr(v) for v in values)})"
+
+
+def _compute_cast_ff_repr(ff_repr: str | None, pl_dtype: pl.DataType | type, strict: bool = True) -> str | None:
+    """Compute ff_repr for a cast operation. Shared by Expr.cast() and Column.cast().
+
+    Other casts (Int8, Float32, Date, non-strict, ...) keep the Polars-code path: the formula would change the result.
+    """
+    if ff_repr is None or not strict:
+        return None
+    return next((f"{function}({ff_repr})" for dtype, function in CAST_FF_MAP.items() if pl_dtype == dtype), None)
+
+
+_PYTHON_FUNCTION_MARKERS = ('"AnonymousFunction":', '"callback":', '"RenameAlias":{"function":{"Map":')
+"""Where a serialized plan carries a pickled Python function: ``map_elements`` / ``map_batches`` / ``map_groups``,
+``fold`` / ``reduce`` and their cumulative forms, and ``name.map``."""
+_SCALAR_LITERAL_TYPES = (
+    type(None),
+    bool,
+    int,
+    float,
+    str,
+    decimal.Decimal,
+    datetime.date,
+    datetime.time,
+    datetime.timedelta,
+)
+
+
+def _polars_expr_code(value: pl.Expr) -> str | None:
+    """Source that rebuilds ``value``: ``pl.col(name)`` for a column, ``pl.lit(...)`` for a scalar literal, else its
+    JSON plan (``str(value)`` is Polars' display form, not code). ``None`` when the plan carries a pickled Python
+    function, which no code rebuilds."""
+    if value.meta.is_column():
+        return f"pl.col({value.meta.output_name()!r})"
+    literal = _literal_code(value) if value.meta.is_literal() else None
+    if literal is not None:
+        return literal
+    plan = value.meta.serialize(format="json")
+    if any(marker in plan for marker in _PYTHON_FUNCTION_MARKERS):
+        return None
+    return f"pl.Expr.deserialize(BytesIO({plan.encode()!r}), format='json')"
+
+
+def _literal_code(value: pl.Expr) -> str | None:
+    """``pl.lit(<scalar>[, dtype=pl.<dtype>])`` for a literal holding one scalar the sandbox can spell, else None."""
+    try:
+        frame = pl.select(value)
+    except Exception:
+        return None
+    if frame.shape != (1, 1):
+        return None
+    scalar, dtype = frame.item(), frame.dtypes[0]
+    if not isinstance(scalar, _SCALAR_LITERAL_TYPES) or getattr(scalar, "tzinfo", None) is not None:
+        return None
+    literal = python_literal(scalar, set())
+    if pl.select(pl.lit(scalar)).dtypes[0] == dtype:
+        return f"pl.lit({literal})"
+    return f"pl.lit({literal}, dtype=pl.{dtype!r})"
 
 
 def _get_expr_and_repr(value: Any) -> tuple[pl.Expr | None, str]:
     """Helper to get polars expr and repr string for operands."""
+    if isinstance(value, Parameter):
+        value = value.to_expr()
+    value = _frame_value(value)
     if isinstance(value, Expr):
-        # Ensure we return None if the inner expression is None
-        inner_expr = value.expr if value.expr is not None else None
-        return inner_expr, value._repr_str
-    elif isinstance(value, pl.Expr):
-        base_str = str(value)
-        if base_str.startswith("col("):
-            return value, f"pl.{base_str}"
-        if base_str.startswith("lit("):
-            return value, f"pl.{base_str}"
-        return value, f"pl.Expr({base_str})"
-    else:
-        # Assume literal
-        return pl.lit(value), repr(value)
+        return value.expr, value._repr_str
+    # Assume literal
+    return pl.lit(value), python_literal(value, set())
+
+
+def _map_nested(value: Any, leaf: Callable[[Any], Any]) -> Any:
+    """``value`` with ``leaf`` applied to every element of its lists, tuples and dicts, at any depth."""
+    if isinstance(value, list | tuple):
+        return type(value)(_map_nested(item, leaf) for item in value)
+    if isinstance(value, dict):
+        return {key: _map_nested(item, leaf) for key, item in value.items()}
+    return leaf(value)
+
+
+def _frame_value(value: Any) -> Any:
+    """``value`` with every Polars expression in it, at any depth, wrapped as an ``Expr``, whose repr is code."""
+    return _map_nested(value, lambda item: Expr(item) if isinstance(item, pl.Expr) else item)
+
+
+def _polars_argument(value: Any) -> Any:
+    """``value`` with every frame expression in it, at any depth, replaced by its Polars expression.
+
+    Raises ``TypeError`` for a selector or an expression without a Polars expression.
+    """
+    from flowfile_frame.selectors import Selector
+
+    def polars(item: Any) -> Any:
+        if isinstance(item, Expr) and item.expr is not None:
+            return item.expr
+        if isinstance(item, Expr | Selector):
+            raise TypeError("an argument has no Polars expression")
+        return item
+
+    return _map_nested(value, polars)
+
+
+def _frame_exprs(value: Any) -> Iterator[Expr]:
+    """Every frame expression in ``value``, at any depth (a bare Polars expression wrapped)."""
+    if isinstance(value, pl.Expr):
+        yield Expr(value)
+    elif isinstance(value, Expr):
+        yield value
+    elif isinstance(value, list | tuple):
+        for item in value:
+            yield from _frame_exprs(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _frame_exprs(item)
+
+
+def _merge_operand_metadata(left: Any, *operands: Any) -> tuple[list[str], bool]:
+    """Lambda sources and code-convertability of ``left`` and the frame expressions in ``operands``."""
+    sources = list(left._function_sources)
+    convertable = left.convertable_to_code
+    for operand in _frame_exprs(operands):
+        sources.extend(source for source in operand._function_sources if source not in sources)
+        convertable = convertable and operand.convertable_to_code
+    return sources, convertable
+
+
+def _namespace_expr(
+    parent: Expr,
+    repr_str: str,
+    operands: tuple,
+    result_expr: pl.Expr | None,
+    *,
+    is_complex: bool = True,
+    ff_repr: str | None = None,
+) -> Expr:
+    """The ``Expr`` a ``.str`` / ``.dt`` / ``.list`` method returns: ``parent``'s identity and aggregation state, and
+    the function sources and code-convertibility of ``parent`` and of the frame expressions in ``operands``."""
+    sources, convertable = _merge_operand_metadata(parent, *operands)
+    return Expr(
+        result_expr,
+        parent.column_name,
+        repr_str=repr_str,
+        initial_column_name=parent._initial_column_name,
+        selector=None,
+        agg_func=parent.agg_func,
+        is_complex=is_complex,
+        convertable_to_code=convertable,
+        _function_sources=sources,
+        ff_repr=ff_repr,
+    )
 
 
 class StringMethods:
     expr: ExprStringNameSpace | None
-    convertable_to_code: bool
-    _function_sources: list[str] | None
 
-    def __init__(
-        self,
-        parent_expr: Expr,
-        parent_repr_str: str,
-        convertable_to_code: bool = True,
-        _function_sources: list[str] | None = None,
-    ):
+    def __init__(self, parent_expr: Expr, parent_repr_str: str):
         self.parent = parent_expr
         self.expr = parent_expr.expr.str if parent_expr.expr is not None else None
         self.parent_repr_str = parent_repr_str
-        self.convertable_to_code = convertable_to_code
-        self._function_sources = _function_sources or []
+
+    @property
+    def convertable_to_code(self) -> bool:
+        return self.parent.convertable_to_code
 
     def _create_next_expr(
-        self,
-        *args,
-        method_name: str,
-        result_expr: pl.Expr | None,
-        is_complex: bool,
-        convertable_to_code: bool = None,
-        **kwargs,
+        self, *args, method_name: str, result_expr: pl.Expr | None, is_complex: bool, **kwargs
     ) -> Expr:
-        args_repr = _repr_args(*args, **kwargs)
-        new_repr = f"{self.parent_repr_str}.str.{method_name}({args_repr})"
-        if convertable_to_code is None:
-            convertable_to_code = self.convertable_to_code
+        args, kwargs = _frame_value(args), _frame_value(kwargs)
+        new_repr = f"{self.parent_repr_str}.str.{method_name}({_repr_args(*args, **kwargs)})"
 
-        # Compute ff_repr for string methods
         ff = None
         parent_ff = self.parent._ff_repr
         if parent_ff is not None and method_name in STRING_METHOD_FF_MAP:
@@ -167,37 +297,30 @@ class StringMethods:
                     all_args = [parent_ff] + extra_ff_args
                     ff = f"{func_name}({', '.join(all_args)})"
 
-        new_expr = Expr(
-            result_expr,
-            self.parent.column_name,
-            repr_str=new_repr,
-            initial_column_name=self.parent._initial_column_name,
-            selector=None,
-            agg_func=self.parent.agg_func,
-            is_complex=is_complex,
-            convertable_to_code=convertable_to_code,
-            _function_sources=self._function_sources,
-            ff_repr=ff,
+        return _namespace_expr(
+            self.parent, new_repr, (*args, *kwargs.values()), result_expr, is_complex=is_complex, ff_repr=ff
         )
-        return new_expr
 
-    # ... (String methods remain unchanged from your provided code) ...
     def contains(self, pattern, *, literal=False):
-        res_expr = self.expr.contains(pattern, literal=literal) if self.expr is not None else None
+        res_expr = self.expr.contains(_polars_argument(pattern), literal=literal) if self.expr is not None else None
         return self._create_next_expr(
             pattern, literal=literal, method_name="contains", result_expr=res_expr, is_complex=True
         )
 
     def starts_with(self, prefix):
-        res_expr = self.expr.starts_with(prefix) if self.expr is not None else None
+        res_expr = self.expr.starts_with(_polars_argument(prefix)) if self.expr is not None else None
         return self._create_next_expr(prefix, is_complex=True, method_name="starts_with", result_expr=res_expr)
 
     def ends_with(self, suffix):
-        res_expr = self.expr.ends_with(suffix) if self.expr is not None else None
+        res_expr = self.expr.ends_with(_polars_argument(suffix)) if self.expr is not None else None
         return self._create_next_expr(suffix, result_expr=res_expr, method_name="ends_with", is_complex=True)
 
     def replace(self, pattern, replacement, *, literal=False):
-        res_expr = self.expr.replace(pattern, replacement, literal=literal) if self.expr is not None else None
+        res_expr = (
+            self.expr.replace(*_polars_argument((pattern, replacement)), literal=literal)
+            if self.expr is not None
+            else None
+        )
         return self._create_next_expr(
             pattern, replacement, method_name="replace", result_expr=res_expr, literal=literal, is_complex=True
         )
@@ -207,7 +330,7 @@ class StringMethods:
         return self._create_next_expr(method_name="to_uppercase", result_expr=res_expr, is_complex=True)
 
     def slice(self, offset: int | IntoExprColumn, length: int | IntoExprColumn | None = None) -> Expr:
-        res_expr = self.expr.slice(offset=offset, length=length)
+        res_expr = self.expr.slice(offset=_polars_argument(offset), length=_polars_argument(length))
         return self._create_next_expr(
             method_name="slice", result_expr=res_expr, is_complex=True, offset=offset, length=length
         )
@@ -229,15 +352,17 @@ class StringMethods:
         return self._create_next_expr(method_name="to_titlecase", result_expr=res_expr, is_complex=True)
 
     def strip_chars_start(self, characters: str | None = None):
-        res_expr = self.expr.strip_chars_start(characters) if self.expr is not None else None
-        result = self._create_next_expr(method_name="strip_chars_start", result_expr=res_expr, is_complex=True)
+        res_expr = self.expr.strip_chars_start(_polars_argument(characters)) if self.expr is not None else None
+        args = () if characters is None else (characters,)
+        result = self._create_next_expr(*args, method_name="strip_chars_start", result_expr=res_expr, is_complex=True)
         if characters is not None:
             result._ff_repr = None  # left_trim formula only supports generic whitespace trim
         return result
 
     def strip_chars_end(self, characters: str | None = None):
-        res_expr = self.expr.strip_chars_end(characters) if self.expr is not None else None
-        result = self._create_next_expr(method_name="strip_chars_end", result_expr=res_expr, is_complex=True)
+        res_expr = self.expr.strip_chars_end(_polars_argument(characters)) if self.expr is not None else None
+        args = () if characters is None else (characters,)
+        result = self._create_next_expr(*args, method_name="strip_chars_end", result_expr=res_expr, is_complex=True)
         if characters is not None:
             result._ff_repr = None  # right_trim formula only supports generic whitespace trim
         return result
@@ -272,7 +397,7 @@ class StringMethods:
             strict=strict,
             exact=exact,
             cache=cache,
-            ambiguous=ambiguous,
+            ambiguous=_polars_argument(ambiguous),
         )
         return self._create_next_expr(
             method_name="to_datetime",
@@ -297,7 +422,9 @@ class StringMethods:
         cache: bool = True,
         ambiguous: Literal["earliest", "latest", "raise", "null"] | Expr = "raise",
     ) -> Expr:
-        res_expr = self.expr.strptime(dtype, format, strict=strict, exact=exact, cache=cache, ambiguous=ambiguous)
+        res_expr = self.expr.strptime(
+            dtype, format, strict=strict, exact=exact, cache=cache, ambiguous=_polars_argument(ambiguous)
+        )
         return self._create_next_expr(
             method_name="strptime",
             dtype=dtype,
@@ -322,7 +449,7 @@ class StringMethods:
         if callable(pl_attr):
 
             def wrapper(*args, **kwargs):
-                result = pl_attr(*args, **kwargs)
+                result = pl_attr(*_polars_argument(args), **_polars_argument(kwargs))
                 # Assume generic getattr methods don't change aggregation status
                 return self._create_next_expr(
                     *args, method_name=name, result_expr=result, is_complex=True, **kwargs
@@ -335,73 +462,50 @@ class StringMethods:
 
 class DateTimeMethods:
     expr: Any | None
-    convertable_to_code: bool
-    _function_sources: list[str] | None
 
-    def __init__(
-        self,
-        parent_expr: Expr,
-        parent_repr_str: str,
-        convertable_to_code: bool = True,
-        _function_sources: list[str] | None = None,
-    ):
+    def __init__(self, parent_expr: Expr, parent_repr_str: str):
         self.parent = parent_expr
         self.expr = parent_expr.expr.dt if parent_expr.expr is not None else None
         self.parent_repr_str = parent_repr_str
-        self.convertable_to_code = convertable_to_code
-        self._function_sources = _function_sources or []
 
-    def _create_next_expr(
-        self, method_name: str, result_expr: pl.Expr | None, convertable_to_code: bool = None, *args, **kwargs
-    ) -> Expr:
-        args_repr = _repr_args(*args, **kwargs)
-        new_repr = f"{self.parent_repr_str}.dt.{method_name}({args_repr})"
-        if convertable_to_code is None:
-            convertable_to_code = self.convertable_to_code
+    @property
+    def convertable_to_code(self) -> bool:
+        return self.parent.convertable_to_code
 
-        # Compute ff_repr for datetime methods
+    def _create_next_expr(self, *args, method_name: str, result_expr: pl.Expr | None, **kwargs) -> Expr:
+        args, kwargs = _frame_value(args), _frame_value(kwargs)
+        new_repr = f"{self.parent_repr_str}.dt.{method_name}({_repr_args(*args, **kwargs)})"
+
         ff = None
         parent_ff = self.parent._ff_repr
         if parent_ff is not None and method_name in DT_METHOD_FF_MAP:
             ff = f"{DT_METHOD_FF_MAP[method_name]}({parent_ff})"
 
-        new_expr = Expr(
-            result_expr,
-            self.parent.column_name,
-            repr_str=new_repr,
-            initial_column_name=self.parent._initial_column_name,
-            selector=None,
-            agg_func=self.parent.agg_func,
-            is_complex=True,
-            convertable_to_code=convertable_to_code,
-            _function_sources=self._function_sources,
-            ff_repr=ff,
-        )
-        return new_expr
+        return _namespace_expr(self.parent, new_repr, (*args, *kwargs.values()), result_expr, ff_repr=ff)
 
     def year(self):
         res_expr = self.expr.year() if self.expr is not None else None
-        return self._create_next_expr("year", res_expr)
+        return self._create_next_expr(method_name="year", result_expr=res_expr)
 
     def month(self):
         res_expr = self.expr.month() if self.expr is not None else None
-        return self._create_next_expr("month", res_expr)
+        return self._create_next_expr(method_name="month", result_expr=res_expr)
 
     def day(self):
         res_expr = self.expr.day() if self.expr is not None else None
-        return self._create_next_expr("day", res_expr)
+        return self._create_next_expr(method_name="day", result_expr=res_expr)
 
     def hour(self):
         res_expr = self.expr.hour() if self.expr is not None else None
-        return self._create_next_expr("hour", res_expr)
+        return self._create_next_expr(method_name="hour", result_expr=res_expr)
 
     def minute(self):
         res_expr = self.expr.minute() if self.expr is not None else None
-        return self._create_next_expr("minute", res_expr)
+        return self._create_next_expr(method_name="minute", result_expr=res_expr)
 
     def second(self):
         res_expr = self.expr.second() if self.expr is not None else None
-        return self._create_next_expr("second", res_expr)
+        return self._create_next_expr(method_name="second", result_expr=res_expr)
 
     def __getattr__(self, name):
         if self.expr is None or not hasattr(self.expr, name):
@@ -415,9 +519,9 @@ class DateTimeMethods:
         if callable(pl_attr):
 
             def wrapper(*args, **kwargs):
-                result = pl_attr(*args, **kwargs)
+                result = pl_attr(*_polars_argument(args), **_polars_argument(kwargs))
                 # Assume generic getattr methods don't change aggregation status
-                return self._create_next_expr(name, result, *args, **kwargs)
+                return self._create_next_expr(*args, method_name=name, result_expr=result, **kwargs)
 
             return wrapper
         else:
@@ -435,6 +539,7 @@ class Expr:
     is_complex: bool = False
     convertable_to_code: bool
     _function_sources: list[str]  # Add this attribute
+    _window_spec: dict[str, Any] | None
 
     def __init__(
         self,
@@ -459,6 +564,7 @@ class Expr:
         self.convertable_to_code = convertable_to_code
         self._function_sources = _function_sources or []
         self._ff_repr = ff_repr
+        self._window_spec = None
         # --- Determine Representation String ---
         if repr_str is not None:
             self._repr_str = repr_str
@@ -474,6 +580,10 @@ class Expr:
         elif self.selector is not None:
             self._repr_str = f"{self.selector.repr_str}"
             self.expr = None
+        elif isinstance(self.expr, pl.Expr):
+            code = _polars_expr_code(self.expr)
+            self._repr_str = str(self.expr) if code is None else code
+            self.convertable_to_code = convertable_to_code and code is not None
         elif self.expr is not None:
             _, default_repr = _get_expr_and_repr(self.expr)
             self._repr_str = default_repr
@@ -515,18 +625,14 @@ class Expr:
         bool
             True if this is a simple expression, False otherwise
         """
-        # Check for selector expressions
         if self.selector is not None:
             # Selector expressions are complex - they select multiple columns
             return False
 
-        # Check if this expression has any arithmetic/logical operators
         if hasattr(self, "_repr_str"):
-            # Check for when/then/otherwise expressions
             if any(marker in self._repr_str for marker in ["when(", ".then(", ".otherwise("]):
                 return False
 
-            # Look for arithmetic operators in the expression string
             for op in [
                 "+",
                 "-",
@@ -549,10 +655,8 @@ class Expr:
                     if f".alias('{op}" in self._repr_str:
                         continue
 
-                    # Otherwise, we have a complex expression
                     return False
 
-            # Check for other functions that might create complex expressions
             for func in [
                 "filter(",
                 "where(",
@@ -564,7 +668,6 @@ class Expr:
                 if func in self._repr_str:
                     return False
 
-        # If we reach here, it's a simple expression (just column reference and maybe aggregation)
         return True
 
     def arg_unique(self) -> Expr:
@@ -596,24 +699,19 @@ class Expr:
         **kwargs,
     ) -> Expr:
         """Creates a new Expr instance, appending method call to repr string."""
+        args, kwargs = _frame_value(args), _frame_value(kwargs)
         if _repr_override is not None:
             new_repr = _repr_override
         else:
-            # Filter out _function_sources from kwargs to avoid passing it to _repr_args
-            filtered_kwargs = {k: v for k, v in kwargs.items() if k != "_function_sources"}
-            args_repr = _repr_args(*args, **filtered_kwargs)
-            new_repr = f"{self._repr_str}.{method_name}({args_repr})"
+            new_repr = f"{self._repr_str}.{method_name}({_repr_args(*args, **kwargs)})"
 
         if convertable_to_code is None:
             convertable_to_code = self.convertable_to_code
-
-        # Combine function sources from current expression and new ones
-        combined_function_sources = self._function_sources.copy()
-        if _function_sources:
-            combined_function_sources.extend(_function_sources)
+        sources, operands_convertable = _merge_operand_metadata(self, *args, *kwargs.values())
+        sources.extend(source for source in _function_sources or () if source not in sources)
 
         # Create new instance, inheriting current agg_func status by default
-        new_expr_instance = Expr(
+        return Expr(
             result_expr,
             self.column_name,
             repr_str=new_repr,
@@ -621,11 +719,10 @@ class Expr:
             selector=None,
             agg_func=self.agg_func,
             is_complex=is_complex,
-            convertable_to_code=convertable_to_code,
-            _function_sources=combined_function_sources,
+            convertable_to_code=convertable_to_code and operands_convertable,
+            _function_sources=sources,
             ff_repr=ff_repr,
         )
-        return new_expr_instance
 
     @property
     def name(self) -> ExprNameNameSpace:
@@ -642,6 +739,7 @@ class Expr:
                 f"Cannot perform binary operation '{op_symbol}' on Expr without underlying polars expression."
             )
 
+        other = _frame_value(other)
         other_expr, other_repr = _get_expr_and_repr(other)
 
         if other_expr is None and not isinstance(other, int | float | str | bool | type(None)):
@@ -653,7 +751,6 @@ class Expr:
         # For binary operations, just construct the expression without extra parentheses
         new_repr = f"{self._repr_str} {op_symbol} {other_repr}"
 
-        # Compute flowfile function representation
         if ff_repr is not ...:
             new_ff = ff_repr
         else:
@@ -664,13 +761,14 @@ class Expr:
             else:
                 new_ff = None
 
-        # Derive output column name from the polars expression metadata
         output_column_name = None
         if result_expr is not None:
             try:
                 output_column_name = result_expr.meta.output_name()
             except Exception:
                 pass
+
+        function_sources, convertable_to_code = _merge_operand_metadata(self, other)
 
         # Binary ops clear the aggregation state and selector link
         return Expr(
@@ -681,13 +779,15 @@ class Expr:
             selector=None,
             agg_func=None,
             is_complex=True,
+            convertable_to_code=convertable_to_code,
+            _function_sources=function_sources,
             ff_repr=new_ff,
         )
 
     @property
     def str(self) -> StringMethods:
         if self._str_namespace is None:
-            self._str_namespace = StringMethods(self, self._repr_str, convertable_to_code=self.convertable_to_code)
+            self._str_namespace = StringMethods(self, self._repr_str)
         return self._str_namespace
 
     @property
@@ -785,8 +885,11 @@ class Expr:
         return result
 
     def std(self, ddof=1):
+        """Standard deviation; at the default ``ddof=1`` (the Group By node's) it aggregates natively."""
         result_expr = self.expr.std(ddof=ddof) if self.expr is not None else None
-        result = self._create_next_expr(method_name="std", result_expr=result_expr, ddof=ddof, is_complex=True)
+        result = self._create_next_expr(
+            method_name="std", result_expr=result_expr, ddof=ddof, is_complex=self.is_complex or ddof != 1
+        )
         result.agg_func = "std"
         return result
 
@@ -812,46 +915,49 @@ class Expr:
         return result
 
     def var(self, ddof=1):
+        """Variance; at the default ``ddof=1`` (the Group By node's) it aggregates natively."""
         result_expr = self.expr.var(ddof=ddof) if self.expr is not None else None
-        result = self._create_next_expr(method_name="var", result_expr=result_expr, ddof=ddof, is_complex=True)
+        result = self._create_next_expr(
+            method_name="var", result_expr=result_expr, ddof=ddof, is_complex=self.is_complex or ddof != 1
+        )
         result.agg_func = "var"
         return result
 
-    def __add__(self, other):
+    def __add__(self, other) -> Expr:
         other_expr, _ = _get_expr_and_repr(other)
         res_expr = self.expr + other_expr if self.expr is not None and other_expr is not None else None
         return self._create_binary_op_expr("+", other, res_expr)
 
-    def __sub__(self, other):
+    def __sub__(self, other) -> Expr:
         other_expr, _ = _get_expr_and_repr(other)
         res_expr = self.expr - other_expr if self.expr is not None and other_expr is not None else None
         return self._create_binary_op_expr("-", other, res_expr)
 
-    def __mul__(self, other):
+    def __mul__(self, other) -> Expr:
         other_expr, _ = _get_expr_and_repr(other)
         res_expr = self.expr * other_expr if self.expr is not None and other_expr is not None else None
         return self._create_binary_op_expr("*", other, res_expr)
 
-    def __truediv__(self, other):
+    def __truediv__(self, other) -> Expr:
         other_expr, _ = _get_expr_and_repr(other)
         res_expr = self.expr / other_expr if self.expr is not None and other_expr is not None else None
         return self._create_binary_op_expr("/", other, res_expr)
 
-    def __floordiv__(self, other):
+    def __floordiv__(self, other) -> Expr:
         other_expr, _ = _get_expr_and_repr(other)
         res_expr = self.expr // other_expr if self.expr is not None and other_expr is not None else None
         other_ff = _get_ff_repr(other)
         ff = f"floor(({self._ff_repr} / {other_ff}))" if self._ff_repr is not None and other_ff is not None else None
         return self._create_binary_op_expr("//", other, res_expr, ff_repr=ff)
 
-    def __pow__(self, exponent):
+    def __pow__(self, exponent) -> Expr:
         exp_expr, _ = _get_expr_and_repr(exponent)
         res_expr = self.expr.pow(exp_expr) if self.expr is not None and exp_expr is not None else None
         exp_ff = _get_ff_repr(exponent)
         ff = f"power({self._ff_repr}, {exp_ff})" if self._ff_repr is not None and exp_ff is not None else None
         return self._create_binary_op_expr("**", exponent, res_expr, ff_repr=ff)
 
-    def __mod__(self, other):
+    def __mod__(self, other) -> Expr:
         other_expr, _ = _get_expr_and_repr(other)
         res_expr = self.expr % other_expr if self.expr is not None and other_expr is not None else None
         return self._create_binary_op_expr("%", other, res_expr)
@@ -865,75 +971,89 @@ class Expr:
             return f"({other_ff} {ff_op} {self._ff_repr})"
         return None
 
-    def __radd__(self, other):
+    def __radd__(self, other) -> Expr:
         other_expr, other_repr = _get_expr_and_repr(other)
         new_repr = f"({other_repr} + {self._repr_str})"
         res_expr = other_expr + self.expr if other_expr is not None and self.expr is not None else None
+        function_sources, convertable_to_code = _merge_operand_metadata(self, other)
         return Expr(res_expr, None, repr_str=new_repr, agg_func=None, is_complex=True,
+                    convertable_to_code=convertable_to_code, _function_sources=function_sources,
                     ff_repr=self._create_reverse_binary_ff_repr("+", other))
 
-    def __rsub__(self, other):
+    def __rsub__(self, other) -> Expr:
         other_expr, other_repr = _get_expr_and_repr(other)
         new_repr = f"({other_repr} - {self._repr_str})"
         res_expr = other_expr - self.expr if other_expr is not None and self.expr is not None else None
+        function_sources, convertable_to_code = _merge_operand_metadata(self, other)
         return Expr(res_expr, None, repr_str=new_repr, agg_func=None, is_complex=True,
+                    convertable_to_code=convertable_to_code, _function_sources=function_sources,
                     ff_repr=self._create_reverse_binary_ff_repr("-", other))
 
-    def __rmul__(self, other):
+    def __rmul__(self, other) -> Expr:
         other_expr, other_repr = _get_expr_and_repr(other)
         new_repr = f"({other_repr} * {self._repr_str})"
         res_expr = other_expr * self.expr if other_expr is not None and self.expr is not None else None
+        function_sources, convertable_to_code = _merge_operand_metadata(self, other)
         return Expr(res_expr, None, repr_str=new_repr, agg_func=None, is_complex=True,
+                    convertable_to_code=convertable_to_code, _function_sources=function_sources,
                     ff_repr=self._create_reverse_binary_ff_repr("*", other))
 
-    def __rtruediv__(self, other):
+    def __rtruediv__(self, other) -> Expr:
         other_expr, other_repr = _get_expr_and_repr(other)
         new_repr = f"({other_repr} / {self._repr_str})"
         res_expr = other_expr / self.expr if other_expr is not None and self.expr is not None else None
+        function_sources, convertable_to_code = _merge_operand_metadata(self, other)
         return Expr(res_expr, None, repr_str=new_repr, agg_func=None, is_complex=True,
+                    convertable_to_code=convertable_to_code, _function_sources=function_sources,
                     ff_repr=self._create_reverse_binary_ff_repr("/", other))
 
-    def __rfloordiv__(self, other):
+    def __rfloordiv__(self, other) -> Expr:
         other_expr, other_repr = _get_expr_and_repr(other)
         new_repr = f"({other_repr} // {self._repr_str})"
         res_expr = other_expr // self.expr if other_expr is not None and self.expr is not None else None
         other_ff = _get_ff_repr(other)
         ff = f"floor(({other_ff} / {self._ff_repr}))" if other_ff is not None and self._ff_repr is not None else None
-        return Expr(res_expr, None, repr_str=new_repr, agg_func=None, is_complex=True, ff_repr=ff)
+        function_sources, convertable_to_code = _merge_operand_metadata(self, other)
+        return Expr(res_expr, None, repr_str=new_repr, agg_func=None, is_complex=True,
+                    convertable_to_code=convertable_to_code, _function_sources=function_sources, ff_repr=ff)
 
-    def __rmod__(self, other):
+    def __rmod__(self, other) -> Expr:
         other_expr, other_repr = _get_expr_and_repr(other)
         new_repr = f"({other_repr} % {self._repr_str})"
         res_expr = other_expr % self.expr if other_expr is not None and self.expr is not None else None
+        function_sources, convertable_to_code = _merge_operand_metadata(self, other)
         return Expr(res_expr, None, repr_str=new_repr, agg_func=None, is_complex=True,
+                    convertable_to_code=convertable_to_code, _function_sources=function_sources,
                     ff_repr=self._create_reverse_binary_ff_repr("%", other))
 
-    def __rpow__(self, other):
+    def __rpow__(self, other) -> Expr:
         other_expr, other_repr = _get_expr_and_repr(other)
         new_repr = f"({other_repr} ** {self._repr_str})"
         base_expr = pl.lit(other) if not isinstance(other, Expr | pl.Expr) else other_expr
         res_expr = base_expr.pow(self.expr) if self.expr is not None and base_expr is not None else None
         other_ff = _get_ff_repr(other)
         ff = f"power({other_ff}, {self._ff_repr})" if other_ff is not None and self._ff_repr is not None else None
-        return Expr(res_expr, None, repr_str=new_repr, agg_func=None, is_complex=True, ff_repr=ff)
+        function_sources, convertable_to_code = _merge_operand_metadata(self, other)
+        return Expr(res_expr, None, repr_str=new_repr, agg_func=None, is_complex=True,
+                    convertable_to_code=convertable_to_code, _function_sources=function_sources, ff_repr=ff)
 
     # --- Comparison operations ---
-    def __eq__(self, other):
+    def __eq__(self, other) -> Expr:
         other_expr, _ = _get_expr_and_repr(other)
         res_expr = self.expr == other_expr if self.expr is not None and other_expr is not None else None
         return self._create_binary_op_expr("==", other, res_expr)
 
-    def __ne__(self, other):
+    def __ne__(self, other) -> Expr:
         other_expr, _ = _get_expr_and_repr(other)
         res_expr = self.expr != other_expr if self.expr is not None and other_expr is not None else None
         return self._create_binary_op_expr("!=", other, res_expr)
 
-    def __gt__(self, other):
+    def __gt__(self, other) -> Expr:
         other_expr, _ = _get_expr_and_repr(other)
         res_expr = self.expr > other_expr if self.expr is not None and other_expr is not None else None
         return self._create_binary_op_expr(">", other, res_expr)
 
-    def __lt__(self, other):
+    def __lt__(self, other) -> Expr:
         other_expr, _ = _get_expr_and_repr(other)
         res_expr = self.expr < other_expr if self.expr is not None and other_expr is not None else None
         return self._create_binary_op_expr("<", other, res_expr)
@@ -949,6 +1069,14 @@ class Expr:
         return self._create_binary_op_expr("<=", other, res_expr)
 
     # --- Logical operations ---
+    def __bool__(self) -> bool:
+        """Refuse truthiness, as Polars does: ``and``/``or``/``not`` would silently drop a condition."""
+        raise TypeError(
+            "the truth value of an Expr is ambiguous\n\n"
+            "Use `&` instead of `and`, `|` instead of `or` and `~` instead of `not`, "
+            "e.g. `(ff.col('a') > 0) & (ff.col('b') > 0)`."
+        )
+
     def __and__(self, other) -> Expr:
         from flowfile_frame.selectors import Selector
 
@@ -970,13 +1098,31 @@ class Expr:
     def __invert__(self) -> Expr:
         new_repr = f"~({self._repr_str})"
         res_expr = ~self.expr if self.expr is not None else None
+        ff = f"not({self._ff_repr})" if self._ff_repr is not None else None
         # Invert clears agg_func
-        return Expr(res_expr, None, repr_str=new_repr, initial_column_name=self._initial_column_name, agg_func=None)
+        return Expr(
+            res_expr,
+            None,
+            repr_str=new_repr,
+            initial_column_name=self._initial_column_name,
+            agg_func=None,
+            convertable_to_code=self.convertable_to_code,
+            _function_sources=self._function_sources,
+            ff_repr=ff,
+        )
 
     def __neg__(self) -> Expr:
         new_repr = f"-{self._repr_str}"
         res_expr = -self.expr if self.expr is not None else None
-        return Expr(res_expr, None, repr_str=new_repr, initial_column_name=self._initial_column_name, agg_func=None)
+        return Expr(
+            res_expr,
+            None,
+            repr_str=new_repr,
+            initial_column_name=self._initial_column_name,
+            agg_func=None,
+            convertable_to_code=self.convertable_to_code,
+            _function_sources=self._function_sources,
+        )
 
     def is_null(self):
         result_expr = self.expr.is_null() if self.expr is not None else None
@@ -989,7 +1135,6 @@ class Expr:
         """
         Filter expression
         """
-        # Build arguments for the filter representation
         args_strs = []
         for pred in predicates:
             if isinstance(pred, Expr):
@@ -1000,27 +1145,21 @@ class Expr:
             else:
                 args_strs.append(repr(pred))
 
-        # Add constraints as keyword arguments
         constraints_strs = [f"{k}={repr(v)}" for k, v in constraints.items()]
         all_args_str = ", ".join(args_strs + constraints_strs)
 
-        # Process the predicates for the polars expression
         processed_predicates = []
         for pred in predicates:
             if isinstance(pred, Expr):
                 if pred.expr is not None:
                     processed_predicates.append(pred.expr)
             else:
-                # Handle non-Expr predicates (convert to polars Expr if possible)
                 processed_predicates.append(pred)
 
-        # Process constraints for the polars expression
         for col_name, value in constraints.items():
-            # Create equivalent of pl.col(col_name).eq(value)
             constraint_expr = pl.col(col_name).eq(value)
             processed_predicates.append(constraint_expr)
 
-        # Create the actual polars expression if possible
         res_expr = None
         if self.expr is not None:
             try:
@@ -1047,14 +1186,22 @@ class Expr:
         return result
 
     def is_in(self, values):
-        res_expr = self.expr.is_in(values) if self.expr is not None else None
+        refuse_parameter_argument("is_in", (values,), {}, hint="compare with == instead: (ff.col(x) == parameter)")
+        res_expr = self.expr.is_in(_polars_argument(values)) if self.expr is not None else None
         # is_in is not an aggregation, resets agg_func
-        result = self._create_next_expr(values, method_name="is_in", result_expr=res_expr, is_complex=True)
+        result = self._create_next_expr(
+            values,
+            method_name="is_in",
+            result_expr=res_expr,
+            is_complex=True,
+            ff_repr=_membership_ff_repr(self._ff_repr, values),
+        )
         result.agg_func = None
         return result
 
     def alias(self, name):
         """Rename the expression result."""
+        refuse_parameter_as_column(name, "alias")
         new_pl_expr = self.expr.alias(name) if self.expr is not None else None
         new_repr = f"{self._repr_str}.alias({repr(name)})"
         # Alias preserves aggregation status and ff_repr
@@ -1070,21 +1217,31 @@ class Expr:
             _function_sources=self._function_sources,
             ff_repr=self._ff_repr,
         )
+        new_instance._window_spec = self._window_spec
         return new_instance
 
-    def fill_null(self, value):
-        res_expr = self.expr.fill_null(value) if self.expr is not None else None
-        val_ff = _get_ff_repr(value)
+    def fill_null(
+        self,
+        value: Any | Expr | pl.Expr | None = None,
+        strategy: FillNullStrategy | None = None,
+        limit: int | None = None,
+    ) -> Expr:
+        refuse_parameter_argument("fill_null", (value,), {})
+        options = {name: option for name, option in (("strategy", strategy), ("limit", limit)) if option is not None}
+        res_expr = self.expr.fill_null(_polars_argument(value), **options) if self.expr is not None else None
+        val_ff = _get_ff_repr(value) if value is not None and strategy is None else None
         ff = f"coalesce({self._ff_repr}, {val_ff})" if self._ff_repr is not None and val_ff is not None else None
-        result = self._create_next_expr(value, method_name="fill_null", result_expr=res_expr, is_complex=True,
-                                        ff_repr=ff)
+        args = () if value is None else (value,)
+        result = self._create_next_expr(*args, method_name="fill_null", result_expr=res_expr, is_complex=True,
+                                        ff_repr=ff, **options)
         result.agg_func = None
         return result
 
-    def fill_nan(self, value):
+    def fill_nan(self, value: int | float | Expr | pl.Expr | None) -> Expr:
+        refuse_parameter_argument("fill_nan", (value,), {})
         res_expr = None
         if self.expr is not None and hasattr(self.expr, "fill_nan"):
-            res_expr = self.expr.fill_nan(value)
+            res_expr = self.expr.fill_nan(_polars_argument(value))
         result = self._create_next_expr(value, method_name="fill_nan", result_expr=res_expr, is_complex=True)
         result.agg_func = None
         return result
@@ -1117,12 +1274,7 @@ class Expr:
         elif isinstance(expr, str):
             return f"pl.col('{expr}')"
         elif isinstance(expr, pl.Expr):
-            base_str = str(expr)
-            if base_str.startswith("col("):
-                return f"pl.{base_str}"
-            if base_str.startswith("lit("):
-                return f"pl.{base_str}"
-            return f"pl.Expr({base_str})"
+            return Expr(expr)._repr_str
         else:
             return repr(expr)
 
@@ -1140,7 +1292,6 @@ class Expr:
         String representation will show 'descending' and 'nulls_last' if they are True,
         regardless of 'order_by' presence.
         """
-        # Process all partition columns (partition_by + more_exprs)
         all_partition_cols = [partition_by]
         if more_exprs:
             all_partition_cols.extend(more_exprs)
@@ -1177,8 +1328,6 @@ class Expr:
             col_reprs = [self._get_expr_repr(p) for p in processed_partition_cols]
             over_arg_strings_for_repr.append(f"[{', '.join(col_reprs)}]")
 
-        # Handle keyword-like arguments for string representation
-        # order_by
         if processed_order_by is not None:
             if isinstance(processed_order_by, list):
                 order_by_repr_val = f"[{', '.join([self._get_expr_repr(o) for o in processed_order_by])}]"
@@ -1209,11 +1358,9 @@ class Expr:
                 else:
                     partition_arg = [p.expr if hasattr(p, "expr") else p for p in processed_partition_cols]
 
-                # Build kwargs for the actual polars over() call
                 polars_call_kwargs = {"mapping_strategy": mapping_strategy}
 
                 if processed_order_by is not None:
-                    # Convert order_by to Polars expressions
                     if isinstance(processed_order_by, list):
                         polars_order_by_arg = [o.expr if hasattr(o, "expr") else o for o in processed_order_by]
                     else:
@@ -1227,11 +1374,10 @@ class Expr:
 
                 res_expr = self.expr.over(partition_by=partition_arg, **polars_call_kwargs)
 
-            except Exception:
-                logger.warning("Could not create polars expression for over(): {e}")
-                pass
+            except Exception as e:
+                logger.warning(f"Could not create polars expression for over(): {e}")
 
-        return Expr(
+        result = Expr(
             res_expr,
             self.column_name,
             repr_str=f"{self._repr_str}.over({args_str_for_repr})",
@@ -1240,6 +1386,27 @@ class Expr:
             agg_func=None,
             _function_sources=self._function_sources,
         )
+        if order_by is None and not descending and not nulls_last and mapping_strategy == "group_to_rows":
+            result._window_spec = self._partition_aggregate_spec(processed_partition_cols)
+        return result
+
+    def _partition_aggregate_spec(self, partition_cols: list) -> dict[str, Any] | None:
+        """Structured form of ``pl.col(x).<agg>()`` over plain columns, so that
+        ``FlowFrame.with_columns`` can emit a native Window Functions node
+        instead of a Polars-code node. ``None`` when the expression is anything else."""
+        func = self.agg_func
+        source = self._initial_column_name
+        if func not in transform_schema.AGGREGATE_WINDOW_FUNCTIONS or source is None:
+            return None
+        expected_args = "ddof=1" if func == "std" else ""
+        if self._repr_str != f"pl.col({source!r}).{func}({expected_args})":
+            return None
+        partition_by: list[str] = []
+        for part in partition_cols:
+            if not isinstance(part, Column) or part._select_input.is_altered:
+                return None
+            partition_by.append(part.column_name)
+        return {"column": source, "function": func, "partition_by": partition_by}
 
     def get_polars_code(self) -> str:
         """
@@ -1253,7 +1420,6 @@ class Expr:
         if not self._function_sources:
             return self._repr_str
 
-        # Remove duplicates while preserving order
         unique_sources = []
         seen = set()
         for source in self._function_sources:
@@ -1261,7 +1427,6 @@ class Expr:
                 seen.add(source)
                 unique_sources.append(source)
 
-        # Build the complete code with function definitions
         functions_section = "# Function definitions\n" + "\n\n".join(unique_sources)
         return functions_section + "\n#─────SPLIT─────\n\n" + self._repr_str
 
@@ -1293,7 +1458,7 @@ class Expr:
             dtype_repr = f"pl.{dtype!s}"
 
         res_expr = self.expr.cast(pl_dtype, strict=strict) if self.expr is not None else None
-        cast_ff = _compute_cast_ff_repr(self._ff_repr, pl_dtype)
+        cast_ff = _compute_cast_ff_repr(self._ff_repr, pl_dtype, strict)
 
         # Cast preserves aggregation status (e.g., cast(col('a').sum()))
         new_expr = Expr(
@@ -1317,6 +1482,7 @@ class Column(Expr):
     _select_input: transform_schema.SelectInput
 
     def __init__(self, name: str, select_input: transform_schema.SelectInput | None = None):
+        refuse_parameter_as_column(name, "ff.col")
         super().__init__(
             expr=pl.col(name),
             column_name=name,
@@ -1330,6 +1496,7 @@ class Column(Expr):
 
     def alias(self, new_name: str) -> Column:
         """Rename a column, returning a new Column instance."""
+        refuse_parameter_as_column(new_name, "alias")
         new_select = transform_schema.SelectInput(
             old_name=self._select_input.old_name,
             new_name=new_name,
@@ -1390,7 +1557,7 @@ class Column(Expr):
         new_repr = f"{self._repr_str}.cast({dtype_repr}, strict={strict})"
         display_name = self._select_input.new_name or self._select_input.old_name
 
-        cast_ff = _compute_cast_ff_repr(self._ff_repr, pl_dtype)
+        cast_ff = _compute_cast_ff_repr(self._ff_repr, pl_dtype, strict)
 
         new_column = Column(display_name, new_select)
         new_column.expr = new_pl_expr
@@ -1402,7 +1569,6 @@ class Column(Expr):
 
     def to_select_input(self) -> transform_schema.SelectInput:
         """Convert Column state back to a SelectInput schema object."""
-        # This logic seems correct based on your previous version
         current_name = self.column_name
         original_name = self._select_input.old_name
         new_name_attr = self._select_input.new_name
@@ -1433,23 +1599,35 @@ add_expr_methods(Expr)
 
 
 class When(Expr):
-    """Class that represents a when-then-otherwise expression chain."""
+    """Class that represents a when-then-otherwise expression chain.
+
+    Alongside the Polars source string, the chain keeps a flowfile-formula form
+    (``if c1 then v1 elseif c2 then v2 else v endif``) whenever every condition
+    and value has one, so ``with_columns`` can lower it onto a native Formula
+    node. A chain used without ``otherwise`` renders with ``else null``, which is
+    Polars' implicit default.
+    """
 
     def __init__(self, condition):
         """Initialize a When expression with a condition."""
-        # Get the condition's expression and representation
+        condition = _frame_value(condition)
         condition_expr, condition_repr = self._get_expr_and_repr(condition)
         self.condition = condition_expr
 
-        # Build the initial representation string
         repr_str = f"pl.when({condition_repr})"
-        # Initialize the base class
         super().__init__(expr=None, repr_str=repr_str, is_complex=True)
+        self._absorb(condition)
         self._branch_expr = None
+        self._ff_branches: list[tuple[str | None, str | None]] = []
+        self._pending_ff_condition = self._get_branch_ff_repr(condition)
+
+    def _absorb(self, value) -> None:
+        """Carry a branch operand's function sources and code-convertibility on the chain."""
+        self._function_sources, self.convertable_to_code = _merge_operand_metadata(self, value)
 
     @staticmethod
     def _get_expr_and_repr(value):
-        """Extract expression and representation from a value."""
+        """Extract expression and representation from a value (a Polars expression comes wrapped)."""
         if hasattr(value, "expr") and hasattr(value, "_repr_str"):
             return value.expr, value._repr_str
         elif isinstance(value, str) and not value.startswith("pl."):
@@ -1458,21 +1636,45 @@ class When(Expr):
         else:
             return value, repr(value)
 
+    @staticmethod
+    def _get_branch_ff_repr(value) -> str | None:
+        """Formula form of a branch operand; bare strings are column names, as in Polars."""
+        if isinstance(value, str) and not value.startswith("pl."):
+            return f"[{value}]"
+        return _get_ff_repr(value)
+
+    def _build_ff_repr(self, else_ff: str | None) -> str | None:
+        if else_ff is None or not self._ff_branches:
+            return None
+        parts = []
+        for i, (condition_ff, then_ff) in enumerate(self._ff_branches):
+            if condition_ff is None or then_ff is None:
+                return None
+            parts.append(f"{'if' if i == 0 else 'elseif'} {condition_ff} then {then_ff}")
+        return f"{' '.join(parts)} else {else_ff} endif"
+
     def then(self, value):
         """Set the value to use when the condition is True."""
+        value = _frame_value(value)
         value_expr, value_repr = self._get_expr_and_repr(value)
 
         self._repr_str = f"{self._repr_str}.then({value_repr})"
         try:
-            self._branch_expr = pl.when(self.condition).then(value_expr)
+            chain = self._branch_expr if self._branch_expr is not None else pl.when(self.condition)
+            self._branch_expr = chain.then(value_expr)
         except Exception as e:
             logger.warning(f"Error in then() creation: {e}")
+        # A then() is a Polars expression (a when() alone is not), so the chain takes a method or is an argument.
+        self.expr = self._branch_expr if isinstance(self._branch_expr, pl.Expr) else None
+        self._absorb(value)
 
+        self._ff_branches.append((self._pending_ff_condition, self._get_branch_ff_repr(value)))
+        self._ff_repr = self._build_ff_repr("null")
         return self
 
     def otherwise(self, value):
         """Set the value to use when no condition is True."""
-        # Get the value's expression and representation
+        value = _frame_value(value)
         value_expr, value_repr = self._get_expr_and_repr(value)
         final_repr = f"{self._repr_str}.otherwise({value_repr})"
 
@@ -1483,7 +1685,14 @@ class When(Expr):
         except Exception as e:
             logger.warning(f"Could not create when-then-otherwise expression: {e}")
 
-        return Expr(pl_expr, repr_str=final_repr)
+        sources, convertable = _merge_operand_metadata(self, value)
+        return Expr(
+            pl_expr,
+            repr_str=final_repr,
+            convertable_to_code=convertable,
+            _function_sources=sources,
+            ff_repr=self._build_ff_repr(self._get_branch_ff_repr(value)),
+        )
 
     def when(self, condition):
         """Create a new branch in the chain."""
@@ -1491,6 +1700,7 @@ class When(Expr):
             logger.warning("Cannot add new branch without a then() first")
             return self
 
+        condition = _frame_value(condition)
         condition_expr, condition_repr = self._get_expr_and_repr(condition)
 
         self._repr_str = f"{self._repr_str}.when({condition_repr})"
@@ -1499,8 +1709,11 @@ class When(Expr):
             self._branch_expr = self._branch_expr.when(condition_expr)
         except Exception as e:
             logger.warning(f"Error adding new when() branch: {e}")
+        self.expr = None  # a chained when() awaits its then()
+        self._absorb(condition)
 
-        # Return self for chaining
+        self._pending_ff_condition = self._get_branch_ff_repr(condition)
+        self._ff_repr = None
         return self
 
 
@@ -1516,7 +1729,9 @@ def column(name: str) -> Column:
 
 
 def lit(value: Any) -> Expr:
-    """Creates a Literal expression."""
+    """Creates a Literal expression; a ``Parameter`` becomes its ``to_expr()``."""
+    if isinstance(value, Parameter):
+        return value.to_expr()
     # Literals don't have an agg_func
     return Expr(pl.lit(value, allow_object=True), repr_str=f"pl.lit({repr(value)})", agg_func=None,
                 ff_repr=_get_ff_repr(value))
@@ -1551,12 +1766,9 @@ def agg_function(func=None, *, customize_repr=True):
         def wrapper(*args, **kwargs):
             from flowfile_frame.expr import Expr
 
-            # Get the Polars expression from the original function
             pl_expr = func(*args, **kwargs)
 
-            # Generate representation string
             if customize_repr:
-                # Process positional arguments
                 args_reprs = []
                 for arg in args:
                     if isinstance(arg, str):
@@ -1566,7 +1778,6 @@ def agg_function(func=None, *, customize_repr=True):
                     else:
                         args_reprs.append(repr(arg))
 
-                # Process keyword arguments
                 kwargs_reprs = []
                 for k, v in kwargs.items():
                     if isinstance(v, str) and not (k == "method" or k == "mapping_strategy"):
@@ -1578,15 +1789,12 @@ def agg_function(func=None, *, customize_repr=True):
                     else:
                         kwargs_reprs.append(f"{k}={repr(v)}")
 
-                # Combine into final representation
                 all_args = args_reprs + kwargs_reprs
                 args_str = ", ".join(all_args)
                 repr_str = f"pl.{agg_func_name}({args_str})"
             else:
-                # Use default representation (rarely needed)
                 repr_str = None
 
-            # Determine initial column name for tracking (if applicable)
             initial_column_name = None
             if built_in_len(args) > 0:
                 first_arg = args[0]
@@ -1595,12 +1803,10 @@ def agg_function(func=None, *, customize_repr=True):
                 elif hasattr(first_arg, "column_name"):
                     initial_column_name = first_arg.column_name
 
-            # Determine if this is a complex expression
             is_complex = True
             if built_in_len(args) == 1 and isinstance(args[0], str) and not kwargs:
                 is_complex = False
 
-            # Create the expression with all necessary properties
             return Expr(
                 pl_expr,
                 repr_str=repr_str,

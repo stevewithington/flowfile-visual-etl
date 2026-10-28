@@ -2,18 +2,17 @@
   <div
     :id="props.id"
     class="overlay"
+    data-canvas-overlay
     :class="{
       'no-transition': isResizing,
       minimized: isMinimized,
-      'in-group': itemState.group,
-      synced: itemState.syncDimensions,
     }"
     :style="{
-      width: isMinimized ? 'auto' : itemState.width + 'px',
-      height: isMinimized ? 'auto' : itemState.height + 'px',
-      top: itemState.top + 'px',
-      left: itemState.left + 'px',
-      zIndex: itemState.zIndex,
+      width: isMinimized ? 'auto' : rect.width + 'px',
+      height: isMinimized ? 'auto' : rect.height + 'px',
+      top: rect.top + 'px',
+      left: rect.left + 'px',
+      zIndex: itemStore.zIndexFor(props.id),
     }"
   >
     <div class="header" @mousedown="startMove" @dblclick="handleHeaderDblClick">
@@ -28,62 +27,76 @@
       </button>
 
       <button
-        v-if="showRight && itemState.stickynessPosition !== 'right'"
+        v-if="showRight && intent.dock !== 'right'"
         class="minimal-button"
         data-tooltip="true"
         title="Move to Right"
-        @click="moveToRight"
+        @click="dockTo('right')"
       >
         <span class="icon">→</span>
       </button>
       <button
-        v-if="showBottom && itemState.stickynessPosition !== 'bottom'"
+        v-if="showBottom && intent.dock !== 'bottom'"
         class="minimal-button"
         data-tooltip="true"
         title="Move to Bottom"
-        @click="moveToBottom"
+        @click="dockTo('bottom')"
       >
         <span class="icon">↓</span>
       </button>
       <button
-        v-if="showLeft && itemState.stickynessPosition !== 'left'"
+        v-if="showLeft && intent.dock !== 'left'"
         class="minimal-button"
         data-tooltip="true"
         title="Move to Left"
-        @click="moveToLeft"
+        @click="dockTo('left')"
       >
         <span class="icon">←</span>
       </button>
       <button
-        v-if="showTop && itemState.stickynessPosition !== 'top'"
+        v-if="showTop && intent.dock !== 'top'"
         class="minimal-button"
         data-tooltip="true"
         title="Move to Top"
-        @click="moveToTop"
+        @click="dockTo('top')"
       >
         <span class="icon">↑</span>
       </button>
       <button
-        v-if="allowFullScreen && !itemState.fullScreen"
+        v-if="allowFullScreen && !intent.fullScreen"
         class="minimal-button"
         data-tooltip="true"
         data-tooltip-text="Toggle Full Screen"
         @click="toggleFullScreen"
       >
-        <span class="icon">⬜</span>
+        <span class="material-icons icon" aria-hidden="true">fullscreen</span>
       </button>
       <button
-        v-if="allowFullScreen && itemState.fullScreen"
+        v-if="allowFullScreen && intent.fullScreen"
         class="minimal-button"
         data-tooltip="true"
         data-tooltip-text="Exit Full Screen"
         @click="toggleFullScreen"
       >
-        <span class="icon">❐</span>
+        <span class="material-icons icon" aria-hidden="true">fullscreen_exit</span>
       </button>
-      <span class="group-badge" @mousedown="startMove">
-        {{ title }}
-      </span>
+      <div v-if="tabs.length" class="dragitem-tabs" @mousedown.stop>
+        <button
+          v-for="t in tabs"
+          :key="t.id"
+          class="dragitem-tab"
+          :class="{ active: t.id === activeTab }"
+          @click="emit('update:activeTab', t.id)"
+        >
+          {{ t.label }}
+        </button>
+      </div>
+      <div v-else-if="title" class="dragitem-tabs" @mousedown="startMove">
+        <span class="dragitem-tab dragitem-tab--static active">{{ title }}</span>
+      </div>
+      <div v-if="$slots['header-actions']" class="dragitem-actions" @mousedown.stop>
+        <slot name="header-actions"></slot>
+      </div>
     </div>
 
     <div class="content" @click="registerClick">
@@ -92,25 +105,25 @@
 
     <div
       class="draggable-line right-vertical"
-      @mousedown.stop="startResizeRight"
+      @mousedown.stop="beginResize($event, 'right')"
       @mouseenter="resizeOnEnter($event, 'right')"
       @dblclick.stop="handleResizeBarDblClick"
     ></div>
     <div
       class="draggable-line bottom-horizontal"
-      @mousedown.stop="startResizeBottom"
+      @mousedown.stop="beginResize($event, 'bottom')"
       @mouseenter="resizeOnEnter($event, 'bottom')"
       @dblclick.stop="handleResizeBarDblClick"
     ></div>
     <div
       class="draggable-line top-horizontal"
-      @mousedown.stop="startResizeTop"
+      @mousedown.stop="beginResize($event, 'top')"
       @mouseenter="resizeOnEnter($event, 'top')"
       @dblclick.stop="handleResizeBarDblClick"
     ></div>
     <div
       class="draggable-line left-vertical"
-      @mousedown.stop="startResizeLeft"
+      @mousedown.stop="beginResize($event, 'left')"
       @mouseenter="resizeOnEnter($event, 'left')"
       @dblclick.stop="handleResizeBarDblClick"
     ></div>
@@ -118,23 +131,30 @@
 </template>
 
 <script setup lang="ts">
-// TODO(refactor): ~1027 LOC, god component. Plan to extract:
-//   - useDraggableResize composable: per-edge resize handlers (~lines 365-457)
-//   - useDraggablePosition composable: move/sticky helpers (~lines 475-545)
-//   - DraggableItemHeader.vue: header controls (~lines 19-87)
-//   - useGroupSync composable: group dimension sync (~lines 285-316)
+// Renders one overlay panel from persisted USER INTENT (store) derived
+// against the shared canvas container — see layoutGeometry.ts for the
+// intent-vs-derived contract. During a gesture the local gestureRect
+// overrides the derived rect at 60Hz; intent is committed once, at mouseup.
+import { computed, onBeforeUnmount, ref, watch, watchEffect, type PropType } from "vue";
+
 import {
-  ref,
-  onMounted,
-  onBeforeUnmount,
-  defineExpose,
-  defineProps,
-  getCurrentInstance,
-  nextTick,
-  watch,
-} from "vue";
+  clampRectToBounds,
+  computeLayout,
+  defaultIntent,
+  intentFromRect,
+  isContainerUsable,
+  snapSideForRect,
+  type AxisBehaviour,
+  type DockSide,
+  type PanelConfig,
+  type PanelDock,
+  type PanelIntent,
+  type RenderRect,
+} from "./layoutGeometry";
+import { nextMinimizedState } from "./minimize";
 import { useItemStore } from "./stateStore";
-import type { ItemLayout } from "./stateStore";
+import { useDraggablePosition } from "./useDraggablePosition";
+import { useDraggableResize } from "./useDraggableResize";
 
 const props = defineProps({
   id: {
@@ -157,10 +177,6 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
-  showPresets: {
-    type: Boolean,
-    default: false,
-  },
   initialPosition: {
     type: String as () => "top" | "bottom" | "left" | "right" | "free",
     default: "free",
@@ -173,7 +189,15 @@ const props = defineProps({
     type: Number,
     default: null,
   },
-
+  // Per-axis resize response (see AxisBehaviour).
+  widthBehaviour: {
+    type: String as () => AxisBehaviour,
+    default: null,
+  },
+  heightBehaviour: {
+    type: String as () => AxisBehaviour,
+    default: null,
+  },
   initialLeft: {
     type: Number,
     default: null,
@@ -190,8 +214,8 @@ const props = defineProps({
     type: String,
     default: "",
   },
-  onMinize: {
-    type: Function,
+  onMinimize: {
+    type: Function as PropType<() => unknown>,
     default: null,
   },
   allowFreeMove: {
@@ -202,152 +226,167 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
-  group: {
-    type: String,
-    default: null,
+  // Tab strip rendered in the header. Empty ⇒ the `title` shows as a single
+  // static tab (so every panel header looks the same).
+  tabs: {
+    type: Array as () => { id: string; label: string }[],
+    default: () => [],
   },
-  syncDimensions: {
-    type: Boolean,
-    default: false,
+  activeTab: {
+    type: String,
+    default: "",
   },
 });
 
+const emit = defineEmits(["update:activeTab"]);
+
 const itemStore = useItemStore();
-const itemState = ref(
-  itemStore.items[props.id] || {
-    width: props.initialWidth || 400,
-    height: props.initialHeight || 300,
-    left: props.initialLeft || 100, // Used corrected prop
-    top: props.initialTop || 100,
-    group: props.group,
-    syncDimensions: props.syncDimensions,
-    zIndex: 100,
-  },
+
+// Unset ⇒ legacy rule: "fill" when no initial size was given, else "fixed".
+const resolvedWidthBehaviour = computed<AxisBehaviour>(
+  () => props.widthBehaviour ?? (props.initialWidth ? "fixed" : "fill"),
+);
+const resolvedHeightBehaviour = computed<AxisBehaviour>(
+  () => props.heightBehaviour ?? (props.initialHeight ? "fixed" : "fill"),
 );
 
-const isDragging = ref(false);
-const isResizing = ref(false);
-const startX = ref(0);
-const startY = ref(0);
-const startWidth = ref(0);
-const startHeight = ref(0);
-const startLeft = ref(0);
-const startTop = ref(0);
+const panelCfg = computed<PanelConfig>(() => ({
+  defaultDock: props.initialPosition as PanelDock,
+  h: {
+    behaviour: resolvedWidthBehaviour.value,
+    defaultSize: props.initialWidth ?? null,
+    defaultOffset: props.initialLeft ?? (props.initialPosition === "free" ? 100 : 0),
+  },
+  v: {
+    behaviour: resolvedHeightBehaviour.value,
+    defaultSize: props.initialHeight ?? null,
+    defaultOffset: props.initialTop ?? (props.initialPosition === "free" ? 100 : 0),
+  },
+}));
+
+// Registration needs no DOM; doing it in setup means the first render already
+// has the loaded (or migrated) intent. The watch keeps the store's config
+// fresh for resetLayout when reactive defaults (e.g. Canvas height override)
+// change — re-registering is idempotent for the intent itself.
+itemStore.registerPanel(props.id, panelCfg.value);
+watch(panelCfg, (cfg) => itemStore.registerPanel(props.id, cfg));
+
+const intent = computed<PanelIntent>(
+  () => itemStore.items[props.id] ?? defaultIntent(panelCfg.value),
+);
+
 const isMinimized = ref(false);
-const instance = getCurrentInstance();
-const activeLine = ref<HTMLElement | null>(null);
-let resizeTimeout: ReturnType<typeof setTimeout>;
+const gestureRect = ref<RenderRect | null>(null);
+const lastGoodRect = ref<RenderRect | null>(null);
 
-const resizeDirection = ref<"top" | "bottom" | "left" | "right" | null>(null);
-const initialGroupStates = ref<
-  Record<string, { top: number; left: number; width: number; height: number }>
->({});
+const derivedRect = computed<RenderRect | null>(() =>
+  computeLayout(intent.value, panelCfg.value, itemStore.containerBounds, isMinimized.value),
+);
 
-// Track previous window dimensions for proportional repositioning. Initialized
-// in onMounted from the live window — referencing window at module-eval time
-// would freeze in stale values when the module is imported before the window
-// reaches its final size (HMR, code-splitting, etc.).
-const prevWindowWidth = ref(0);
-const prevWindowHeight = ref(0);
-
-const resizeDelay = ref<ReturnType<typeof setTimeout> | null>(null);
-const resizeOnEnter = (e: MouseEvent, position: "top" | "bottom" | "left" | "right") => {
-  if (resizeDelay.value) clearTimeout(resizeDelay.value);
-  resizeDelay.value = setTimeout(() => {
-    if (itemStore.inResizing && !isResizing.value) {
-      switch (position) {
-        case "right":
-          startResizeRight(e);
-          break;
-        case "bottom":
-          startResizeBottom(e);
-          break;
-        case "top":
-          startResizeTop(e);
-          break;
-        case "left":
-          startResizeLeft(e);
-          break;
-      }
-    }
-  }, 200);
-};
-
-const savePositionAndSize = () => {
-  itemStore.setItemState(props.id, {
-    width: itemState.value.width,
-    height: itemState.value.height,
-    left: itemState.value.left,
-    top: itemState.value.top,
-    stickynessPosition: itemState.value.stickynessPosition,
-    fullWidth: itemState.value.fullWidth,
-    fullHeight: itemState.value.fullHeight,
-    zIndex: itemState.value.zIndex,
-    fullScreen: itemState.value.fullScreen,
-    group: itemState.value.group,
-    syncDimensions: itemState.value.syncDimensions,
-  });
-
-  itemStore.saveItemState(props.id);
-
-  if (itemState.value.group && itemState.value.syncDimensions && isResizing.value) {
-    const groupItems = itemStore.groups[itemState.value.group];
-    if (groupItems) {
-      const initialActiveState = initialGroupStates.value[props.id];
-      if (!initialActiveState) return;
-
-      const deltaX = itemState.value.left - initialActiveState.left;
-      const deltaY = itemState.value.top - initialActiveState.top;
-
-      groupItems.forEach((itemId) => {
-        if (itemId === props.id) return;
-
-        const initialItemState = initialGroupStates.value[itemId];
-        if (itemStore.items[itemId]?.syncDimensions && initialItemState) {
-          const updates: Partial<ItemLayout> = {
-            width: itemState.value.width,
-            height: itemState.value.height,
-          };
-
-          if (resizeDirection.value === "top") {
-            updates.top = initialItemState.top + deltaY;
-          }
-          if (resizeDirection.value === "left") {
-            updates.left = initialItemState.left + deltaX;
-          }
-
-          itemStore.setItemState(itemId, updates);
-          itemStore.saveItemState(itemId);
-        }
-      });
-    }
+watchEffect(() => {
+  if (derivedRect.value && !gestureRect.value) {
+    lastGoodRect.value = derivedRect.value;
   }
+});
+
+const rect = computed<RenderRect>(
+  () =>
+    gestureRect.value ??
+    derivedRect.value ??
+    lastGoodRect.value ?? {
+      // Pre-container fallback (first frame only): defaults, unclamped — the
+      // .overlay max-width/height CSS caps any overflow.
+      left: panelCfg.value.h.defaultOffset,
+      top: panelCfg.value.v.defaultOffset,
+      width: panelCfg.value.h.defaultSize ?? 300,
+      height: panelCfg.value.v.defaultSize ?? 300,
+    },
+);
+
+const allowedDockSides = computed<DockSide[]>(() => {
+  const sides = new Set<DockSide>();
+  if (props.showRight) sides.add("right");
+  if (props.showBottom) sides.add("bottom");
+  if (props.showLeft) sides.add("left");
+  if (props.showTop) sides.add("top");
+  if (props.initialPosition !== "free") sides.add(props.initialPosition as DockSide);
+  return [...sides];
+});
+
+const registerClick = () => itemStore.clickOnItem(props.id);
+
+const commitRect = (finalRect: RenderRect, dock: PanelDock) => {
+  const bounds = { ...itemStore.containerBounds };
+  // A broken container measurement would turn the rect into garbage intent —
+  // drop the gesture instead (the derived rect simply resumes).
+  if (!isContainerUsable(bounds)) return;
+  const settled = clampRectToBounds(finalRect, bounds, isMinimized.value);
+  itemStore.commitIntent(
+    props.id,
+    intentFromRect(settled, dock, panelCfg.value, bounds, isMinimized.value),
+  );
 };
 
-const loadPositionAndSize = () => {
-  itemStore.loadItemState(props.id);
-  if (itemStore.items[props.id]) {
-    itemState.value = itemStore.items[props.id];
+const dockTo = (side: DockSide) => {
+  // While fullscreen the derived rect is the container — view state, not a
+  // layout to commit. Exit fullscreen instead; the panel then docks normally.
+  if (intent.value.fullScreen) {
+    itemStore.setFullScreen(props.id, false);
+    return;
   }
+  commitRect(rect.value, side);
 };
 
-const toggleMinimize = () => {
-  if (!isMinimized.value && props.onMinize) {
-    props.onMinize();
-  }
-  isMinimized.value = !isMinimized.value;
+const {
+  isResizing,
+  beginResize,
+  resizeOnEnter,
+  teardown: teardownResize,
+} = useDraggableResize({
+  gestureRect,
+  getRect: () => ({ ...rect.value }),
+  getBounds: () => ({ ...itemStore.containerBounds }),
+  isEnabled: () => !intent.value.fullScreen,
+  setSharedResizing: (value) => {
+    itemStore.inResizing = value;
+  },
+  isSharedResizing: () => itemStore.inResizing,
+  onStart: registerClick,
+  onCommit: (finalRect) => commitRect(finalRect, intent.value.dock),
+});
+
+const {
+  isDragging,
+  startMove,
+  teardown: teardownMove,
+} = useDraggablePosition({
+  // A fullscreen panel is not draggable — its rect is view state and a drag
+  // commit would persist container-sized geometry as layout.
+  allowFreeMove: () => props.allowFreeMove && !intent.value.fullScreen,
+  gestureRect,
+  getRect: () => ({ ...rect.value }),
+  getDock: () => intent.value.dock,
+  onStart: registerClick,
+  onCommit: (finalRect) => {
+    const bounds = { ...itemStore.containerBounds };
+    if (!isContainerUsable(bounds)) return;
+    // Magnetic snap-back: releasing near an allowed edge re-docks (VSCode-
+    // style); otherwise the panel becomes a free intent.
+    const snapSide = snapSideForRect(finalRect, bounds, allowedDockSides.value);
+    commitRect(finalRect, snapSide ?? "free");
+  },
+});
+
+const toggleMinimize = async () => {
+  isMinimized.value = await nextMinimizedState(isMinimized.value, props.onMinimize);
 };
 
-const handleReziging = (e: MouseEvent) => {
-  activeLine.value = e.target as HTMLElement;
-  activeLine.value.classList.add("resizing-highlight-line");
-  isResizing.value = true;
-  itemStore.inResizing = true;
+const setFullScreen = (makeFull: boolean) => {
+  itemStore.setFullScreen(props.id, makeFull);
 };
 
 const toggleFullScreen = () => {
   itemStore.toggleFullScreen(props.id);
-  loadPositionAndSize();
 };
 
 const handleResizeBarDblClick = (e: MouseEvent) => {
@@ -372,562 +411,17 @@ const handleHeaderDblClick = (e: MouseEvent) => {
   toggleFullScreen();
 };
 
-const captureGroupInitialStates = () => {
-  if (itemState.value.group && itemState.value.syncDimensions) {
-    initialGroupStates.value = {};
-    const groupItems = itemStore.groups[itemState.value.group];
-    if (groupItems) {
-      groupItems.forEach((id) => {
-        const item = itemStore.items[id];
-        if (item) {
-          initialGroupStates.value[id] = {
-            top: item.top,
-            left: item.left,
-            width: item.width,
-            height: item.height,
-          };
-        }
-      });
-    }
-  }
-};
-
-const startResizeRight = (e: MouseEvent) => {
-  registerClick();
-  e.preventDefault();
-  handleReziging(e);
-  resizeDirection.value = "right";
-  captureGroupInitialStates();
-  startX.value = e.clientX;
-  startWidth.value = itemState.value.width;
-  document.addEventListener("mousemove", onResizeWidth);
-  document.addEventListener("mouseup", stopResize);
-};
-
-const onResizeWidth = (e: MouseEvent) => {
-  if (isResizing.value) {
-    const deltaX = e.clientX - startX.value;
-    const newWidth = startWidth.value + deltaX;
-    if (newWidth > 100 && newWidth < window.innerWidth) {
-      itemState.value.width = newWidth;
-      savePositionAndSize();
-    }
-  }
-};
-
-const startResizeBottom = (e: MouseEvent) => {
-  registerClick();
-  e.preventDefault();
-  handleReziging(e);
-  resizeDirection.value = "bottom";
-  captureGroupInitialStates();
-  startY.value = e.clientY;
-  startHeight.value = itemState.value.height;
-  document.addEventListener("mousemove", onResizeHeight);
-  document.addEventListener("mouseup", stopResize);
-};
-
-const onResizeHeight = (e: MouseEvent) => {
-  if (isResizing.value) {
-    const deltaY = e.clientY - startY.value;
-    const newHeight = startHeight.value + deltaY;
-    if (newHeight > 100 && newHeight < window.innerHeight - 100) {
-      itemState.value.height = newHeight;
-      savePositionAndSize();
-    }
-  }
-};
-
-const startResizeTop = (e: MouseEvent) => {
-  registerClick();
-  e.preventDefault();
-  handleReziging(e);
-  resizeDirection.value = "top";
-  captureGroupInitialStates();
-  startY.value = e.clientY;
-  startTop.value = itemState.value.top;
-  startHeight.value = itemState.value.height;
-  document.addEventListener("mousemove", onResizeTop);
-  document.addEventListener("mouseup", stopResize);
-};
-
-const onResizeTop = (e: MouseEvent) => {
-  if (isResizing.value) {
-    const deltaY = e.clientY - startY.value;
-    const newTop = startTop.value + deltaY;
-    const newHeight = startHeight.value - deltaY;
-    if (newHeight > 100 && newHeight < window.innerHeight - 100 && newTop >= 0) {
-      itemState.value.top = newTop;
-      itemState.value.height = newHeight;
-      savePositionAndSize();
-    }
-  }
-};
-
-const startResizeLeft = (e: MouseEvent) => {
-  registerClick();
-  e.preventDefault();
-  handleReziging(e);
-  resizeDirection.value = "left";
-  captureGroupInitialStates();
-  startX.value = e.clientX;
-  startLeft.value = itemState.value.left;
-  startWidth.value = itemState.value.width;
-  document.addEventListener("mousemove", onResizeLeft);
-  document.addEventListener("mouseup", stopResize);
-};
-
-const onResizeLeft = (e: MouseEvent) => {
-  if (isResizing.value) {
-    const deltaX = e.clientX - startX.value;
-    const newLeft = startLeft.value + deltaX;
-    const newWidth = startWidth.value - deltaX;
-    if (newWidth > 100 && newWidth < window.innerWidth - 100) {
-      itemState.value.left = newLeft;
-      itemState.value.width = newWidth;
-      savePositionAndSize();
-    }
-  }
-};
-
-const stopResize = () => {
-  if (isResizing.value) {
-    isResizing.value = false;
-    resizeDirection.value = null;
-    initialGroupStates.value = {};
-    if (activeLine.value) {
-      activeLine.value.classList.remove("resizing-highlight-line");
-    }
-    itemStore.inResizing = false;
-    document.removeEventListener("mousemove", onResizeWidth);
-    document.removeEventListener("mousemove", onResizeHeight);
-    document.removeEventListener("mousemove", onResizeTop);
-    document.removeEventListener("mousemove", onResizeLeft);
-    itemStore.flushItemState(props.id);
-  }
-};
-
-// Pixel threshold a mousedown must travel before we treat the gesture as a
-// drag. Without this, a header dblclick (two mousedowns + tiny cursor
-// jitter) would fire onMove with deltas of 1–2 px, drift the panel, and
-// then snapshot the drifted position into prev{Top,Left} on
-// `setFullScreen(true)` — so dblclick → fullscreen → dblclick restored
-// the panel slightly lower each cycle. Matches the standard OS drag
-// threshold so deliberate drags still feel responsive.
-const DRAG_THRESHOLD_PX = 4;
-let dragActivated = false;
-
-const startMove = (e: MouseEvent) => {
-  registerClick();
-  if (!props.allowFreeMove) return;
-  e.preventDefault();
-  if (
-    (e.target as HTMLElement).classList.contains("icon") ||
-    (e.target as HTMLElement).classList.contains("minimal-button")
-  )
-    return;
-
-  isDragging.value = true;
-  dragActivated = false;
-  startX.value = e.clientX;
-  startY.value = e.clientY;
-  startLeft.value = itemState.value.left;
-  startTop.value = itemState.value.top;
-  document.addEventListener("mousemove", onMove);
-  document.addEventListener("mouseup", stopMove);
-  // stickynessPosition is flipped to "free" only once the threshold trips
-  // (inside onMove) — a dblclick gesture must not silently un-stick a
-  // sticky-positioned panel.
-};
-
-const onMove = (e: MouseEvent) => {
-  if (!isDragging.value) return;
-  const deltaX = e.clientX - startX.value;
-  const deltaY = e.clientY - startY.value;
-  if (!dragActivated) {
-    if (Math.abs(deltaX) < DRAG_THRESHOLD_PX && Math.abs(deltaY) < DRAG_THRESHOLD_PX) return;
-    dragActivated = true;
-    itemState.value.stickynessPosition = "free";
-  }
-  itemState.value.left = startLeft.value + deltaX;
-  itemState.value.top = startTop.value + deltaY;
-};
-
-const stopMove = () => {
-  if (isDragging.value) {
-    isDragging.value = false;
-    document.removeEventListener("mousemove", onMove);
-    document.removeEventListener("mouseup", stopMove);
-
-    // No-op if the gesture stayed under the drag threshold — nothing
-    // changed, so there's nothing to persist (and persisting a drifted
-    // mid-dblclick position is exactly the bug this guards against).
-    if (dragActivated) {
-      savePositionAndSize();
-      // Make the final position durable immediately — debounced writes would
-      // be lost if the user closes the tab within 250 ms of releasing the drag.
-      itemStore.flushItemState(props.id);
-    }
-    dragActivated = false;
-  }
-};
-
-// Returns the element panels are actually positioned against (the overlay's
-// offsetParent — the canvas <main>). Sticky/move math is relative to this
-// element's INSIDE, so `(left=0, top=0)` is its top-left corner. Falls back
-// to the Vue parent root only if the overlay isn't mounted yet.
-const getStickyContainer = (): { width: number; height: number } => {
-  const overlayEl = document.getElementById(props.id);
-  const offsetParent = overlayEl?.offsetParent as HTMLElement | null;
-  const ref = offsetParent ?? (instance?.parent?.vnode.el as HTMLElement | null);
-  if (ref) {
-    return { width: ref.clientWidth, height: ref.clientHeight };
-  }
-  return { width: window.innerWidth, height: window.innerHeight };
-};
-
-const moveToRight = () => {
-  const c = getStickyContainer();
-  itemState.value.left = c.width - itemState.value.width;
-  itemState.value.top = 0;
-  itemState.value.stickynessPosition = "right";
-  if (itemState.value.fullHeight) {
-    itemState.value.height = c.height;
-  }
-  savePositionAndSize();
-};
-
-const moveToBottom = () => {
-  const c = getStickyContainer();
-  itemState.value.left = props.initialLeft || 0;
-  itemState.value.top = c.height - (itemState.value.height + (props.initialTop || 0));
-  itemState.value.stickynessPosition = "bottom";
-  if (itemState.value.fullWidth) {
-    itemState.value.width = c.width - (props.initialLeft || 0);
-  }
-  savePositionAndSize();
-};
-
-const moveToLeft = () => {
-  const c = getStickyContainer();
-  itemState.value.left = 0;
-  itemState.value.top = 0;
-  itemState.value.stickynessPosition = "left";
-  if (itemState.value.fullHeight) {
-    itemState.value.height = c.height;
-  }
-  savePositionAndSize();
-};
-
-const moveToTop = () => {
-  const c = getStickyContainer();
-  itemState.value.left = 0;
-  itemState.value.top = 0;
-  itemState.value.stickynessPosition = "top";
-  if (itemState.value.fullWidth) {
-    itemState.value.width = c.width;
-  }
-  savePositionAndSize();
-};
-
-const applyStickyPosition = () => {
-  const c = getStickyContainer();
-  const newWindowWidth = window.innerWidth;
-  const newWindowHeight = window.innerHeight;
-
-  switch (itemState.value.stickynessPosition) {
-    case "top":
-      itemState.value.left = props.initialLeft || 0;
-      itemState.value.top = 0;
-      if (itemState.value.fullWidth) {
-        itemState.value.width = c.width - (props.initialLeft || 0);
-      }
-      break;
-
-    case "bottom":
-      itemState.value.left = props.initialLeft || 0;
-      itemState.value.top = c.height - itemState.value.height - (props.initialTop || 0);
-      if (itemState.value.fullWidth) {
-        itemState.value.width = c.width - (props.initialLeft || 0);
-      }
-      break;
-
-    case "left":
-      itemState.value.left = 0;
-      itemState.value.top = props.initialTop || 0;
-      if (itemState.value.fullHeight) {
-        itemState.value.height = c.height - (props.initialTop || 0);
-      }
-      break;
-
-    case "right":
-      itemState.value.left = c.width - itemState.value.width;
-      itemState.value.top = props.initialTop || 0;
-      if (itemState.value.fullHeight) {
-        itemState.value.height = c.height - (props.initialTop || 0);
-      }
-      break;
-
-    case "free":
-    default: {
-      // For free-positioned items, ensure they stay within viewport bounds
-      // and maintain relative positioning when window resizes
-      if (prevWindowWidth.value > 0 && prevWindowHeight.value > 0) {
-        // Calculate if item was positioned relative to right edge (more than 50% from left)
-        const wasRightAligned = itemState.value.left > prevWindowWidth.value / 2;
-        const wasBottomAligned = itemState.value.top > prevWindowHeight.value / 2;
-
-        if (wasRightAligned) {
-          // Maintain distance from right edge
-          const distanceFromRight =
-            prevWindowWidth.value - itemState.value.left - itemState.value.width;
-          itemState.value.left = Math.max(
-            0,
-            newWindowWidth - itemState.value.width - distanceFromRight,
-          );
-        }
-
-        if (wasBottomAligned) {
-          // Maintain distance from bottom edge
-          const distanceFromBottom =
-            prevWindowHeight.value - itemState.value.top - itemState.value.height;
-          itemState.value.top = Math.max(
-            0,
-            newWindowHeight - itemState.value.height - distanceFromBottom,
-          );
-        }
-      }
-
-      // Clamp to ensure item stays visible
-      const minVisible = 100; // Minimum visible pixels
-      itemState.value.left = Math.max(
-        0,
-        Math.min(itemState.value.left, newWindowWidth - minVisible),
-      );
-      itemState.value.top = Math.max(
-        0,
-        Math.min(itemState.value.top, newWindowHeight - minVisible),
-      );
-
-      // Clamp width/height if they exceed viewport
-      if (itemState.value.width > newWindowWidth) {
-        itemState.value.width = newWindowWidth - 20;
-      }
-      if (itemState.value.height > newWindowHeight - 50) {
-        itemState.value.height = newWindowHeight - 70;
-      }
-      break;
-    }
-  }
-
-  // Update tracked window dimensions
-  prevWindowWidth.value = newWindowWidth;
-  prevWindowHeight.value = newWindowHeight;
-
-  // Save the new position
-  savePositionAndSize();
-};
-
-const calculateWidth = () => {
-  if (props.initialWidth) {
-    return props.initialWidth;
-  } else if (props.initialPosition === "top" || props.initialPosition === "bottom") {
-    return instance?.parent?.vnode.el?.offsetWidth - props.initialLeft || 300;
-  } else return 300;
-};
-
-const calculateHeight = () => {
-  if (props.initialHeight) {
-    return props.initialHeight;
-  } else if (props.initialPosition === "left" || props.initialPosition === "right") {
-    return instance?.parent?.vnode.el?.offsetHeight - props.initialHeight || 300;
-  } else return 300;
-};
-
-const handleResize = () => {
-  clearTimeout(resizeTimeout);
-  resizeTimeout = setTimeout(applyStickyPosition, 1);
-};
-
-const parentResizeObserver = new ResizeObserver(() => {
-  handleResize();
-});
-
-const observeParentResize = () => {
-  const parentElement = instance?.parent?.vnode.el as HTMLElement | null;
-  if (parentElement) {
-    parentResizeObserver.observe(parentElement);
-  }
-};
-
-// Handle window resize events directly
-const handleWindowResize = () => {
-  handleResize();
-};
-
-const registerClick = () => {
-  itemStore.clickOnItem(props.id);
-};
-
-const setFullScreen = (makeFull: boolean) => {
-  itemStore.setFullScreen(props.id, makeFull);
-  loadPositionAndSize();
-};
-
-watch(
-  () => itemStore.items[props.id],
-  (newState) => {
-    if (newState) {
-      if (isDragging.value || isResizing.value) {
-        itemState.value.zIndex = newState.zIndex;
-      } else {
-        itemState.value = { ...newState };
-      }
-    }
-  },
-  { deep: true },
-);
-
-watch(
-  () => ({ group: props.group, syncDimensions: props.syncDimensions }),
-  ({ group, syncDimensions }) => {
-    itemStore.setItemState(props.id, {
-      group,
-      syncDimensions,
-    });
-    itemState.value.group = group;
-    itemState.value.syncDimensions = syncDimensions;
-  },
-);
-
-nextTick().then(() => {
-  observeParentResize();
-});
-
-// Instance-scoped reset handler. Replaces a previous global registry on
-// `(window as any)[resetHandler_${id}]` that leaked references when the
-// component unmounted without running its cleanup.
-let layoutResetHandler: (() => void) | null = null;
-
-const clampStateToViewport = (state: ItemLayout) => {
-  const minVisible = 100;
-  const w = window.innerWidth;
-  const h = window.innerHeight;
-  state.width = Math.max(150, Math.min(state.width, w));
-  state.height = Math.max(100, Math.min(state.height, Math.max(150, h - 50)));
-  state.left = Math.max(0, Math.min(state.left, Math.max(0, w - minVisible)));
-  state.top = Math.max(0, Math.min(state.top, Math.max(0, h - minVisible)));
-};
-
-onMounted(() => {
-  // Capture window dimensions now (not at module-eval time) so proportional
-  // repositioning math in handleWindowResize stays accurate.
-  prevWindowWidth.value = window.innerWidth;
-  prevWindowHeight.value = window.innerHeight;
-
-  // Calculate initial values based on props
-  const initialWidth = calculateWidth();
-  const initialHeight = calculateHeight();
-  const initialLeft = props.initialLeft || 100;
-  const initialTop = props.initialTop || 100;
-
-  // IMPORTANT: Register the true initial state FIRST
-  itemStore.registerInitialState(props.id, {
-    width: initialWidth,
-    height: initialHeight,
-    left: initialLeft,
-    top: initialTop,
-    stickynessPosition: props.initialPosition,
-    fullWidth: !props.initialWidth,
-    fullHeight: !props.initialHeight,
-    group: props.group,
-    syncDimensions: props.syncDimensions,
-  });
-
-  // Check if there's a saved state
-  const hasSavedState = itemStore.hasSavedState(props.id);
-
-  if (!hasSavedState) {
-    // No saved state, use initial values
-    itemStore.setItemState(props.id, {
-      width: initialWidth,
-      height: initialHeight,
-      left: initialLeft,
-      top: initialTop,
-      fullHeight: !props.initialHeight,
-      fullWidth: !props.initialWidth,
-      stickynessPosition: props.initialPosition,
-      group: props.group,
-      syncDimensions: props.syncDimensions,
-    });
-    itemState.value = itemStore.items[props.id];
-
-    // Apply sticky position after DOM is ready
-    if (props.initialPosition !== "free") {
-      nextTick(() => {
-        applyStickyPosition();
-      });
-    }
-  } else {
-    // Load saved state
-    loadPositionAndSize();
-    // Saved width/height/left/top from a different viewport size can place
-    // the panel partially or fully off-screen. Clamp before first paint.
-    clampStateToViewport(itemState.value);
-    itemStore.setItemState(props.id, { ...itemState.value });
-
-    // If the saved state has a sticky position, re-apply it
-    if (itemState.value.stickynessPosition && itemState.value.stickynessPosition !== "free") {
-      nextTick(() => {
-        applyStickyPosition();
-      });
-    }
-  }
-
-  layoutResetHandler = () => {
-    // Get the updated state from the store
-    itemState.value = { ...itemStore.items[props.id] };
-
-    // Ensure stickynessPosition is restored from initial state (props.initialPosition)
-    // This guarantees sticky items like logViewer snap back to their original position
-    const initialStickyPosition =
-      itemStore.initialItemStates[props.id]?.stickynessPosition || props.initialPosition;
-    if (initialStickyPosition && initialStickyPosition !== "free") {
-      itemState.value.stickynessPosition = initialStickyPosition;
-      nextTick(() => {
-        applyStickyPosition();
-      });
-    }
-  };
-
-  window.addEventListener("layout-reset", layoutResetHandler);
-  window.addEventListener("resize", handleWindowResize);
-  document.addEventListener("mouseup", stopResize);
+onBeforeUnmount(() => {
+  teardownResize();
+  teardownMove();
 });
 
 defineExpose({
   setFullScreen,
 });
-
-onBeforeUnmount(() => {
-  if (layoutResetHandler) {
-    window.removeEventListener("layout-reset", layoutResetHandler);
-    layoutResetHandler = null;
-  }
-  window.removeEventListener("resize", handleWindowResize);
-  parentResizeObserver.disconnect();
-  document.removeEventListener("mouseup", stopResize);
-  document.removeEventListener("mousemove", onMove);
-  document.removeEventListener("mouseup", stopMove);
-  document.removeEventListener("mousemove", onResizeWidth);
-  document.removeEventListener("mousemove", onResizeHeight);
-  document.removeEventListener("mousemove", onResizeTop);
-  document.removeEventListener("mousemove", onResizeLeft);
-});
 </script>
 
 <style scoped>
-/* (Styles are unchanged) */
 .minimal-button {
   background: none;
   border: none;
@@ -991,22 +485,52 @@ onBeforeUnmount(() => {
   color: var(--color-text-primary);
   background-color: var(--color-background-hover);
 }
-.group-badge {
-  background-color: var(--color-accent);
-  color: var(--color-text-inverse);
-  padding: 2px 6px;
-  border-radius: 3px;
-  font-size: 11px;
-  margin-right: 4px;
-  cursor: pointer;
-  transition: background-color 0.2s;
-  user-select: none;
+
+/* VS Code-style tab strip in the header. `align-self: stretch` + negative
+   vertical margin makes the tabs fill the 35px header so the active underline
+   meets the header's bottom border. Used for both multi-tab and single-title. */
+.dragitem-tabs {
+  display: flex;
+  align-self: stretch;
+  margin: -4px 0 -4px 4px;
 }
-.title-text {
-  flex-grow: 1;
-  padding: 0 8px;
-  font-size: 14px;
+.dragitem-tab {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 12px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    background 0.15s ease;
+}
+button.dragitem-tab:hover {
   color: var(--color-text-primary);
+  background: var(--color-background-hover);
+}
+.dragitem-tab.active {
+  color: var(--color-text-primary);
+  border-bottom-color: var(--color-accent);
+}
+.dragitem-tab--static {
+  cursor: move;
+  user-select: none;
+  font-size: 10px;
+}
+/* The host's per-tab actions (a pop-out button), after the tab strip. */
+.dragitem-actions {
+  display: flex;
+  align-items: center;
+  margin-left: 4px;
 }
 .overlay.minimized {
   width: auto !important;

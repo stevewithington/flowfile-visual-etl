@@ -19,10 +19,12 @@ from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.engine import Engine
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Engine, make_url
 
 import shared.storage_config as _storage_config
+from flowfile_core.database import backup as _backup
+from shared.database import create_catalog_engine, sqlite_database_path
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,14 @@ BATCH_SIZE = 500
 
 
 def _make_flow_registration_uuid_generator(new_conn) -> Callable[[dict], str]:
+    return lambda row: str(uuid.uuid4())
+
+
+def _make_visualization_uuid_generator(new_conn) -> Callable[[dict], str]:
+    return lambda row: str(uuid.uuid4())
+
+
+def _make_dashboard_uuid_generator(new_conn) -> Callable[[dict], str]:
     return lambda row: str(uuid.uuid4())
 
 
@@ -48,6 +58,8 @@ def _make_flow_run_uuid_generator(new_conn) -> Callable[[dict], str | None]:
 _NEW_COLUMN_GENERATORS: dict[str, dict[str, Callable[[Any], Callable[[dict], Any]]]] = {
     "flow_registrations": {"flow_uuid": _make_flow_registration_uuid_generator},
     "flow_runs": {"flow_uuid": _make_flow_run_uuid_generator},
+    "catalog_visualizations": {"viz_uuid": _make_visualization_uuid_generator},
+    "catalog_dashboards": {"dashboard_uuid": _make_dashboard_uuid_generator},
 }
 
 
@@ -67,17 +79,24 @@ def _get_alembic_config() -> Config:
     base = _get_base_dir()
     cfg = Config(str(base / "alembic.ini"))
     cfg.set_main_option("script_location", str(base / "alembic"))
-    cfg.set_main_option("sqlalchemy.url", _storage_config.get_database_url())
+    cfg.set_main_option("sqlalchemy.url", _storage_config.get_database_url().replace("%", "%%"))
+    # The process importing core owns its logging; alembic.ini's logging section is for the alembic CLI.
+    cfg.attributes["configure_logger"] = False
     return cfg
 
 
 def _catalog_db_exists() -> bool:
-    """Check whether the new ``flowfile_catalog.db`` file already exists."""
+    """Check the local file or the server catalog's Alembic revision."""
     url = _storage_config.get_database_url()
-    if "sqlite" in url:
-        db_path = Path(url.replace("sqlite:///", ""))
-        return db_path.exists()
-    return False
+    if make_url(url).get_backend_name() == "sqlite":
+        db_path = sqlite_database_path(url)
+        return db_path is not None and db_path.exists()
+    engine = create_catalog_engine(url)
+    try:
+        with engine.connect() as conn:
+            return bool(MigrationContext.configure(conn).get_current_heads())
+    finally:
+        engine.dispose()
 
 
 def _ensure_known_revision(cfg: Config) -> None:
@@ -88,7 +107,7 @@ def _ensure_known_revision(cfg: Config) -> None:
     Schema artifacts from the unknown revision are not reverted — only the
     ``alembic_version`` pointer is corrected so startup can proceed.
     """
-    engine = create_engine(cfg.get_main_option("sqlalchemy.url"))
+    engine = create_catalog_engine(cfg.get_main_option("sqlalchemy.url"))
     try:
         if not inspect(engine).has_table("alembic_version"):
             return
@@ -118,11 +137,42 @@ def _ensure_known_revision(cfg: Config) -> None:
         engine.dispose()
 
 
+def _database_path(cfg: Config) -> Path | None:
+    return sqlite_database_path(cfg.get_main_option("sqlalchemy.url"))
+
+
+def _snapshot_if_migration_pending(cfg: Config) -> Path | None:
+    """Snapshot the catalog DB when the upcoming upgrade (or re-stamp) will mutate it."""
+    db_path = _database_path(cfg)
+    if db_path is None or not db_path.exists():
+        return None
+    try:
+        engine = create_catalog_engine(cfg.get_main_option("sqlalchemy.url"))
+        try:
+            with engine.connect() as conn:
+                current = MigrationContext.configure(conn).get_current_revision()
+        finally:
+            engine.dispose()
+        head = ScriptDirectory.from_config(cfg).get_current_head()
+    except Exception:
+        logger.warning("Could not determine catalog DB revision; skipping pre-migration snapshot", exc_info=True)
+        return None
+    if current == head:
+        return None
+    return _backup.snapshot_database(db_path, current, head)
+
+
 def run_alembic_upgrade() -> None:
     """Run all pending Alembic migrations up to *head*."""
     cfg = _get_alembic_config()
-    _ensure_known_revision(cfg)
-    command.upgrade(cfg, "head")
+    snapshot = _snapshot_if_migration_pending(cfg)
+    try:
+        _ensure_known_revision(cfg)
+        command.upgrade(cfg, "head")
+    except Exception:
+        if snapshot is not None:
+            logger.error("Migration failed; pre-migration snapshot available at %s", snapshot)
+        raise
     logger.info("Alembic migrations applied successfully")
 
 
@@ -225,6 +275,8 @@ def migrate_data_from_legacy_db() -> None:
     Uses dynamic column mapping so schema differences are handled
     gracefully.  The old database is **never modified**.
     """
+    if make_url(_storage_config.get_database_url()).get_backend_name() != "sqlite":
+        return
     legacy_path = _storage_config.get_legacy_database_path()
     if legacy_path is None:
         logger.info("No legacy database found, skipping data migration")
@@ -233,8 +285,8 @@ def migrate_data_from_legacy_db() -> None:
     new_url = _storage_config.get_database_url()
     old_url = f"sqlite:///{legacy_path}"
 
-    old_engine = create_engine(old_url, connect_args={"check_same_thread": False})
-    new_engine = create_engine(new_url, connect_args={"check_same_thread": False})
+    old_engine = create_catalog_engine(old_url)
+    new_engine = create_catalog_engine(new_url)
 
     try:
         old_inspector = inspect(old_engine)
@@ -251,7 +303,6 @@ def migrate_data_from_legacy_db() -> None:
         logger.info("Migrating data from %s to new catalog database", legacy_path)
         logger.info("Tables to migrate: %s", migration_order)
 
-        # Disable FK checks for the duration of the data copy
         with new_engine.connect() as conn:
             conn.execute(text("PRAGMA foreign_keys = OFF"))
             conn.commit()
@@ -267,7 +318,6 @@ def migrate_data_from_legacy_db() -> None:
                     table_name,
                 )
 
-        # Re-enable FK checks
         with new_engine.connect() as conn:
             conn.execute(text("PRAGMA foreign_keys = ON"))
             conn.commit()
@@ -290,7 +340,11 @@ def run_startup_migration() -> None:
     3. Neither exists (fresh install) → create schema from scratch
     """
     catalog_exists = _catalog_db_exists()
-    legacy_path = _storage_config.get_legacy_database_path()
+    legacy_path = (
+        _storage_config.get_legacy_database_path()
+        if make_url(_storage_config.get_database_url()).get_backend_name() == "sqlite"
+        else None
+    )
 
     if catalog_exists:
         logger.info("Existing catalog database detected, checking for pending migrations")

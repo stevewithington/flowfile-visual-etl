@@ -11,14 +11,67 @@ Falls back to REST automatically if the worker doesn't support WebSocket.
 
 import io
 import json
+import os
 from base64 import b64encode
+from collections.abc import Callable
+from time import monotonic
 from typing import Any
 
 import polars as pl
+from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
+from flowfile_core.auth.jwt import get_internal_token
 from flowfile_core.configs.settings import WORKER_URL
 from flowfile_core.flowfile.flow_data_engine.subprocess_operations.models import Status
+
+# How often the receive loop wakes up to check for cancellation/inactivity.
+_WS_RECV_POLL_SECONDS = 2.0
+
+# Abort the receive when the worker has sent NOTHING for this long. The worker
+# heartbeats a progress frame at least every ~10s while a task is alive, so
+# prolonged silence means the worker parent is wedged or gone (protocol-level
+# pings don't catch an app-level wedge). 0 disables. Mirrors the REST path's
+# FLOWFILE_WORKER_POLL_TIMEOUT.
+_WS_INACTIVITY_TIMEOUT = float(os.getenv("FLOWFILE_WORKER_WS_TIMEOUT", "300"))
+
+
+class WorkerStreamInterrupted(Exception):
+    """Receive phase interrupted after the task was already submitted.
+
+    Callers must NOT fall back to REST on this: the task reached the worker,
+    and re-submitting would duplicate work against a worker that is wedged
+    or a run that was cancelled.
+    """
+
+
+class WorkerStreamStalled(WorkerStreamInterrupted):
+    """The worker went silent past the inactivity timeout (presumed wedged)."""
+
+
+class WorkerTaskError(Exception):
+    """The worker ran the task and reported it failed.
+
+    ``kind`` is the worker's ``error_kind``: ``"environment"`` means the worker
+    could not load the plan, write the result or finish in time, which degrades
+    like a dead child (error code -1). Anything else, including a worker that
+    sends no kind, is the plan failing on its data (e.g. a collect-time polars
+    error) and is a real node error (code 1), matching the REST path's "Error".
+    Either way the task already ran, so it is never re-submitted.
+    """
+
+    def __init__(self, message: str, kind: str | None = None):
+        super().__init__(message)
+        self.kind = kind
+
+    @property
+    def error_code(self) -> int:
+        return error_code_for_kind(self.kind)
+
+
+def error_code_for_kind(kind: str | None) -> int:
+    """Fetcher error code for a worker "Error" of *kind*: -1 degrades, 1 fails the node."""
+    return -1 if kind == "environment" else 1
 
 
 def _get_ws_url() -> str:
@@ -68,15 +121,25 @@ def _handle_complete_message(data: dict, task_id: str) -> Status:
         result_type=data.get("result_type", "polars"),
         progress=100,
         results=data.get("results", None),
+        number_of_records=data.get("number_of_records"),
     )
 
 
-def _receive_raw_result(ws, task_id: str) -> tuple[Any, Status | None]:
+def _receive_raw_result(
+    ws,
+    task_id: str,
+    should_abort: Callable[[], bool] | None = None,
+) -> tuple[Any, Status | None]:
     """Receive messages from the worker until a raw result or error arrives.
 
     Returns the result **without** deserializing it so the caller can both
     populate ``Status.results`` (b64-encoded bytes for polars) and
     deserialize into the in-memory object.
+
+    The recv is bounded: each poll tick checks ``should_abort`` (cancellation)
+    and total silence against ``_WS_INACTIVITY_TIMEOUT``, so a wedged worker
+    surfaces as :class:`WorkerStreamStalled` instead of hanging core forever.
+    Any received message (including progress heartbeats) resets the clock.
 
     Returns:
         (raw_result, status) where raw_result is ``bytes`` for polars
@@ -84,9 +147,31 @@ def _receive_raw_result(ws, task_id: str) -> tuple[Any, Status | None]:
     """
     raw_result = None
     status = None
+    last_message_at = monotonic()
 
     while True:
-        msg = ws.recv()
+        try:
+            msg = ws.recv(timeout=_WS_RECV_POLL_SECONDS)
+        except TimeoutError:
+            if should_abort is not None and should_abort():
+                raise WorkerStreamInterrupted(f"Canceled while waiting for worker result (task {task_id})") from None
+            silence = monotonic() - last_message_at
+            if _WS_INACTIVITY_TIMEOUT and silence > _WS_INACTIVITY_TIMEOUT:
+                raise WorkerStreamStalled(
+                    f"No data from worker for {silence:.0f}s (task {task_id}); worker presumed "
+                    f"unresponsive. Tune or disable via FLOWFILE_WORKER_WS_TIMEOUT."
+                ) from None
+            continue
+        except ConnectionClosed:
+            # cancel() sets the stop event and then closes the socket, which
+            # aborts a blocked recv with ConnectionClosed (never TimeoutError).
+            # Only map to an interrupt when a cancel is actually in flight — a
+            # worker-initiated close with no cancel must keep its original
+            # exception so callers preserve the degrade-gracefully semantics.
+            if should_abort is not None and should_abort():
+                raise WorkerStreamInterrupted(f"Canceled while waiting for worker result (task {task_id})") from None
+            raise
+        last_message_at = monotonic()
 
         if isinstance(msg, bytes):
             raw_result = msg
@@ -109,7 +194,10 @@ def _receive_raw_result(ws, task_id: str) -> tuple[Any, Status | None]:
             break
 
         if msg_type == "error":
-            raise Exception(data.get("error_message", "Unknown worker error"))
+            message = data.get("error_message", "Unknown worker error")
+            if data.get("status") == "Error":
+                raise WorkerTaskError(message, data.get("error_kind"))
+            raise Exception(message)
 
     return raw_result, status
 
@@ -151,7 +239,7 @@ def streaming_start(
     ws_url = _get_ws_url() + "/ws/submit"
     metadata = _build_metadata(task_id, operation_type, flow_id, node_id, kwargs)
 
-    ws = connect(ws_url)
+    ws = connect(ws_url, additional_headers={"X-Flowfile-Internal": get_internal_token()})
     try:
         ws.send(json.dumps(metadata))
         ws.send(lf_bytes)
@@ -161,7 +249,11 @@ def streaming_start(
     return ws
 
 
-def streaming_receive(ws, task_id: str) -> tuple[Any, Status]:
+def streaming_receive(
+    ws,
+    task_id: str,
+    should_abort: Callable[[], bool] | None = None,
+) -> tuple[Any, Status]:
     """Block until the worker sends back a result, then close the connection.
 
     The returned ``Status`` object is fully populated (including
@@ -172,7 +264,7 @@ def streaming_receive(ws, task_id: str) -> tuple[Any, Status]:
         Tuple of (result, Status)
     """
     try:
-        raw_result, status = _receive_raw_result(ws, task_id)
+        raw_result, status = _receive_raw_result(ws, task_id, should_abort=should_abort)
     finally:
         ws.close()
 

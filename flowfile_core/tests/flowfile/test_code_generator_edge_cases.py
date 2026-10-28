@@ -17,10 +17,12 @@ Tests cover:
 """
 
 import polars as pl
+import datetime
 import pytest
 from polars.testing import assert_frame_equal
 
 from flowfile_core.flowfile.code_generator.code_generator import (
+    export_flow_to_flowframe,
     export_flow_to_polars,
     FlowGraphToPolarsConverter,
     UnsupportedNodeError,
@@ -165,7 +167,6 @@ class TestBasicFilterOperators:
         add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
 
         code = export_flow_to_polars(flow)
-        # Compare flow node output with generated code output
         assert_flow_result_matches_generated(flow, output_node_id=2, code=code)
 
     @pytest.mark.parametrize("operator,value,expected_names", [
@@ -196,25 +197,13 @@ class TestBasicFilterOperators:
         add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
 
         code = export_flow_to_polars(flow)
-        # Compare flow node output with generated code output
         assert_flow_result_matches_generated(flow, output_node_id=2, code=code)
 
-    @pytest.mark.xfail(
-        reason="BUG: Flow's IN filter quotes numeric values incorrectly. "
-               "Flow checks 'is_numeric' on whole value '1, 3, 5' (fails due to commas), "
-               "while code generator correctly splits first then checks each value. "
-               "See flow_graph.py:1055-1056 vs code_generator.py:1517-1522"
-    )
     def test_in_operator_numeric(self, sample_data_flow):
         """Test IN operator with numeric values - compare flow result with generated code.
 
-        BUG FOUND: There's an inconsistency between how the flow and the code generator
-        handle IN operator values. The flow checks if the whole value string "1, 3, 5"
-        is numeric (it's not, due to commas), so it quotes all values as strings.
-        The code generator splits first, then checks each individual value "1", "3", "5"
-        and correctly generates integers.
-
-        This test will fail until the bug is fixed in flow_graph.py.
+        Both sides split the comma-separated value list before deciding whether to
+        quote, so "1, 3, 5" on an integer column compares as integers in each.
         """
         flow = sample_data_flow
         filter_node = input_schema.NodeFilter(
@@ -289,7 +278,6 @@ class TestNullHandling:
     def data_with_nulls_flow(self):
         """Create a flow with data containing nulls"""
         flow = create_basic_flow()
-        # Creating data with nulls using explicit None values
         data = input_schema.NodeManualInput(
             flow_id=1,
             node_id=1,
@@ -458,19 +446,11 @@ class TestRecordIdDeprecation:
 class TestUniqueOperationVariations:
     """Test unique operation with different configurations."""
 
-    @pytest.mark.xfail(
-        reason="BUG: Flow's unique with empty columns uses group_by internally, "
-               "which requires at least one key. Generated code uses .unique(keep='first') "
-               "which works on all columns. The flow should handle empty columns the same way."
-    )
     def test_unique_without_columns(self):
         """Test unique operation on all columns - compare flow result with generated code.
 
-        BUG FOUND: The flow's unique implementation uses group_by internally, which
-        requires at least one key column. When columns=[] (empty), it fails with:
-        "at least one key is required in a group_by operation"
-
-        The code generator correctly generates `.unique(keep='first')` which works.
+        columns=[] must behave like columns=None: unique over every column with the
+        configured keep strategy, on both the engine and the generated code.
         """
         flow = create_basic_flow()
         data = input_schema.NodeManualInput(
@@ -551,7 +531,6 @@ class TestUnionModes:
         """Test union with selective mode (diagonal) - compare flow result with generated code"""
         flow = create_basic_flow()
 
-        # Two dataframes with same columns
         for i in range(1, 3):
             data = input_schema.NodeManualInput(
                 flow_id=1,
@@ -586,7 +565,6 @@ class TestUnionModes:
         """Test union with relaxed mode (diagonal_relaxed) - compare flow result with generated code"""
         flow = create_basic_flow()
 
-        # Two dataframes with same columns
         for i in range(1, 3):
             data = input_schema.NodeManualInput(
                 flow_id=1,
@@ -669,7 +647,6 @@ class TestPolarsCodeEdgeCases:
         )
         flow.add_manual_input(data)
 
-        # Code that just returns the input
         polars_code_node = input_schema.NodePolarsCode(
             flow_id=1,
             node_id=2,
@@ -768,22 +745,11 @@ class TestEmptyDataHandling:
 class TestGroupByEdgeCases:
     """Test group by edge cases."""
 
-    @pytest.mark.xfail(
-        reason="BUG: Delimiter mismatch in str.concat. "
-               "Code generator uses default '-' delimiter, flow uses ',' delimiter. "
-               "Generated: str.concat() → ['x-y'], Flow: str.concat(',') → ['x,y']. "
-               "See code_generator.py:1564 - should specify delimiter=','"
-    )
     def test_groupby_with_concat_aggregation(self):
         """Test groupby with string concatenation aggregation - compare flow result with generated code.
 
-        BUG FOUND: The code generator's str.concat() uses the default delimiter "-" (hyphen),
-        but the flow uses "," (comma) as the delimiter.
-
-        Result from generated code: ['x-y', 'z']
-        Result from flow: ['x,y', 'z']
-
-        The code generator should specify delimiter=',' to match the flow's behavior.
+        Both sides join group members with transform_schema.STRING_CONCAT_DELIMITER,
+        so ["x", "y"] becomes "x,y" in the engine and in the generated code.
         """
         flow = create_basic_flow()
         data = input_schema.NodeManualInput(
@@ -817,8 +783,7 @@ class TestGroupByEdgeCases:
         add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
 
         code = export_flow_to_polars(flow)
-        # Check that concat uses str.concat (deprecated - should be str.join)
-        assert "str.concat" in code or "str.join" in code
+        assert "str.join" in code
         assert_flow_result_matches_generated(flow, output_node_id=2, code=code)
 
 
@@ -829,7 +794,6 @@ class TestFlowOutputNodes:
         """Test flow with multiple output markers"""
         flow = create_basic_flow()
 
-        # Input node
         data = input_schema.NodeManualInput(
             flow_id=1,
             node_id=1,
@@ -840,7 +804,6 @@ class TestFlowOutputNodes:
         )
         flow.add_manual_input(data)
 
-        # Two branches from the same input
         for i in range(2, 4):
             filter_node = input_schema.NodeFilter(
                 flow_id=1,
@@ -906,7 +869,6 @@ class TestConverterHelperMethods:
         flow = create_basic_flow()
         converter = FlowGraphToPolarsConverter(flow)
 
-        # Test all documented mappings
         assert converter._get_polars_dtype("String") == "pl.Utf8"
         assert converter._get_polars_dtype("Integer") == "pl.Int64"
         assert converter._get_polars_dtype("Double") == "pl.Float64"
@@ -914,23 +876,20 @@ class TestConverterHelperMethods:
         assert converter._get_polars_dtype("Date") == "pl.Date"
         assert converter._get_polars_dtype("Datetime") == "pl.Datetime"
 
-        # Test unknown type defaults to Utf8
         assert converter._get_polars_dtype("UnknownType") == "pl.Utf8"
 
     def test_get_agg_function_mapping(self):
-        """Test aggregation function name mapping"""
+        """Test aggregation name to Polars call mapping"""
         flow = create_basic_flow()
         converter = FlowGraphToPolarsConverter(flow)
 
-        # Test mapped functions
-        assert converter._get_agg_function("avg") == "mean"
-        assert converter._get_agg_function("average") == "mean"
-        assert converter._get_agg_function("concat") == "str.concat"
+        assert converter._get_agg_function("avg") == "mean()"
+        assert converter._get_agg_function("average") == "mean()"
+        assert converter._get_agg_function("concat") == "str.join(',')"
 
-        # Test pass-through functions
-        assert converter._get_agg_function("sum") == "sum"
-        assert converter._get_agg_function("min") == "min"
-        assert converter._get_agg_function("max") == "max"
+        assert converter._get_agg_function("sum") == "sum()"
+        assert converter._get_agg_function("min") == "min()"
+        assert converter._get_agg_function("max") == "max()"
 
 
 class TestUnsupportedNodeHandling:
@@ -940,7 +899,6 @@ class TestUnsupportedNodeHandling:
         """Test that unknown node types raise UnsupportedNodeError"""
         flow = create_basic_flow()
 
-        # Add a manual input
         data = input_schema.NodeManualInput(
             flow_id=1,
             node_id=1,
@@ -1013,13 +971,12 @@ class TestDeprecatedMethodUsage:
 
         # TODO: When fixed, change to: assert uses_modern and not uses_deprecated
 
-    def test_groupby_concat_uses_deprecated_str_concat(self):
-        """Test that string concatenation in group_by uses deprecated str.concat.
+    def test_groupby_concat_uses_str_join(self):
+        """Test that string concatenation in group_by uses str.join, not the deprecated str.concat.
 
-        BUG: The code generator uses `str.concat()` for string concatenation
-        which is deprecated. It should use `str.join()` instead.
-
-        The default delimiter also changed from '-' to '' (empty string).
+        `str.concat()` is deprecated in Polars and its default delimiter ('-') differs
+        from `str.join()` (''), so the generated code must name the modern method and
+        pass the engine's delimiter explicitly.
 
         See: https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.str.join.html
         """
@@ -1056,14 +1013,10 @@ class TestDeprecatedMethodUsage:
 
         code = export_flow_to_polars(flow)
 
-        # Document the deprecated method usage
         uses_deprecated = "str.concat" in code
         uses_modern = "str.join" in code
 
-        # Currently the code generator uses the deprecated method
-        assert uses_deprecated or uses_modern, "Neither deprecated nor modern method found"
-
-        # TODO: When fixed, change to: assert uses_modern and not uses_deprecated
+        assert uses_modern and not uses_deprecated, "Generated code should use str.join, not str.concat"
 
 
 class TestFilterOperatorSpaceVariants:
@@ -1112,5 +1065,354 @@ class TestFilterOperatorSpaceVariants:
                 FilterOperator.from_symbol(symbol)
 
 
+class TestApplyRenamesPreservesStringLiterals:
+    """_apply_renames must rename variable tokens but never identifiers inside string/comment tokens."""
+
+    def _converter(self) -> FlowGraphToPolarsConverter:
+        conv = FlowGraphToPolarsConverter(create_basic_flow())
+        conv.output_nodes = []
+        conv.last_node_var = None
+        return conv
+
+    def test_string_literal_not_rewritten(self):
+        """A column literal that happens to match a provisional var name is left intact."""
+        conv = self._converter()
+        body = [
+            'df_2 = source.filter(pl.col("df_2") > 1)',
+            'out = df_2.select(["df_2"])',
+        ]
+        result = conv._apply_renames(body, {"df_2": "filtered"})
+        joined = "\n".join(result)
+        assert "filtered = source.filter(" in joined
+        assert "out = filtered.select(" in joined
+        # the string literals are NOT rewritten
+        assert 'pl.col("df_2")' in joined
+        assert '["df_2"]' in joined
+
+    def test_kwarg_param_name_preserved(self):
+        """A kwarg/contract param name (``df_1=``) stays, only the value reference renames."""
+        conv = self._converter()
+        result = conv._apply_renames(["result = run(df_1=df_1.data)"], {"df_1": "source"})
+        assert result[0] == "result = run(df_1=source.data)"
+
+    def test_multiline_string_literal_preserved(self):
+        """Identifiers inside a multi-line triple-quoted string (e.g. SQL) are untouched."""
+        conv = self._converter()
+        body = [
+            'df_3 = read("""',
+            "SELECT df_3 FROM t",
+            '""")',
+            "out = df_3.head()",
+        ]
+        result = conv._apply_renames(body, {"df_3": "queried"})
+        joined = "\n".join(result)
+        assert "queried = read(" in joined
+        assert "out = queried.head()" in joined
+        assert "SELECT df_3 FROM t" in joined  # SQL identifier inside the string literal
+
+
+class TestJoinDoesNotClobberSharedUpstream:
+    """A join that renames/drops columns must not rebind a shared upstream variable."""
+
+    def test_shared_right_input_survives_join_drop(self):
+        flow = create_basic_flow()
+        flow.add_manual_input(input_schema.NodeManualInput(
+            flow_id=1, node_id=1, raw_data_format=input_schema.RawData(
+                columns=[
+                    input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                    input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                ],
+                data=[[1, 2, 3], ["Alice", "Bob", "Charlie"]])))
+        flow.add_manual_input(input_schema.NodeManualInput(
+            flow_id=1, node_id=2, raw_data_format=input_schema.RawData(
+                columns=[
+                    input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                    input_schema.MinimalFieldInfo(name="city", data_type="String"),
+                ],
+                data=[[1, 2, 4], ["NYC", "LA", "Chicago"]])))
+        # node 3: inner join that DROPS the right 'city' column (mutates the right side).
+        flow.add_join(input_schema.NodeJoin(
+            flow_id=1, node_id=3, depending_on_ids=[1, 2],
+            join_input=transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("id", "id")],
+                left_select=[transform_schema.SelectInput("id"), transform_schema.SelectInput("name")],
+                right_select=[
+                    transform_schema.SelectInput("id"),
+                    transform_schema.SelectInput("city", keep=False),
+                ],
+                how="inner")))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 3, "main"))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3, "right"))
+        # node 4: sibling select on the SAME right input that still needs 'city'.
+        flow.add_select(input_schema.NodeSelect(
+            flow_id=1, node_id=4, depending_on_id=2,
+            select_input=[
+                transform_schema.SelectInput("id", keep=True),
+                transform_schema.SelectInput("city", keep=True),
+            ]))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 4, "main"))
+
+        code = export_flow_to_polars(flow)
+        # The shared upstream var must never be reassigned in place (would drop 'city'
+        # before the sibling select reads it).
+        assert "source_2 = source_2" not in code
+        # And the whole script (join branch + sibling branch) executes cleanly.
+        verify_code_executes(code)
+
+
+class TestSemiAntiJoinPassesLeftThrough:
+    """Semi/anti joins pass all left columns through unchanged, ignoring left_select keep/rename."""
+
+    @pytest.mark.parametrize("how", ["semi", "anti"])
+    def test_left_columns_pass_through_unchanged(self, how):
+        flow = create_basic_flow()
+        flow.add_manual_input(input_schema.NodeManualInput(
+            flow_id=1, node_id=1, raw_data_format=input_schema.RawData(
+                columns=[
+                    input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                    input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                ],
+                data=[[1, 2, 3], ["Alice", "Bob", "Charlie"]])))
+        flow.add_manual_input(input_schema.NodeManualInput(
+            flow_id=1, node_id=2, raw_data_format=input_schema.RawData(
+                columns=[
+                    input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                    input_schema.MinimalFieldInfo(name="city", data_type="String"),
+                ],
+                data=[[1, 2, 4], ["NYC", "LA", "Chicago"]])))
+        flow.add_join(input_schema.NodeJoin(
+            flow_id=1, node_id=3, depending_on_ids=[1, 2],
+            join_input=transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("id", "id")],
+                left_select=[
+                    transform_schema.SelectInput("id", keep=False),
+                    transform_schema.SelectInput("name"),
+                ],
+                right_select=[transform_schema.SelectInput("id"), transform_schema.SelectInput("city")],
+                how=how)))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 3, "main"))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3, "right"))
+
+        code = export_flow_to_polars(flow)
+        verify_code_executes(code)
+        result = get_result_from_generated_code(code)
+        cols = result.collect().columns if hasattr(result, "collect") else result.columns
+        assert "id" in cols  # left passes through unchanged; keep=False on a join key is ignored
+        assert "name" in cols
+        assert_flow_result_matches_generated(flow, output_node_id=3, code=code)
+
+
+class TestBooleanFilterTypedLiteral:
+    """Basic filters on a Boolean column must emit typed bool literals, matching the runtime."""
+
+    def _flow(self) -> FlowGraph:
+        flow = create_basic_flow()
+        flow.add_manual_input(input_schema.NodeManualInput(
+            flow_id=1, node_id=1, raw_data_format=input_schema.RawData(
+                columns=[
+                    input_schema.MinimalFieldInfo(name="flag", data_type="Boolean"),
+                    input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                ],
+                data=[[True, False, True], [1, 2, 3]])))
+        return flow
+
+    @pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe],
+                             ids=["polars", "flowframe"])
+    @pytest.mark.parametrize("value,literal", [("true", "True"), ("false", "False")])
+    def test_boolean_equals_emits_typed_literal(self, value, literal, export_func):
+        flow = self._flow()
+        flow.add_filter(input_schema.NodeFilter(
+            flow_id=1, node_id=2, depending_on_id=1,
+            filter_input=transform_schema.FilterInput(
+                filter_type="basic",
+                basic_filter=transform_schema.BasicFilter(field="flag", operator="=", value=value))))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+        code = export_func(flow)
+        assert f"== {literal}" in code
+        assert f'== "{value}"' not in code  # not a string comparison
+        assert_flow_result_matches_generated(flow, output_node_id=2, code=code)
+
+
+class TestSpecialCharacterColumnNames:
+    """Columns containing quotes/backslashes must be escaped, never break generated code."""
+
+    def test_quotes_and_backslash_through_group_by_and_sort(self):
+        weird = 'Revenue "Q1"'
+        weird_path = r"path\to\col"
+        agg_out = 'Total "Q1"'
+        flow = create_basic_flow()
+        flow.add_manual_input(input_schema.NodeManualInput(
+            flow_id=1, node_id=1, raw_data_format=input_schema.RawData(
+                columns=[
+                    input_schema.MinimalFieldInfo(name=weird, data_type="Integer"),
+                    input_schema.MinimalFieldInfo(name=weird_path, data_type="String"),
+                    input_schema.MinimalFieldInfo(name="grp", data_type="String"),
+                ],
+                data=[[10, 20, 30], ["a", "b", "c"], ["x", "x", "y"]])))
+        flow.add_group_by(input_schema.NodeGroupBy(
+            flow_id=1, node_id=2, depending_on_id=1,
+            groupby_input=transform_schema.GroupByInput(agg_cols=[
+                transform_schema.AggColl("grp", "groupby"),
+                transform_schema.AggColl(weird, "sum", agg_out),
+            ])))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+        flow.add_sort(input_schema.NodeSort(
+            flow_id=1, node_id=3, depending_on_id=2,
+            sort_input=[transform_schema.SortByInput(column=agg_out, how="asc")]))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+
+        code = export_flow_to_polars(flow)
+        verify_code_executes(code)
+        result = get_result_from_generated_code(code)
+        cols = result.collect().columns if hasattr(result, "collect") else result.columns
+        assert agg_out in cols
+        assert "grp" in cols
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestTemporalFilterTypedLiteral:
+    """Basic filters on Date / Datetime columns must emit ``datetime`` literals, matching the runtime."""
+
+    def _flow(self) -> FlowGraph:
+        flow = create_basic_flow()
+        flow.add_manual_input(input_schema.NodeManualInput(
+            flow_id=1, node_id=1, raw_data_format=input_schema.RawData.from_pylist([
+                {"d": datetime.date(2024, 1, 1), "ts": datetime.datetime(2024, 1, 1, 10, 0, 0)},
+                {"d": datetime.date(2024, 6, 1), "ts": datetime.datetime(2024, 6, 1, 12, 0, 0)},
+                {"d": datetime.date(2024, 9, 1), "ts": datetime.datetime(2024, 9, 1, 0, 0, 0)},
+            ])))
+        return flow
+
+    def _add_filter(self, flow: FlowGraph, field: str, operator: str, value: str, value2: str | None = None):
+        flow.add_filter(input_schema.NodeFilter(
+            flow_id=1, node_id=2, depending_on_id=1,
+            filter_input=transform_schema.FilterInput(
+                filter_type="basic",
+                basic_filter=transform_schema.BasicFilter(field=field, operator=operator, value=value, value2=value2))))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    @pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe],
+                             ids=["polars", "flowframe"])
+    @pytest.mark.parametrize("field,operator,value,value2,literal", [
+        ("d", "greater_than", "2024-03-01", None, "> datetime.date(2024, 3, 1)"),
+        ("d", "between", "2024-01-01", "2024-06-01", ">= datetime.date(2024, 1, 1)"),
+        ("d", "in", "2024-01-01, 2024-09-01", None, "is_in([datetime.date(2024, 1, 1), datetime.date(2024, 9, 1)])"),
+        ("ts", "less_than", "2024-06-01 12:00:00", None, "< datetime.datetime(2024, 6, 1, 12, 0, 0)"),
+        ("ts", "equals", "2024-06-01", None, "== datetime.datetime(2024, 6, 1, 0, 0, 0)"),
+    ])
+    def test_temporal_filter_emits_datetime_literal(self, field, operator, value, value2, literal, export_func):
+        flow = self._flow()
+        self._add_filter(flow, field, operator, value, value2)
+        code = export_func(flow)
+        assert literal in code
+        assert "import datetime" in code
+        assert_flow_result_matches_generated(flow, output_node_id=2, code=code)
+
+
+def _people_flow() -> FlowGraph:
+    flow = create_basic_flow()
+    flow.add_manual_input(input_schema.NodeManualInput(
+        flow_id=1, node_id=1, raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                input_schema.MinimalFieldInfo(name="age", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="city", data_type="String"),
+            ],
+            data=[[1, 2, 3], ["a", "b", "c"], [30, 40, 50], ["x", "y", "z"]])))
+    return flow
+
+
+def _assert_same_columns_in_order(flow: FlowGraph, node_id: int, code: str) -> None:
+    expected = flow.get_node(node_id).get_resulting_data().data_frame.collect_schema().names()
+    result = get_result_from_generated_code(code)
+    result = result.collect() if hasattr(result, "collect") else result
+    assert result.columns == expected, code
+
+
+class TestSelectKeepMissingKeepsUnlistedColumns:
+    """A keep_missing select passes the columns it does not list through, in the canvas's order."""
+
+    def _select_flow(self) -> FlowGraph:
+        flow = _people_flow()
+        flow.add_select(input_schema.NodeSelect(
+            flow_id=1, node_id=2, depending_on_id=1, keep_missing=True,
+            select_input=[
+                transform_schema.SelectInput("name", "full_name"),
+                transform_schema.SelectInput("city", keep=False),
+                transform_schema.SelectInput("age", data_type="Float64", data_type_change=True),
+            ]))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+        return flow
+
+    @pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe],
+                             ids=["polars", "flowframe"])
+    def test_unlisted_column_survives_the_export(self, export_func):
+        flow = self._select_flow()
+        code = export_func(flow)
+        assert_flow_result_matches_generated(flow, output_node_id=2, code=code)
+        _assert_same_columns_in_order(flow, 2, code)
+
+    @pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe],
+                             ids=["polars", "flowframe"])
+    def test_unknown_input_schema_exports_drop_rename_and_cast(self, export_func, monkeypatch):
+        from flowfile_core.flowfile.code_generator.code_generator import FlowGraphCodeConverter
+
+        monkeypatch.setattr(FlowGraphCodeConverter, "_input_column_names", lambda self, node_id: None)
+        flow = self._select_flow()
+        code = export_func(flow)
+        assert '.drop(["city"]).rename({"name": "full_name"}).with_columns(' in code
+        assert_flow_result_matches_generated(flow, output_node_id=2, code=code)
+
+
+class TestJoinSuffixForm:
+    """A join whose right-side renames are one suffix pattern exports as a single ``.join(..., suffix=...)``."""
+
+    def _join_flow(self, right_select: list, how: str = "left") -> FlowGraph:
+        flow = _people_flow()
+        flow.add_manual_input(input_schema.NodeManualInput(
+            flow_id=1, node_id=2, raw_data_format=input_schema.RawData(
+                columns=[
+                    input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                    input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                ],
+                data=[["p", "q"], [1, 3]])))
+        flow.add_join(input_schema.NodeJoin(
+            flow_id=1, node_id=3, depending_on_ids=[1, 2],
+            join_input=transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("id", "id")],
+                left_select=[transform_schema.SelectInput(c) for c in ("id", "name", "age", "city")],
+                right_select=right_select,
+                how=how)))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 3, "main"))
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3, "right"))
+        return flow
+
+    @pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe],
+                             ids=["polars", "flowframe"])
+    @pytest.mark.parametrize("how", ["left", "inner"])
+    @pytest.mark.parametrize("right_select,expected", [
+        ([transform_schema.SelectInput("name"), transform_schema.SelectInput("id", keep=False)], ""),
+        ([transform_schema.SelectInput("name", "name_r"), transform_schema.SelectInput("id", keep=False)],
+         'suffix="_r"'),
+        ([transform_schema.SelectInput("name"), transform_schema.SelectInput("id")], "coalesce=False"),
+    ], ids=["default_suffix", "user_suffix", "right_key_kept"])
+    def test_suffix_join_matches_the_canvas(self, export_func, how, right_select, expected):
+        flow = self._join_flow(right_select, how)
+        code = export_func(flow)
+        assert "__DROP__" not in code and ".rename(" not in code
+        if export_func is export_flow_to_flowframe and expected == "coalesce=False":
+            expected = "keep_right_keys=True"
+        assert expected in code
+        assert_flow_result_matches_generated(flow, output_node_id=3, code=code)
+        _assert_same_columns_in_order(flow, 3, code)
+
+    def test_right_key_before_other_right_columns_keeps_the_rename_form(self):
+        flow = self._join_flow([transform_schema.SelectInput("id"), transform_schema.SelectInput("name")])
+        code = export_flow_to_polars(flow)
+        assert "__DROP__" in code
+        assert_flow_result_matches_generated(flow, output_node_id=3, code=code)

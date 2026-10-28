@@ -109,13 +109,15 @@
       width="92vw"
       destroy-on-close
       append-to-body
+      :before-close="onViewerBeforeClose"
+      @close="closeViewer"
     >
       <VisualizationViewer
         v-if="viewerOpen && active"
+        ref="viewerRef"
         :viz-id="active.id"
         :appearance="appearance"
-        @close="closeViewer"
-        @deleted="onDeletedFromViewer"
+        @updated="onVizUpdated"
       />
     </el-dialog>
 
@@ -128,9 +130,11 @@
       destroy-on-close
       append-to-body
       :close-on-click-modal="false"
+      :before-close="onCreatorBeforeClose"
     >
       <VisualizationEditor
         v-if="creatorOpen && pendingSource"
+        ref="creatorRef"
         :source="pendingSource"
         :appearance="appearance"
         @saved="onCreated"
@@ -243,9 +247,50 @@ async function onDelete(item: CatalogVisualization) {
   }
 }
 
-function onDeletedFromViewer() {
-  closeViewer();
+function onVizUpdated(viz: CatalogVisualization) {
+  active.value = viz;
 }
+
+const viewerRef = ref<InstanceType<typeof VisualizationViewer> | null>(null);
+const creatorRef = ref<InstanceType<typeof VisualizationEditor> | null>(null);
+
+// Flush while GW is still mounted; a failed flush gets a lose-changes confirm.
+const onViewerBeforeClose = async (done: () => void) => {
+  const clean = (await viewerRef.value?.flushAutosave()) ?? true;
+  if (clean) {
+    done();
+    return;
+  }
+  try {
+    await ElMessageBox.confirm(
+      "Some chart changes couldn't be saved. Close anyway and lose them?",
+      "Unsaved changes",
+      { confirmButtonText: "Close", cancelButtonText: "Keep editing", type: "warning" },
+    );
+    done();
+  } catch {
+    // stay open
+  }
+};
+
+const onCreatorBeforeClose = async (done: () => void) => {
+  const editor = creatorRef.value;
+  if (!editor?.isDirty) {
+    done();
+    return;
+  }
+  await editor.flushDraft();
+  try {
+    await ElMessageBox.confirm(
+      "Close the chart builder? Your work is kept as a draft on this device.",
+      "Close chart builder",
+      { confirmButtonText: "Close", cancelButtonText: "Keep editing", type: "warning" },
+    );
+    done();
+  } catch {
+    // stay open
+  }
+};
 
 onMounted(() => {
   store.loadVisualizationLibrary();

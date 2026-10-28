@@ -58,10 +58,10 @@ from flowfile_core.ai.intent_router import (
     verdict_for,
 )
 from flowfile_core.ai.providers import (
-    PROVIDERS,
     Message,
     UnknownProviderError,
-    list_supported_providers,
+    is_resolvable_provider,
+    resolvable_provider_names,
 )
 from flowfile_core.auth.jwt import get_current_active_user
 from flowfile_core.database.connection import get_db
@@ -102,11 +102,6 @@ class RouteRequest(BaseModel):
     provider: str = Field(min_length=1)
     model: str | None = None
     history: list[ChatHistoryEntry] | None = None
-    """Recent chat turns (oldest first), excluding the current message. The
-    classifier uses this to disambiguate short follow-ups like *"can you
-    implement?"* — the answer depends entirely on whether the prior assistant
-    turn proposed concrete nodes / steps. Capped server-side at
-    :data:`flowfile_core.ai.intent_router.DEFAULT_HISTORY_TURNS` turns."""
 
 
 class RouteResponse(BaseModel):
@@ -128,10 +123,10 @@ class RouteResponse(BaseModel):
 
 
 def _ensure_known_provider(name: str) -> None:
-    if name not in PROVIDERS:
+    if not is_resolvable_provider(name):
         raise HTTPException(
             status_code=404,
-            detail=f"Unknown provider {name!r}; supported: {list_supported_providers()}",
+            detail=f"Unknown provider {name!r}; supported: {resolvable_provider_names()}",
         )
 
 

@@ -50,7 +50,7 @@
         <div v-show="openMode === 'catalog'" class="open-panel catalog-panel">
           <div class="catalog-tree-pane">
             <label class="pane-label">Namespace</label>
-            <catalog-namespace-picker v-model="selectedNamespaceId" />
+            <catalog-namespace-picker ref="namespacePicker" v-model="selectedNamespaceId" />
           </div>
           <div class="catalog-flows-pane">
             <label class="pane-label">Flows</label>
@@ -116,15 +116,36 @@ const props = defineProps({
 
 const emit = defineEmits<{
   (e: "update:visible", value: boolean): void;
-  (e: "open-flow", payload: { message: string; flowPath: string }): void;
+  (
+    e: "open-flow",
+    payload: { message: string; flowPath: string; flowName?: string; catalogRef?: string },
+  ): void;
   (e: "open-cancelled"): void;
 }>();
 
+// Persist the last-used source (file vs catalog) and namespace so the dialog
+// reopens where the user left off, instead of always defaulting to the local
+// file system.
+const OPEN_MODE_STORAGE_KEY = "openDialog_mode";
+const NAMESPACE_STORAGE_KEY = "openDialog_namespaceId";
+
+function loadOpenMode(): "file" | "catalog" {
+  return localStorage.getItem(OPEN_MODE_STORAGE_KEY) === "catalog" ? "catalog" : "file";
+}
+
+function loadNamespaceId(): number | null {
+  const stored = localStorage.getItem(NAMESPACE_STORAGE_KEY);
+  if (!stored) return null;
+  const n = Number(stored);
+  return Number.isNaN(n) ? null : n;
+}
+
 const isVisible = ref(props.visible);
-const openMode = ref<"file" | "catalog">("file");
+const openMode = ref<"file" | "catalog">(loadOpenMode());
+const namespacePicker = ref<InstanceType<typeof CatalogNamespacePicker> | null>(null);
 
 // Catalog tab state
-const selectedNamespaceId = ref<number | null>(null);
+const selectedNamespaceId = ref<number | null>(loadNamespaceId());
 const flows = ref<FlowRegistration[]>([]);
 const loadingFlows = ref(false);
 const selectedFlowId = ref<number | null>(null);
@@ -150,7 +171,13 @@ watch(isVisible, (v) => {
   if (!v) emit("open-cancelled");
 });
 
-// Reload flow list when the selected namespace changes
+// Remember the last-used source and namespace across sessions.
+watch(openMode, (m) => localStorage.setItem(OPEN_MODE_STORAGE_KEY, m));
+watch(selectedNamespaceId, (nsId) => {
+  if (nsId === null) localStorage.removeItem(NAMESPACE_STORAGE_KEY);
+  else localStorage.setItem(NAMESPACE_STORAGE_KEY, String(nsId));
+});
+
 watch(selectedNamespaceId, async (nsId) => {
   selectedFlowId.value = null;
   if (nsId === null) {
@@ -199,9 +226,14 @@ function handleRowClick(flow: FlowRegistration) {
 }
 
 function handleOpenCatalogFlow(flow: FlowRegistration) {
+  const nsPath = namespacePicker.value?.getNamespacePath(
+    flow.namespace_id ?? selectedNamespaceId.value,
+  );
   emit("open-flow", {
     message: "Flow opened from catalog",
     flowPath: flow.flow_path,
+    flowName: flow.name,
+    catalogRef: nsPath ? `${nsPath}.${flow.name}` : undefined,
   });
   isVisible.value = false;
 }

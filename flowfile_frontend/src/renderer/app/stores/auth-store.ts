@@ -1,5 +1,6 @@
 import { defineStore } from "pinia";
 import authService from "../services/auth.service";
+import { useTelemetryStore } from "./telemetry-store";
 
 export interface User {
   username: string;
@@ -43,7 +44,7 @@ export const useAuthStore = defineStore("auth", {
 
         if (success) {
           this.isAuthenticated = true;
-          // Fetch full user info including is_admin
+          this.clearSessionScopedStores();
           const userInfo = await authService.getCurrentUser();
           if (userInfo) {
             this.user = userInfo;
@@ -71,7 +72,6 @@ export const useAuthStore = defineStore("auth", {
         this.isAuthenticated = authenticated;
 
         if (authenticated) {
-          // Try to get user info from the backend
           const userInfo = await authService.getCurrentUser();
           if (userInfo) {
             this.user = userInfo;
@@ -93,6 +93,17 @@ export const useAuthStore = defineStore("auth", {
       this.user = null;
       this.isAuthenticated = false;
       this.error = null;
+      this.clearSessionScopedStores();
+    },
+
+    /**
+     * Drop per-user state that outlives a client-side user switch. Telemetry
+     * status is load-once and carries `can_manage`, which is per-user in docker
+     * mode — keeping it would let the next user be judged by the previous
+     * user's authority.
+     */
+    clearSessionScopedStores() {
+      useTelemetryStore().$reset();
     },
 
     clearError() {

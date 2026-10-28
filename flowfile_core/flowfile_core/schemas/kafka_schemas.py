@@ -7,9 +7,9 @@ from typing import Literal
 
 from pydantic import BaseModel, SecretStr
 
-# ---------------------------------------------------------------------------
+from flowfile_core.schemas.sharing_schema import AccessInfo
+
 # Kafka Connection schemas
-# ---------------------------------------------------------------------------
 
 
 class KafkaConnectionCreate(BaseModel):
@@ -56,6 +56,7 @@ class KafkaConnectionOut(BaseModel):
     schema_registry_url: str | None = None
     created_at: datetime
     updated_at: datetime
+    access: AccessInfo | None = None
 
 
 class KafkaTopicInfo(BaseModel):

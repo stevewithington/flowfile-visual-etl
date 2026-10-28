@@ -20,13 +20,23 @@ logger = logging.getLogger("flowfile_core.ai.agents.planner")
 
 
 DEFAULT_MAX_STEPS: int = 32
-"""Per-session planner-loop budget. The ``agent_staged`` surface fans
-each node-add into 4 LLM rounds (classify → pick_type → pick_upstream →
-fill_settings), so a 3-node user turn needs at least 12 rounds. Wasted
-budget is free; missed budget truncates the user's plan."""
 DEFAULT_MAX_RETRIES_PER_STEP: int = 3
 DEFAULT_MAX_TOKENS: int = 2_048
 RATIONALE_MAX_LEN: int = 500
+DEFAULT_MAX_DB_READER_OPS: int = 8
+
+# Plan-ledger budget knobs (see ``plan_ledger`` + the loop's emit_plan
+# handler). On a parsed plan the default step budget auto-scales to
+# ``_PLAN_ROUNDS_PER_STEP * len(steps) + _PLAN_BUDGET_SLACK``, clamped to
+# ``MAX_STEPS_HARD_CAP``; a caller-supplied ``max_steps`` (``max_steps_explicit``)
+# is a hard ceiling and is never raised. ``_MAX_PLAN_NUDGES``
+# caps mid-plan stall nudges per stall (loop-local counter, re-armed on each
+# completed op). ``DEFAULT_MAX_STEPS`` stays 32 — auto-scaling covers planned
+# runs; keep it in lockstep with ``sessions.AgentSession.max_steps``.
+_MAX_PLAN_NUDGES: int = 2
+_PLAN_ROUNDS_PER_STEP: int = 5
+_PLAN_BUDGET_SLACK: int = 8
+MAX_STEPS_HARD_CAP: int = 128
 
 
 PlannerEventName = Literal[
@@ -46,12 +56,6 @@ PlannerEventName = Literal[
     "error",
     "info",
 ]
-"""``awaiting_user_input`` is emitted *instead of* ``complete`` when the
-planner loop ends with no tool calls AND no staged results AND the last
-assistant message looks like a clarifying question. The session flips to
-``awaiting_user_input`` (not ``completed``) so the frontend can surface
-*"Agent waiting for your reply…"* and the followup endpoint accepts the
-user's answer for re-entry."""
 
 
 class PlannerEvent(BaseModel):

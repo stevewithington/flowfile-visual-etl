@@ -27,6 +27,8 @@ class ArtifactRef:
     type_name: str = ""
     module: str = ""
     size_bytes: int = 0
+    has_preview: bool = False
+    preview_mime: str = ""
     created_at: datetime = field(default_factory=datetime.now)
 
     def to_dict(self) -> dict[str, Any]:
@@ -37,6 +39,8 @@ class ArtifactRef:
             "type_name": self.type_name,
             "module": self.module,
             "size_bytes": self.size_bytes,
+            "has_preview": self.has_preview,
+            "preview_mime": self.preview_mime,
             "created_at": self.created_at.isoformat(),
         }
 
@@ -107,16 +111,16 @@ class ArtifactContext:
                 type_name=item.get("type_name", ""),
                 module=item.get("module", ""),
                 size_bytes=item.get("size_bytes", 0),
+                has_preview=item.get("has_preview", False),
+                preview_mime=item.get("preview_mime") or "",
                 created_at=datetime.now(timezone.utc),
             )
             refs.append(ref)
             state.published.append(ref)
 
-            # Update the per-kernel index
             kernel_map = self._kernel_artifacts.setdefault(kernel_id, {})
             kernel_map[ref.name] = ref
 
-            # Update the reverse index
             key = (kernel_id, ref.name)
             self._publisher_index.setdefault(key, set()).add(node_id)
 
@@ -153,7 +157,6 @@ class ArtifactContext:
         kernel_map = self._kernel_artifacts.get(kernel_id, {})
         for name in artifact_names:
             kernel_map.pop(name, None)
-            # Clean up the reverse index entry but leave published intact
             key = (kernel_id, name)
             publisher_ids = self._publisher_index.pop(key, set())
 
@@ -205,10 +208,8 @@ class ArtifactContext:
             upstream_state = self._node_states.get(uid)
             if upstream_state is None:
                 continue
-            # First, remove artifacts deleted by this upstream node
             for name in upstream_state.deleted:
                 available.pop(name, None)
-            # Then, add artifacts published by this upstream node
             for ref in upstream_state.published:
                 if ref.kernel_id == kernel_id:
                     available[ref.name] = ref
@@ -279,12 +280,10 @@ class ArtifactContext:
         Clears the kernel index and availability maps.  The ``published``
         lists on node states are preserved as historical records.
         """
-        # Clean reverse index entries for this kernel
         keys_to_remove = [k for k in self._publisher_index if k[0] == kernel_id]
         for k in keys_to_remove:
             del self._publisher_index[k]
 
-        # Clean deletion origin entries for this kernel
         for nid in list(self._deletion_origins):
             self._deletion_origins[nid] = [entry for entry in self._deletion_origins[nid] if entry[0] != kernel_id]
             if not self._deletion_origins[nid]:
@@ -314,14 +313,12 @@ class ArtifactContext:
             if state is None:
                 continue
             for ref in state.published:
-                # Remove from the kernel artifact index
                 kernel_map = self._kernel_artifacts.get(ref.kernel_id)
                 if kernel_map is not None:
                     # Only remove if this ref is still the current entry
                     existing = kernel_map.get(ref.name)
                     if existing is not None and existing.source_node_id == nid:
                         del kernel_map[ref.name]
-                # Remove from the reverse publisher index
                 key = (ref.kernel_id, ref.name)
                 pub_set = self._publisher_index.get(key)
                 if pub_set is not None:
@@ -421,6 +418,8 @@ class ArtifactContext:
                         "name": r.name,
                         "type_name": r.type_name,
                         "module": r.module,
+                        "has_preview": r.has_preview,
+                        "preview_mime": r.preview_mime,
                     }
                     for r in state.published
                 ],
@@ -458,3 +457,44 @@ class ArtifactContext:
         if node_id not in self._node_states:
             self._node_states[node_id] = NodeArtifactState()
         return self._node_states[node_id]
+
+
+def merge_declared_artifacts(
+    observed: dict[str, ArtifactRef],
+    declared: list[tuple[int, str, str | None]],
+    kernel_id: str,
+) -> list[dict[str, Any]]:
+    """Merge run-observed artifact refs with manifest-declared publishes.
+
+    ``declared`` entries are ``(source_node_id, name, type)`` tuples where
+    ``type`` is a dotted qualname (``"sklearn.ensemble.RandomForest"``), a bare
+    name, or ``None``.  Observed refs win on name conflict; declared entries
+    only fill in names that were never published this run (``status`` field
+    distinguishes ``"published"`` from ``"declared"``).  Declared-vs-declared
+    duplicate names: first entry wins.  Pure — writes no ArtifactContext state.
+    """
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set(observed)
+    for ref in observed.values():
+        result.append({**ref.to_dict(), "status": "published"})
+    for source_node_id, name, type_ in declared:
+        if name in seen:
+            continue
+        seen.add(name)
+        if type_:
+            module, _, type_name = type_.rpartition(".")
+        else:
+            module, type_name = "", ""
+        result.append(
+            {
+                "name": name,
+                "source_node_id": source_node_id,
+                "kernel_id": kernel_id,
+                "type_name": type_name,
+                "module": module,
+                "size_bytes": 0,
+                "created_at": None,
+                "status": "declared",
+            }
+        )
+    return result

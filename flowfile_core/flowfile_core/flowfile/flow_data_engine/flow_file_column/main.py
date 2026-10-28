@@ -1,14 +1,33 @@
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
 import polars as pl
 
-from flowfile_core.flowfile.flow_data_engine.flow_file_column.interface import DataTypeGroup, ReadableDataTypeGroup
+from flowfile_core.flowfile.flow_data_engine.flow_file_column.interface import (
+    DataTypeGroup,
+    ReadableDataTypeGroup,
+    SemanticType,
+)
 from flowfile_core.flowfile.flow_data_engine.flow_file_column.polars_type import PlType
 from flowfile_core.flowfile.flow_data_engine.flow_file_column.type_registry import convert_pl_type_to_string
 from flowfile_core.flowfile.flow_data_engine.flow_file_column.utils import cast_str_to_polars_type
 from flowfile_core.schemas import input_schema
+from shared.delta_utils import format_binary_preview
+
+MAX_STAT_VALUE_LENGTH = 200
+
+# pl.Extension stringifies as Extension('<name>', <storage>, <metadata>); capture name + storage base token.
+# TODO(polars-2): extension dtypes then survive IPC/Parquet by default; see tests/…/test_polars2_extension_dtypes.py.
+_EXTENSION_DTYPE = re.compile(r"^Extension\('([^']*)',\s*([A-Za-z0-9_]+)")
+
+
+def _stat_repr(value: Any) -> str:
+    """Bounded string form of a min/max bound; bytes use the shared hex preview encoding."""
+    if isinstance(value, bytes | bytearray | memoryview):
+        return format_binary_preview(value)[:MAX_STAT_VALUE_LENGTH]
+    return str(value)[:MAX_STAT_VALUE_LENGTH]
 
 
 @dataclass
@@ -23,12 +42,14 @@ class FlowfileColumn:
     number_of_unique_values: int
     example_values: str
     data_type_group: ReadableDataTypeGroup
+    semantic_type: SemanticType | None
     __sql_type: Any | None
     __is_unique: bool | None
     __nullable: bool | None
     __has_values: bool | None
     average_value: str | None
     __perc_unique: float | None
+    __stats_applied: bool
 
     def __init__(self, polars_type: PlType):
         self.data_type = convert_pl_type_to_string(polars_type.pl_datatype)
@@ -46,7 +67,9 @@ class FlowfileColumn:
         self.__is_unique = None
         self.__sql_type = None
         self.__perc_unique = None
+        self.__stats_applied = False
         self.data_type_group = self.get_readable_datatype_group()
+        self.semantic_type = self.get_semantic_type()
 
     def __repr__(self):
         """
@@ -75,7 +98,6 @@ class FlowfileColumn:
         if self.size is not None:
             lines.append(f"  Non-Nulls: {self.size}")
 
-        # Calculate and display nulls if possible
         if self.size is not None and self.number_of_empty_values is not None:
             total_entries = self.size + self.number_of_empty_values
             if total_entries > 0:
@@ -104,7 +126,6 @@ class FlowfileColumn:
         # --- Conditional Examples Section ---
         if self.example_values:
             example_str = str(self.example_values)
-            # Truncate long example strings for cleaner display
             if len(example_str) > 70:
                 example_str = example_str[:67] + "..."
             lines.append(f"  Examples: {example_str}")
@@ -171,20 +192,75 @@ class FlowfileColumn:
     def name(self):
         return self.column_name
 
+    def apply_statistics(
+        self,
+        total_rows: int,
+        null_count: int,
+        n_unique: int | None = None,
+        min_value: Any | None = None,
+        max_value: Any | None = None,
+        average_value: Any | None = None,
+    ) -> None:
+        """Applies exactly-computed statistics onto this column.
+
+        Replaces the schema-time sentinels with real values (from the on-demand
+        column_stats pass) and resets the lazily-derived caches (is_unique,
+        perc_unique, …) so they re-derive from the new counts. Every stat field
+        is overwritten: a value not in this batch (count-only retry, an
+        unsupported dtype) becomes unknown again instead of surviving from an
+        earlier state. Values are stringified and bounded so a long-text
+        min/max can't blow up payloads.
+        """
+        self.size = total_rows - null_count
+        self.number_of_empty_values = null_count
+        self.number_of_unique_values = -1 if n_unique is None else n_unique
+        self.min_value = None if min_value is None else _stat_repr(min_value)
+        self.max_value = None if max_value is None else _stat_repr(max_value)
+        if isinstance(average_value, float):
+            average_value = round(average_value, 4)
+        self.average_value = None if average_value is None else str(average_value)[:MAX_STAT_VALUE_LENGTH]
+        self.__stats_applied = True
+        self.__is_unique = None
+        self.__perc_unique = None
+        self.__has_values = None
+        self.__nullable = None
+
+    @property
+    def stats_applied(self) -> bool:
+        """True once exact stats were written via apply_statistics."""
+        return self.__stats_applied
+
+    @staticmethod
+    def _known_count(value: int | None) -> int | None:
+        return None if value is None or value < 0 else value
+
     def get_column_repr(self):
+        # Sentinel stat values (-1 counts, "" bounds — never computed) go out as
+        # None so the wire model doesn't dress "unknown" up as data. Once exact
+        # stats were applied, an empty string is a real bound ("" is a legal min
+        # of a String column) and ships as-is.
+        null_count = self._known_count(self.number_of_empty_values)
+        empty_is_sentinel = not self.__stats_applied
+
+        def bound_repr(value):
+            if value is None or (value == "" and empty_is_sentinel):
+                return None
+            return str(value)
+
         return dict(
             name=self.name,
-            size=self.size,
+            size=None if null_count is None else self.size,
             data_type=str(self.data_type),
             data_type_group=self.data_type_group,
+            semantic_type=self.semantic_type,
             has_values=self.has_values,
             is_unique=self.is_unique,
-            max_value=str(self.max_value),
-            min_value=str(self.min_value),
-            number_of_unique_values=self.number_of_unique_values,
-            number_of_filled_values=self.number_of_filled_values,
-            number_of_empty_values=self.number_of_empty_values,
-            average_size=self.average_value,
+            max_value=bound_repr(self.max_value),
+            min_value=bound_repr(self.min_value),
+            number_of_unique_values=self._known_count(self.number_of_unique_values),
+            number_of_filled_values=None if null_count is None else self.number_of_filled_values,
+            number_of_empty_values=null_count,
+            average_value=None if self.average_value in (None, "") else str(self.average_value),
         )
 
     def generic_datatype(self) -> DataTypeGroup:
@@ -224,15 +300,37 @@ class FlowfileColumn:
         else:
             return "str"
 
+    def _extension_parts(self) -> tuple[str, str] | None:
+        """(extension name, storage base token) for a pl.Extension dtype, else None."""
+        match = _EXTENSION_DTYPE.match(self.data_type)
+        return (match.group(1), match.group(2)) if match else None
+
+    def get_semantic_type(self) -> SemanticType | None:
+        """Only a declared GeoArrow extension dtype counts as geometry; values are never sniffed."""
+        extension = self._extension_parts()
+        if extension is not None and extension[0].lower().startswith("geoarrow."):
+            return "geometry"
+        return None
+
     def get_readable_datatype_group(self) -> ReadableDataTypeGroup:
-        if self.data_type in ("Utf8", "VARCHAR", "CHAR", "NVARCHAR", "String"):
+        # Parameterized dtypes stringify with their inner type, e.g. "List(Int64)"
+        # or "Datetime(time_unit='us', ...)" — match on the base token. An extension
+        # dtype groups by its storage type.
+        extension = self._extension_parts()
+        base = extension[1] if extension else self.data_type.split("(", 1)[0]
+        if base in ("Utf8", "VARCHAR", "CHAR", "NVARCHAR", "String"):
             return "String"
-        elif self.data_type in (
+        elif base in ("boolean", "Boolean"):
+            return "Boolean"
+        elif base in ("binary", "Binary"):
+            return "Binary"
+        elif base in ("list", "struct", "array", "List", "Struct", "Array"):
+            return "Complex"
+        elif base in (
             "fixed_decimal",
             "decimal",
             "float",
             "integer",
-            "boolean",
             "double",
             "Int8",
             "Int16",
@@ -243,8 +341,6 @@ class FlowfileColumn:
             "Float32",
             "Float64",
             "Decimal",
-            "Binary",
-            "Boolean",
             "Uint8",
             "Uint16",
             "Uint32",
@@ -256,7 +352,7 @@ class FlowfileColumn:
             "UInt128",
         ):
             return "Numeric"
-        elif self.data_type in ("datetime", "date", "Date", "Datetime", "Time"):
+        elif base in ("datetime", "date", "Date", "Datetime", "Time", "time", "Duration", "duration"):
             return "Date"
         else:
             return "Other"
@@ -268,6 +364,8 @@ class FlowfileColumn:
 
     def update_type_from_polars_type(self, pl_type: PlType):
         self.data_type = str(pl_type.pl_datatype.base_type())
+        self.data_type_group = self.get_readable_datatype_group()
+        self.semantic_type = self.get_semantic_type()
 
 
 def convert_stats_to_column_info(stats: list[dict]) -> list[FlowfileColumn]:

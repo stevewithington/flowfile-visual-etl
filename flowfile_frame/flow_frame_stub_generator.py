@@ -10,7 +10,8 @@ import inspect
 import os
 import re
 import sys
-from typing import get_type_hints
+import types
+from typing import get_args, get_origin, get_type_hints
 
 PASSTHROUGH_METHODS = {
     "collect",
@@ -62,6 +63,51 @@ def format_default_value(param: inspect.Parameter) -> str | None:
     return "..."
 
 
+def first_keyword_only(sig: inspect.Signature) -> str | None:
+    """The parameter a bare ``*`` goes before: the first keyword-only one, when the signature has no ``*args``."""
+    params = sig.parameters.values()
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
+        return None
+    return next((p.name for p in params if p.kind == inspect.Parameter.KEYWORD_ONLY), None)
+
+
+def format_subscripted_generic(alias) -> str:
+    """
+    Render a PEP 585 subscripted generic (``list[str]``, ``dict[str, int]``) with its arguments.
+
+    Needed because ``isinstance(list[str], type)`` is True on Python 3.10 (it only
+    became False in 3.11), so without this the plain-class branch of
+    ``format_type_annotation`` collapses the alias to its bare ``__name__`` and
+    silently drops the parameters. Properties are the visible casualty: their
+    annotations are resolved through ``get_type_hints``, which turns the
+    ``from __future__ import annotations`` string back into a real alias object,
+    whereas parameter annotations stay strings and pass through untouched.
+
+    Parameters
+    ----------
+    alias : types.GenericAlias
+        The subscripted generic to format.
+
+    Returns
+    -------
+    str
+        The origin rendered with its formatted arguments, e.g. ``"list[str]"``.
+    """
+    origin_str = format_type_annotation(get_origin(alias))
+    args = get_args(alias)
+    if not args:
+        return origin_str
+
+    rendered = []
+    for arg in args:
+        if isinstance(arg, list):
+            # Callable[[int, str], bool] hands back its parameters as a list.
+            rendered.append("[" + ", ".join(format_type_annotation(a) for a in arg) + "]")
+        else:
+            rendered.append(format_type_annotation(arg))
+    return f"{origin_str}[{', '.join(rendered)}]"
+
+
 def format_type_annotation(annotation_obj) -> str:
     """
     Properly format a type annotation object to a string representation.
@@ -76,53 +122,50 @@ def format_type_annotation(annotation_obj) -> str:
     str
         A properly formatted string representation of the type
     """
-    # Handle None/NoneType specially
     if annotation_obj is None or annotation_obj is type(None):
         return "None"
 
-    # Check if it's a class object like <class 'str'>
+    if annotation_obj is Ellipsis:
+        return "..."
+
+    if isinstance(annotation_obj, types.GenericAlias):
+        return format_subscripted_generic(annotation_obj)
+
     if isinstance(annotation_obj, type):
-        # Get the module and name
         module = annotation_obj.__module__
         name = annotation_obj.__name__
 
-        # If it's a builtin type, just use the name
         if module == "builtins":
             return name
 
-        # For known types like polars itself, prefix with pl if appropriate
         if module.startswith("polars.") and name not in ["DataFrame", "LazyFrame", "Series", "Expr"]:
             return f"pl.{name}"
-        if module.startswith("polars.") and name == "DataType":  # Handle pl.DataType specifically
+        if module.startswith("polars.") and name == "DataType":
             return f"pl.{name}"
 
         return f"{name}"
 
     elif isinstance(annotation_obj, str):
-        # Match patterns like <class 'module.submodule.ClassName'>
         class_match = re.match(r"<class '([^']+)'>", annotation_obj)
         if class_match:
             full_path = class_match.group(1)
 
-            # Special case for NoneType
             if full_path == "NoneType" or full_path.endswith(".NoneType"):
                 return "None"
 
             class_name = full_path.split(".")[-1]
             return class_name
 
-    # For other cases, convert to string and remove unnecessary details
     str_rep = str(annotation_obj).replace("<class '", "").replace("'>", "")
     str_rep = str_rep.replace("polars.internals.type_aliases.", "")
     str_rep = str_rep.replace("polars.internals.datatypes.", "pl.")
     str_rep = str_rep.replace("polars.datatypes.", "pl.")
     str_rep = str_rep.replace("polars.type_aliases.", "")
-    str_rep = str_rep.replace("polars.lazyframe.frame.", "")  # For LazyFrame, LazyGroupBy if directly referenced
+    str_rep = str_rep.replace("polars.lazyframe.frame.", "")
     str_rep = str_rep.replace("flowfile_frame.group_frame.", "group_frame.")
     if str_rep == "LazyFrame":
         str_rep = "FlowFrame"
 
-    # Special case for NoneType
     if str_rep == "NoneType" or str_rep.endswith(".NoneType"):
         return "None"
 
@@ -252,6 +295,7 @@ def generate_improved_type_stub(
         "# DO NOT MODIFY THIS FILE MANUALLY",
         "# Run `python flowfile_frame/flow_frame_stub_generator.py` to regenerate",
         "# Standard library imports",
+        "import ast",
         "import collections",
         "import inspect",
         "import os",
@@ -290,6 +334,8 @@ def generate_improved_type_stub(
         "from flowfile_core.flowfile.flow_node.flow_node import FlowNode",
         "from flowfile_frame import group_frame",
         "from flowfile_frame.expr import Expr",
+        "from flowfile_frame.run_flow import FlowOutput",
+        "from flowfile_frame.trained_model import TrainedModel",
         "from flowfile_core.schemas import transform_schema",
         "",
         "# Conditional imports",
@@ -302,7 +348,7 @@ def generate_improved_type_stub(
         "P = typing.ParamSpec('P')",
         "LazyFrameT = TypeVar('LazyFrameT', bound='LazyFrame')",
         "FlowFrameT = TypeVar('FlowFrameT', bound='FlowFrame')",
-        "Self = TypeVar('Self', bound='FlowFrame')",  # For __new__
+        "Self = TypeVar('Self', bound='FlowFrame')",
         "NoneType = type(None)",
         "",
     ]
@@ -323,7 +369,10 @@ def generate_improved_type_stub(
                     module_function_lines.append(f"def {fn_name}(*args, **kwargs) -> Any: ...")
                     continue
                 params: list[str] = []
+                kw_only_start = first_keyword_only(sig)
                 for p in sig.parameters.values():
+                    if p.name == kw_only_start:
+                        params.append("*")
                     if p.kind == inspect.Parameter.VAR_KEYWORD:
                         params.append(f"**{p.name}")
                         continue
@@ -368,7 +417,6 @@ def generate_improved_type_stub(
         content.append(f"    {attr_name}: {attr_type_str}")
     content.append("")
 
-    # Helper function for handling special methods - DEFINED HERE
     def handle_special_methods(name: str, sig: inspect.Signature) -> str | None:
         """Handle methods that need special formatting in the stub file."""
         if name == "group_by":
@@ -376,11 +424,12 @@ def generate_improved_type_stub(
                 "    def group_by(self, *by, description: Optional[str] = None, "
                 "maintain_order: bool = False, **named_by) -> group_frame.GroupByFrame: ..."
             )
-        if name == "with_columns":  # This specific one is from FlowFrame
+        if name == "with_columns":
             return (
-                "    def with_columns(self, *exprs: Union[Expr, Iterable[Expr], Any], "  # Match FlowFrame signature
+                "    def with_columns(self, *exprs: Union[Expr, Iterable[Expr], Any], "
                 "flowfile_formulas: Optional[List[str]] = None, "
                 "output_column_names: Optional[List[str]] = None, "
+                "output_column_datatypes: Optional[List[str]] = None, "
                 "description: Optional[str] = None, "
                 "**named_exprs: Union[Expr, Any]) -> 'FlowFrame': ..."
             )
@@ -474,12 +523,16 @@ def generate_improved_type_stub(
                 has_var_keyword = False
                 var_keyword_param = None
                 description_param_str = None
+                description_is_positional = False
 
                 is_new_method = name == "__new__"
+                kw_only_start = first_keyword_only(sig)
 
                 for i, (param_name, param) in enumerate(sig.parameters.items()):
                     if i == 0 and (param_name == "self" or (is_new_method and param_name == "cls")):
                         continue
+                    if param_name == kw_only_start:
+                        processed_params.append("*")
 
                     param_str = param_name
                     if param.annotation is not inspect.Parameter.empty:
@@ -499,6 +552,7 @@ def generate_improved_type_stub(
 
                     if param_name == "description" and param.default is not inspect.Parameter.empty:
                         description_param_str = param_str
+                        description_is_positional = param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
                         continue
 
                     processed_params.append(param_str)
@@ -506,11 +560,13 @@ def generate_improved_type_stub(
                 if (
                     not name.startswith("_")
                     and name not in PASSTHROUGH_METHODS
-                    and name not in {"__init__", "__new__", "group_by", "with_columns"}
+                    and name not in {"__init__", "__new__", "group_by", "with_columns", "help", "read_model"}
                     and not any(p.startswith("description:") for p in processed_params)
                     and not description_param_str
                 ):
                     processed_params.append("description: Optional[str] = None")
+                elif description_param_str and description_is_positional and "*" in processed_params:
+                    processed_params.insert(processed_params.index("*"), description_param_str)
                 elif description_param_str:
                     processed_params.append(description_param_str)
 
@@ -572,6 +628,9 @@ def generate_improved_type_stub(
                     except Exception:
                         pass
                 content.append(f"    def {name}(self) -> {return_type_str}: ...")
+                if getattr(member, "fset", None) is not None:
+                    content.append(f"    @{name}.setter")
+                    content.append(f"    def {name}(self, value: {return_type_str}) -> None: ...")
                 content.append("")
 
         except Exception as e:
@@ -611,10 +670,13 @@ def generate_improved_type_stub(
                 has_var_keyword = False
                 var_keyword_param = None
                 description_param_added = False
+                kw_only_start = first_keyword_only(sig)
 
                 for i, (param_name, param) in enumerate(sig.parameters.items()):
                     if i == 0:
                         continue
+                    if param_name == kw_only_start:
+                        processed_params.append("*")
 
                     param_str = param_name
                     if param.annotation is not inspect.Parameter.empty:
@@ -733,7 +795,6 @@ def _validate_emitted_imports(content: list[str]) -> None:
                 name = raw.strip()
                 if not name or name == "*":
                     continue
-                # Strip `as alias`
                 if " as " in name:
                     name = name.split(" as ", 1)[0].strip()
                 if not hasattr(module, name):
@@ -786,12 +847,10 @@ if __name__ == "__main__":
             # Assuming flow_frame.py is in a module directory like 'flowfile_frame'
             module_path_part = args.module.replace(".", os.sep)  # e.g., flowfile_frame/flow_frame
 
-            # Check if the target class's module path can be determined
             class_module_file = getattr(module_obj, "__file__", None)
             if class_module_file:
                 output_path = os.path.splitext(class_module_file)[0] + ".pyi"
             else:  # Fallback if module path is not available (e.g. some C extensions or built-ins)
-                # Try to create it in a folder structure mimicking the module path
                 path_parts = args.module.split(".")
                 class_file_name = path_parts[-1] + ".pyi"
                 if len(path_parts) > 1:

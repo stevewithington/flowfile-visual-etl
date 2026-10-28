@@ -1,89 +1,31 @@
 # Python API Tutorials
 
-Learn to build powerful data pipelines with code through practical, hands-on examples.
+Build one city sales report from supermarket invoices, then turn it into a reusable, parameterized flow. Each chapter extends the previous one, links to a complete runnable script, and shows what that script prints.
 
-## Available Tutorials
+<div class="grid cards" markdown>
 
-### [Building Flows with Code](flowfile_frame_api.md)
-The complete guide to creating data pipelines programmatically while maintaining visual compatibility.
+- **Build the report**
 
-**You'll learn:**
-- Creating pipelines with the FlowFrame API
-- Using Polars-compatible operations
-- Automatically generating visual graphs
-- Switching between code and visual editing
+    - [1. First steps](first-steps.md): read, transform, collect, and print the graph
+    - [2. Clean and shape](clean-and-shape.md): editable formulas and expression semantics
+    - [3. Combine](combine.md): union customer segments and join city targets
+    - [4. Aggregate](aggregate.md): summarize revenue without multiplying targets
 
-**Perfect for:**
-- Python developers new to Flowfile
-- Data scientists wanting reproducible pipelines
-- Anyone preferring code over drag-and-drop
+- **Run the report repeatedly**
 
-## Coming Soon
+    - [5. Flow parameters](flow-parameters.md): change the basket threshold between runs
+    - [6. Branching with Gate](branching.md): route the whole report when any city falls short
+    - [7. Write results](write-results.md): files, catalog tables, and cloud storage
+    - [8. Reusable flows](reusable-flows.md): extract a child flow and compare thresholds
+    - [9. Custom logic](custom-logic.md): a percentage score with SQL, a custom node, or Python
+    - [10. Ship it](ship-it.md): save, run headlessly, schedule, and open in the Designer
 
-### Data Pipeline Patterns
-Common patterns for ETL, data cleaning, and analysis.
+</div>
 
-### Performance Optimization
-Advanced techniques for handling large datasets efficiently.
+Use the [Quick Start](../quickstart.md) for installation. Download a chapter script and run it with Python, for example `python tutorial_01.py`. The scripts fetch the public `supermarket_sales.csv`; they do not need a repository checkout. Chapters 7 and 10 write a `city_report` folder into the directory you run them from and a `tutorial_sales` catalog table; chapters 8–10 register flows in your catalog, and chapter 9 installs a custom node. The output shown on each page is checked against the script by the docs test suite.
 
-### Integration Examples
-Connecting Flowfile with pandas, scikit-learn, and other tools.
+## Related walkthrough
 
-## Tutorial Style
+[Building Flows with Code](flowfile_frame_api.md) is the shorter introduction to building and opening a graph. For individual operations, use the [API reference](../reference/index.md).
 
-Our Python tutorials focus on:
-- **Real-world examples** - Practical use cases you'll actually encounter
-- **Code-first approach** - Everything done programmatically
-- **Visual integration** - How to leverage the UI when helpful
-- **Best practices** - Production-ready patterns
-
-## Quick Examples
-
-### ETL Pipeline
-```python
-import flowfile as ff
-
-# Extract
-raw_data = ff.read_csv("sales.csv")
-
-# Transform
-transformed = (
-    raw_data
-    .filter(ff.col("amount") > 0)
-    .with_columns([
-        ff.col("date").str.strptime(ff.Date, "%Y-%m-%d")
-    ])
-    .group_by("region")
-    .agg(ff.col("amount").sum())
-)
-
-# Load
-transformed.write_parquet("output.parquet")
-```
-
-### Data Validation
-```python
-# Check for data quality issues
-df = ff.read_csv("input.csv")
-
-# Find duplicates
-duplicates = df.group_by("id").agg(
-    ff.count().alias("count")
-).filter(ff.col("count") > 1)
-
-# Find nulls
-null_counts = df.select([
-    ff.col(c).is_null().sum().alias(f"{c}_nulls")
-    for c in df.columns
-])
-```
-
-## Resources
-
-- [API Reference](../reference/index.md) - Complete method documentation
-- [Core Concepts](../concepts/index.md) - Understand the architecture
-- [Quick Start](../quickstart.md) - Get running in 5 minutes
-
----
-
-*Want more tutorials? Let us know what you'd like to see in our [GitHub Discussions](https://github.com/edwardvaneechoud/Flowfile/discussions)!*
+**Next:** [First steps](first-steps.md)

@@ -24,7 +24,7 @@ scenarios:
 * ``test_unknown_schema_on_disk_returns_404`` — corrupted disk file with
   bad schema tag → repo returns None → route returns 404.
 * ``test_resume_action_discard_pops_session`` — discard works on a
-  ``paused_user_action`` session (W42 expanded the resumable set).
+  ``paused_user_action`` session — part of the resumable set.
 """
 
 from __future__ import annotations
@@ -55,9 +55,7 @@ from flowfile_core.auth.models import User as PydanticUser
 from flowfile_core.flowfile.flow_graph import FlowGraph
 from flowfile_core.schemas import input_schema, schemas
 
-# --------------------------------------------------------------------------- #
 # Helpers — minimal flow + scripted provider #
-# --------------------------------------------------------------------------- #
 
 
 def _flow_settings(flow_id: int = 1) -> schemas.FlowSettings:
@@ -133,9 +131,7 @@ def _filter_args() -> dict[str, Any]:
     }
 
 
-# --------------------------------------------------------------------------- #
 # Fixtures #
-# --------------------------------------------------------------------------- #
 
 
 @pytest.fixture
@@ -191,6 +187,7 @@ def authed_client() -> Iterator[TestClient]:
 def registered_flow() -> Iterator[FlowGraph]:
     flow = _flow_with_orders()
     flow_file_handler._flows[flow.flow_id] = flow
+    flow_file_handler._register_user_session(1, flow.flow_id)
     try:
         yield flow
     finally:
@@ -209,9 +206,7 @@ def patch_provider(monkeypatch: pytest.MonkeyPatch) -> _FakeProvider:
     return fake
 
 
-# --------------------------------------------------------------------------- #
 # Tests #
-# --------------------------------------------------------------------------- #
 
 
 def test_running_session_survives_restart(
@@ -270,7 +265,7 @@ def test_running_session_survives_restart(
     assert state["status"] == "paused_user_action"
     assert state["pause_reason"] == "cold_start"
 
-    # Resume?action=continue should now succeed (W42 expanded the
+    # Resume?action=continue should now succeed (the resumable set covers the
     # resumable set to include paused_user_action).
     resume_resp = authed_client.post(
         f"/ai/agent/{sid}/resume",
@@ -311,7 +306,6 @@ def test_resume_with_last_event_id_replays_buffered(
                 break
     assert sid is not None
 
-    # Verify multiple frames landed in the buffer.
     buffered = list(
         disk_replay_buffer.read_after(flow_id=1, session_id=sid, event_id=None)
     )
@@ -523,6 +517,39 @@ def test_resume_action_discard_pops_session(
     assert resp.status_code == 200
     assert resp.json()["status"] == "discarded"
     assert sessions.get_session(sid) is None
+
+
+def test_plan_ledger_fields_survive_restart(
+    disk_session_repo: DiskSessionRepository,
+) -> None:
+    """The host-tracked plan ledger fields round-trip the disk repo (defaulted
+    fields, no SCHEMA_VERSION bump needed)."""
+    snapshot = sessions.GraphSnapshot(flow_id=1, node_ids=(1,), node_types={1: "manual_input"})
+    session = sessions.AgentSession(
+        flow_id=1,
+        user_id=1,
+        user_prompt="multi-step",
+        provider_name="anthropic",
+        snapshot=snapshot,
+        plan_markdown="## Proposed changes\n\n1. filter — x\n2. sort — y",
+        plan_steps=["filter — x", "sort — y"],
+        plan_completed_ops=[
+            sessions.CompletedOpEntry(
+                tool_name="flowfile.graph.add_filter", node_id=2, summary="add_filter — staged as node 2"
+            )
+        ],
+    )
+    sessions.register_session(session)
+
+    fresh = DiskSessionRepository(root=disk_session_repo._root)
+    fetched = fresh.get(session.session_id)
+    assert fetched is not None
+    assert fetched.plan_markdown == session.plan_markdown
+    assert fetched.plan_steps == ["filter — x", "sort — y"]
+    assert len(fetched.plan_completed_ops) == 1
+    assert fetched.plan_completed_ops[0].tool_name == "flowfile.graph.add_filter"
+    assert fetched.plan_completed_ops[0].node_id == 2
+    assert fetched.plan_completed_ops[0].summary == "add_filter — staged as node 2"
 
 
 def test_session_file_carries_schema_tag(

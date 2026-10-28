@@ -36,23 +36,19 @@ def test_read_from_parquet_in_performance():
     flow_frame = create_flow_frame_with_parquet_read()
     graph = flow_frame.flow_graph
     graph.flow_settings.execution_mode = 'Performance'
-    output_node = graph.nodes[-1]  # get the output node
-    # Get execution plan
+    output_node = graph.nodes[-1]
     execution_plan_before_run = output_node.get_resulting_data().data_frame.explain(format="plain")
 
     # Instead of checking for the exact path, check that the plan contains a reference to parquet reading
     assert "ScanParquet" in execution_plan_before_run or "parquet" in execution_plan_before_run.lower(), \
         "The execution plan should include parquet file scanning"
 
-    # Run the graph
     graph.run_graph()
 
-    # Check execution plan after run
     execution_plan_after_run = output_node.get_resulting_data().data_frame.explain(format="plain")
     assert "ScanParquet" in execution_plan_after_run or "parquet" in execution_plan_after_run.lower(), \
         "The execution plan should include parquet file scanning after running the graph"
 
-    # You could also check that the data was actually loaded correctly
     result_df = output_node.get_resulting_data().data_frame
     assert len(result_df.collect()) > 0, "The resulting dataframe should not be empty"
 
@@ -115,6 +111,21 @@ def test_cloud_storage_reader_signatures_accept_output_field_config():
     # And ensure the config we built is the type the parameter advertises.
     from flowfile_core.schemas.input_schema import OutputFieldConfig as CoreOutputFieldConfig
     assert isinstance(config, CoreOutputFieldConfig)
+
+
+def test_create_flow_graph_defaults():
+    graph = ff.create_flow_graph()
+    assert graph.flow_id > 0
+    assert graph.flow_settings.path == ""
+    assert graph.flow_settings.track_history is False
+    assert graph.execution_location == "local"
+
+    pinned = ff.create_flow_graph(flow_id=4242)
+    assert pinned.flow_id == 4242
+    assert pinned.flow_settings.name == "Flow_4242"
+    assert pinned.flow_settings.path == ""
+    assert pinned.flow_settings.track_history is False
+    assert pinned.execution_location == "local"
 
 
 if __name__ == "__main__":

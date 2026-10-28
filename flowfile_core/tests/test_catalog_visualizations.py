@@ -321,6 +321,87 @@ class TestVisualizationCRUD:
         assert len(resp.json()) == 1
 
 
+class TestVisualizationConcurrency:
+    def _create(self, client, table_id: int, name: str = "cas-viz") -> dict:
+        return client.post(
+            "/catalog/visualizations",
+            json={
+                "name": name,
+                "spec": SAMPLE_SPEC,
+                "source_type": "table",
+                "catalog_table_id": table_id,
+            },
+        ).json()
+
+    def test_matching_token_succeeds_and_bumps_updated_at(self, client):
+        table_id = _make_table()
+        viz = self._create(client, table_id)
+        token = client.get(f"/catalog/visualizations/{viz['id']}").json()["updated_at"]
+        resp = client.put(
+            f"/catalog/visualizations/{viz['id']}",
+            json={"description": "cas ok", "expected_updated_at": token},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["updated_at"] > token
+
+    def test_stale_token_returns_409_and_leaves_spec_unchanged(self, client):
+        table_id = _make_table()
+        viz = self._create(client, table_id)
+        stale = viz["updated_at"]
+        bumped = client.put(f"/catalog/visualizations/{viz['id']}", json={"description": "first"})
+        assert bumped.status_code == 200
+        resp = client.put(
+            f"/catalog/visualizations/{viz['id']}",
+            json={"spec": [{**SAMPLE_CHART, "clobbered": True}], "expected_updated_at": stale},
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert isinstance(detail, dict)
+        assert detail["error"] == "stale_write"
+        assert detail["resource_type"] == "visualization"
+        assert detail["resource_id"] == viz["id"]
+        assert "modified in another session" in detail["message"]
+        with get_db_context() as db:
+            row = db.get(CatalogVisualization, viz["id"])
+            assert json.loads(row.spec_json) == SAMPLE_SPEC
+
+    def test_omitted_token_succeeds(self, client):
+        table_id = _make_table()
+        viz = self._create(client, table_id)
+        first = client.put(f"/catalog/visualizations/{viz['id']}", json={"description": "first"})
+        assert first.status_code == 200
+        resp = client.put(f"/catalog/visualizations/{viz['id']}", json={"description": "second"})
+        assert resp.status_code == 200, resp.text
+
+    def test_back_to_back_puts_get_distinct_updated_at(self, client):
+        # Pins the explicit microsecond stamp: the column onupdate is second-precision.
+        table_id = _make_table()
+        viz = self._create(client, table_id)
+        first = client.put(f"/catalog/visualizations/{viz['id']}", json={"description": "a"}).json()
+        second = client.put(f"/catalog/visualizations/{viz['id']}", json={"description": "b"}).json()
+        assert second["updated_at"] > first["updated_at"]
+
+    def test_name_collision_keeps_plain_string_detail(self, client):
+        # The frontend discriminates stale-write (dict detail) from name-collision (string detail).
+        # No DB unique constraint exists on viz names today, so force the IntegrityError path
+        # that raises VisualizationExistsError to pin the route's plain-string 409 detail.
+        from sqlalchemy.exc import IntegrityError
+
+        table_id = _make_table()
+        viz = self._create(client, table_id, name="renaming")
+        fresh = client.get(f"/catalog/visualizations/{viz['id']}").json()["updated_at"]
+        with patch(
+            "flowfile_core.catalog.repository.SQLAlchemyCatalogRepository.update_visualization",
+            side_effect=IntegrityError("stmt", {}, Exception("duplicate name")),
+        ):
+            resp = client.put(
+                f"/catalog/visualizations/{viz['id']}",
+                json={"name": "taken", "expected_updated_at": fresh},
+            )
+        assert resp.status_code == 409, resp.text
+        assert isinstance(resp.json()["detail"], str)
+
+
 class TestVisualizationCompute:
     def test_compute_saved_dispatches_with_table_session_key(self, client):
         table_id = _make_table()
@@ -498,6 +579,135 @@ class TestVisualizationCompute:
         assert captured["source"]["kind"] == "ipc_path"
         assert captured["source"]["ipc_path"].startswith(f"fvt-{tid}-")
         assert captured["source"]["mtime"] == 1234.5
-        assert captured["source"]["session_key"] == f"fvt:{tid}:1234"
+        # ipc filename + full-float mtime: rotates on every noversions rebuild.
+        assert captured["source"]["session_key"] == f"fvt:{tid}:fvt-{tid}-noversions00000.arrow:1234.5"
         assert captured["resolve"]["table_id"] == tid
         assert captured["resolve"]["hash"] == "noversions"
+
+
+class TestVersionAddressedSessionKeys:
+    """Session keys must rotate when the underlying Delta data changes."""
+
+    @staticmethod
+    def _make_delta_table(dir_name: str) -> int:
+        import polars as pl
+        from shared.storage_config import storage
+
+        target = storage.catalog_tables_directory / dir_name
+        pl.DataFrame({"category": ["a", "b"], "value": [1, 2]}).write_delta(str(target))
+        with get_db_context() as db:
+            ns = CatalogNamespace(name="VerNs", parent_id=None, level=0, owner_id=1)
+            db.add(ns)
+            db.commit()
+            db.refresh(ns)
+            table = CatalogTable(
+                name=dir_name,
+                namespace_id=ns.id,
+                owner_id=1,
+                file_path=str(target),
+                storage_format="delta",
+                schema_json=json.dumps([{"name": "value", "dtype": "Int64"}]),
+                table_type="physical",
+            )
+            db.add(table)
+            db.commit()
+            db.refresh(table)
+            return table.id
+
+    @staticmethod
+    def _overwrite_delta_table(dir_name: str) -> None:
+        import polars as pl
+        from shared.storage_config import storage
+
+        target = storage.catalog_tables_directory / dir_name
+        pl.DataFrame({"category": ["z"], "value": [99]}).write_delta(str(target), mode="overwrite")
+
+    @staticmethod
+    def _cleanup_delta_dir(dir_name: str) -> None:
+        import shutil
+
+        from shared.storage_config import storage
+
+        shutil.rmtree(storage.catalog_tables_directory / dir_name, ignore_errors=True)
+
+    def _capture_session_key(self, client, source: dict) -> str:
+        from flowfile_core.catalog import service as svc_module
+
+        captured: dict = {}
+
+        def fake_trigger(worker_source, payload, max_rows):
+            captured["source"] = worker_source
+            return {"rows": [], "total_rows": 0, "truncated": False, "elapsed_ms": 0.0, "cache_hit": False}
+
+        with patch.object(svc_module, "trigger_visualize_query", side_effect=fake_trigger):
+            resp = client.post(
+                "/catalog/visualizations/compute",
+                json={
+                    "source": source,
+                    "payload": {"workflow": [{"type": "view", "query": [{"op": "raw", "fields": ["*"]}]}]},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        return captured["source"]["session_key"]
+
+    def test_table_session_key_rotates_with_delta_version(self, client):
+        dir_name = "viz_ver_tbl"
+        table_id = self._make_delta_table(dir_name)
+        try:
+            source = {"source_type": "table", "table_id": table_id}
+            key_v0 = self._capture_session_key(client, source)
+            assert key_v0 == f"tbl:{table_id}:v0"
+
+            self._overwrite_delta_table(dir_name)
+
+            key_v1 = self._capture_session_key(client, source)
+            assert key_v1 == f"tbl:{table_id}:v1"
+        finally:
+            self._cleanup_delta_dir(dir_name)
+
+    def test_sql_session_key_rotates_after_table_change(self, client):
+        dir_name = "viz_ver_sql"
+        self._make_delta_table(dir_name)
+        try:
+            source = {"source_type": "sql", "sql_query": f"SELECT * FROM {dir_name}"}
+            key_before = self._capture_session_key(client, source)
+            assert key_before.startswith("sql:")
+
+            self._overwrite_delta_table(dir_name)
+
+            key_after = self._capture_session_key(client, source)
+            assert key_after.startswith("sql:")
+            assert key_after != key_before
+        finally:
+            self._cleanup_delta_dir(dir_name)
+
+    def test_virtual_sql_table_key_is_sql_digest_and_rotates(self, client):
+        """A query-backed virtual table keys on its (version-aware) SQL digest,
+        not the table row's updated_at, which never moves on source writes."""
+        dir_name = "viz_ver_vsql"
+        self._make_delta_table(dir_name)
+        try:
+            with get_db_context() as db:
+                ns = db.query(CatalogNamespace).filter_by(name="VerNs").first()
+                vtable = CatalogTable(
+                    name="v_over_sql",
+                    namespace_id=ns.id,
+                    owner_id=1,
+                    table_type="virtual",
+                    sql_query=f"SELECT * FROM {dir_name}",
+                )
+                db.add(vtable)
+                db.commit()
+                db.refresh(vtable)
+                vid = vtable.id
+
+            source = {"source_type": "table", "table_id": vid}
+            key_before = self._capture_session_key(client, source)
+            assert key_before.startswith("sql:")
+
+            self._overwrite_delta_table(dir_name)
+
+            key_after = self._capture_session_key(client, source)
+            assert key_after != key_before
+        finally:
+            self._cleanup_delta_dir(dir_name)

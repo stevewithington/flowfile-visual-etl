@@ -15,6 +15,7 @@
         :node="node"
         :selected-id="selectedId"
         :initially-expanded="true"
+        :writable-only="writableOnly"
         @select="handleSelect"
       />
     </div>
@@ -25,10 +26,24 @@
 import { ref, onMounted, watch } from "vue";
 import NamespaceTreeItem from "./NamespaceTreeItem.vue";
 import { CatalogApi } from "../../../api";
+import {
+  filterSelectableNamespaces,
+  findDefaultSaveNamespace,
+  findNamespacePath,
+} from "../../../types";
 import type { NamespaceTree } from "../../../types";
+import { useWritableNamespaces } from "../../../composables/useWritableNamespaces";
+
+const { isWritableNamespace } = useWritableNamespaces();
 
 const props = defineProps<{
   modelValue: number | null;
+  // When true, hide system-managed schemas (e.g. Unnamed/Local Flows) so only
+  // "default" + user-created namespaces are offered as a store target.
+  hideSystemNamespaces?: boolean;
+  // Save-target mode: disable read-only (use-grant) schemas and skip them for
+  // the default selection. Leave unset for browse/read use (Open dialog).
+  writableOnly?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -52,10 +67,14 @@ const loadTree = async () => {
   loading.value = true;
   error.value = null;
   try {
-    tree.value = await CatalogApi.getNamespaceTree();
+    const fetched = await CatalogApi.getNamespaceTree();
+    tree.value = props.hideSystemNamespaces ? filterSelectableNamespaces(fetched) : fetched;
     // Auto-select the most appropriate "General" child when nothing is selected.
     if (selectedId.value === null) {
-      const defaultNs = findDefaultNamespace(tree.value);
+      const defaultNs = findDefaultSaveNamespace(
+        tree.value,
+        (c) => !props.writableOnly || isWritableNamespace(c),
+      );
       if (defaultNs) {
         selectedId.value = defaultNs.id;
         emit("update:modelValue", defaultNs.id);
@@ -70,35 +89,25 @@ const loadTree = async () => {
   }
 };
 
-/**
- * Pick a sensible default namespace: prefer ``General > Local Flows``
- * (the home for disk-backed flows introduced alongside the save UX rework),
- * and fall back to ``General > default`` for older catalogs where the
- * Local Flows namespace hasn't been seeded yet.
- */
-const findDefaultNamespace = (nodes: NamespaceTree[]): NamespaceTree | null => {
-  for (const node of nodes) {
-    if (node.name === "General" && node.parent_id === null) {
-      const local = node.children.find((c) => c.name === "Local Flows");
-      if (local) return local;
-      const defaultChild = node.children.find((c) => c.name === "default");
-      if (defaultChild) return defaultChild;
-    }
-  }
-  return null;
-};
-
 const handleSelect = (namespaceId: number) => {
   selectedId.value = namespaceId;
   emit("update:modelValue", namespaceId);
   emit("select", namespaceId);
 };
 
+// Dotted ancestry label for a namespace (e.g. "General.default"), used to
+// build catalog references like "General.default.my_flow" for the recents list.
+const getNamespacePath = (id: number | null): string | null => {
+  if (id === null) return null;
+  const path = findNamespacePath(tree.value, id);
+  return path.length ? path.join(".") : null;
+};
+
 onMounted(() => {
   loadTree();
 });
 
-defineExpose({ reload: loadTree });
+defineExpose({ reload: loadTree, getNamespacePath });
 </script>
 
 <style scoped>

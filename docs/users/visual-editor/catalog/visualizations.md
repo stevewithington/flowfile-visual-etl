@@ -2,6 +2,9 @@
 
 Save interactive charts in the catalog and reopen them whenever you need them. A visualization sits on top of a catalog table or an inline SQL query and is built with [Graphic Walker](https://github.com/Kanaries/graphic-walker), so dragging fields onto axes, switching aggregations, and filtering happen live against the underlying data.
 
+!!! info "Limited in Flowfile Lite"
+    The browser-only [Flowfile Lite](../../deployment/lite.md) edition can explore data interactively with Graphic Walker (the **Explore Data** node), but **saving visualizations to the catalog** requires the full desktop/server build.
+
 ![Visualizations library](../../../assets/images/guides/catalog/visualizations-library.png)
 *The Visualizations library — saved charts as cards with thumbnails, filtered by namespace.*
 
@@ -69,7 +72,7 @@ From a visualization's detail panel you can:
 - **Edit** the chart spec — opens Graphic Walker again with the saved layout pre-loaded.
 - **Rename** or change the description.
 - **Move** the visualization to a different namespace. The source link is unaffected — a visualization can live anywhere in the catalog tree, regardless of where its source table lives.
-- **Update the thumbnail** — saving an edited chart re-captures the thumbnail automatically.
+- **Update the thumbnail** — saving an edited chart re-captures the thumbnail automatically. Thumbnails are capped at 500 KB; an oversized one is dropped (with a console warning) and the card falls back to the chart-type icon.
 - **Delete** — removes only the visualization. The underlying table or SQL is never touched.
 
 ---
@@ -88,14 +91,6 @@ A visualization is a pointer to its source, not a copy. Concretely:
 ## Multi-tab dashboards
 
 Graphic Walker supports multiple chart tabs in a single workspace. Flowfile saves the whole workspace, so a single visualization entry can carry several charts. Switch between them in the editor exactly the way Graphic Walker normally allows; the saved spec round-trips all tabs.
-
----
-
-## Tips
-
-- Use the same namespace as the underlying table when a visualization is the canonical chart for that table; use a separate namespace (e.g. `dashboards`) when collecting cross-cutting views.
-- For the fastest editor experience, prefer table sources. SQL sources re-execute the query on every open; table sources load once and run every drag-and-drop against the warm dataset.
-- Thumbnails are capped at 200 KB. Very large or very colourful charts may exceed that — Flowfile drops oversized thumbnails silently and falls back to the chart-type icon.
 
 ---
 

@@ -1,18 +1,34 @@
 <template>
-  <!-- Node Browser Modal -->
   <div v-if="show" class="modal-overlay" @click="emit('close')">
-    <div class="modal-container modal-large" @click.stop>
+    <div class="modal-container modal-xl" @click.stop>
       <div class="modal-header">
         <h3 class="modal-title">
           <i class="fa-solid fa-folder-open"></i>
           {{ viewingNodeCode ? viewingNodeName : "Browse Custom Nodes" }}
+          <span v-if="!viewingNodeCode && countLabel" class="modal-title-count">
+            {{ countLabel }}
+          </span>
         </h3>
         <button class="modal-close" @click="emit('close')">
           <i class="fa-solid fa-times"></i>
         </button>
       </div>
-      <div class="modal-content">
-        <!-- Viewing a specific node's code -->
+
+      <!-- Sibling of .modal-content so the search box never scrolls away. -->
+      <div v-if="!viewingNodeCode && nodes.length" class="browser-toolbar">
+        <el-input
+          v-model="search"
+          placeholder="Search nodes"
+          clearable
+          size="small"
+          class="node-search"
+          data-testid="node-browser-search"
+        >
+          <template #prefix><i class="fa-solid fa-magnifying-glass" /></template>
+        </el-input>
+      </div>
+
+      <div class="modal-content" :class="{ 'modal-content--flush': !viewingNodeCode }">
         <template v-if="viewingNodeCode">
           <div class="node-code-view">
             <Codemirror
@@ -26,47 +42,57 @@
           </div>
         </template>
 
-        <!-- Node list -->
         <template v-else>
           <div v-if="loading" class="loading-indicator">
             <i class="fa-solid fa-spinner fa-spin"></i>
             Loading custom nodes...
           </div>
-          <div v-else-if="nodes.length === 0" class="empty-nodes">
-            <i class="fa-solid fa-folder-open"></i>
-            <p>No custom nodes found</p>
-            <p class="empty-hint">Save a node to see it here</p>
-          </div>
-          <div v-else class="nodes-grid">
-            <div
-              v-for="node in nodes"
-              :key="node.file_name"
-              class="node-card"
-              @click="emit('viewNode', node.file_name)"
-            >
-              <div class="node-card-header">
-                <i class="fa-solid fa-puzzle-piece"></i>
-                <span class="node-name">{{ node.node_name || node.file_name }}</span>
+          <EmptyState
+            v-else-if="nodes.length === 0"
+            icon="fa-solid fa-folder-open"
+            title="No custom nodes found"
+            description="Save a node to see it here."
+          />
+          <EmptyState
+            v-else-if="visibleNodes.length === 0"
+            icon="fa-solid fa-magnifying-glass"
+            title="No nodes match your search"
+            :description="`Nothing found for “${search.trim()}”.`"
+          >
+            <template #actions>
+              <button class="btn btn-secondary btn-sm" @click="search = ''">Clear search</button>
+            </template>
+          </EmptyState>
+          <template v-else>
+            <section v-for="group in groups" :key="group.key">
+              <div class="node-group__header">
+                <span>{{ group.label }}</span>
+                <span>{{ group.nodes.length }}</span>
               </div>
-              <div class="node-card-body">
-                <span class="node-category">{{ node.node_category }}</span>
-                <p class="node-description">{{ node.intro || "No description" }}</p>
-              </div>
-              <div class="node-card-footer">
-                <span class="node-file">{{ node.file_name }}</span>
-              </div>
-            </div>
-          </div>
+              <NodeBrowserRow
+                v-for="node in group.nodes"
+                :key="node.file_name"
+                :node="node"
+                :is-current="node.file_name === currentFile"
+                :community="communityNodes?.[node.file_name] ?? null"
+                @edit="emit('edit', $event)"
+                @duplicate="emit('duplicate', $event)"
+                @view="emit('viewNode', $event)"
+                @delete="askDelete(node.file_name, node.node_name || node.file_name)"
+              />
+            </section>
+          </template>
         </template>
       </div>
       <div class="modal-actions">
+        <button v-if="!viewingNodeCode" class="community-link" @click="browseCommunity">
+          <i class="fa-solid fa-store"></i>
+          Browse community nodes
+          <i class="fa-solid fa-arrow-right community-link-arrow"></i>
+        </button>
         <button v-if="viewingNodeCode" class="btn btn-secondary" @click="emit('back')">
           <i class="fa-solid fa-arrow-left"></i>
           Back
-        </button>
-        <button v-if="viewingNodeCode" class="btn btn-danger" @click="emit('confirmDelete')">
-          <i class="fa-solid fa-trash"></i>
-          Delete
         </button>
         <button class="btn btn-secondary" @click="emit('close')">
           {{ viewingNodeCode ? "Close" : "Cancel" }}
@@ -75,28 +101,27 @@
     </div>
   </div>
 
-  <!-- Delete Confirmation Modal -->
-  <div v-if="showDeleteConfirm" class="modal-overlay" @click="emit('cancelDelete')">
+  <div v-if="pendingDelete" class="modal-overlay" @click="pendingDelete = null">
     <div class="modal-container" @click.stop>
       <div class="modal-header modal-header-error">
         <h3 class="modal-title">
           <i class="fa-solid fa-triangle-exclamation"></i>
           Confirm Delete
         </h3>
-        <button class="modal-close" @click="emit('cancelDelete')">
+        <button class="modal-close" @click="pendingDelete = null">
           <i class="fa-solid fa-times"></i>
         </button>
       </div>
       <div class="modal-content">
         <p>
-          Are you sure you want to delete <strong>{{ viewingNodeName }}</strong
+          Are you sure you want to delete <strong>{{ pendingDelete.name }}</strong
           >?
         </p>
         <p class="delete-warning">This action cannot be undone.</p>
       </div>
       <div class="modal-actions">
-        <button class="btn btn-secondary" @click="emit('cancelDelete')">Cancel</button>
-        <button class="btn btn-danger" @click="emit('delete')">
+        <button class="btn btn-secondary" @click="pendingDelete = null">Cancel</button>
+        <button class="btn btn-danger-filled" @click="confirmDelete">
           <i class="fa-solid fa-trash"></i>
           Delete
         </button>
@@ -106,28 +131,75 @@
 </template>
 
 <script setup lang="ts">
+import { computed, ref, watch } from "vue";
+import { useRouter } from "vue-router";
 import { Codemirror } from "vue-codemirror";
+import { ElInput } from "element-plus";
 import type { Extension } from "@codemirror/state";
+import type { InstallReceipt } from "../../api/communityNodes";
 import type { CustomNodeInfo } from "./types";
+import { filterNodes, groupByCategory } from "./customNodeFilter";
+import NodeBrowserRow from "./NodeBrowserRow.vue";
+import EmptyState from "../../components/common/EmptyState/EmptyState.vue";
 
-defineProps<{
+const router = useRouter();
+
+const props = defineProps<{
   show: boolean;
   nodes: CustomNodeInfo[];
   loading: boolean;
   viewingNodeCode: string;
   viewingNodeName: string;
-  showDeleteConfirm: boolean;
   readOnlyExtensions: Extension[];
+  currentFile?: string | null;
+  communityNodes?: Record<string, InstallReceipt>;
 }>();
 
 const emit = defineEmits<{
   (e: "close"): void;
   (e: "viewNode", fileName: string): void;
+  (e: "edit", fileName: string): void;
+  (e: "duplicate", fileName: string): void;
   (e: "back"): void;
-  (e: "confirmDelete"): void;
-  (e: "cancelDelete"): void;
-  (e: "delete"): void;
+  (e: "delete", fileName: string): void;
 }>();
+
+const search = ref("");
+
+const visibleNodes = computed(() => filterNodes(props.nodes, search.value));
+const groups = computed(() => groupByCategory(visibleNodes.value));
+
+const countLabel = computed(() => {
+  const total = props.nodes.length;
+  if (!total) return "";
+  const shown = visibleNodes.value.length;
+  return shown === total ? `${total}` : `${shown} of ${total}`;
+});
+
+// The component never unmounts (v-if lives on the inner overlay), so a stale
+// query would silently hide nodes on the next visit.
+watch(
+  () => props.show,
+  (open) => {
+    if (open) search.value = "";
+  },
+);
+
+const pendingDelete = ref<{ fileName: string; name: string } | null>(null);
+
+function askDelete(fileName: string, name: string) {
+  pendingDelete.value = { fileName, name };
+}
+
+function confirmDelete() {
+  if (pendingDelete.value) emit("delete", pendingDelete.value.fileName);
+  pendingDelete.value = null;
+}
+
+function browseCommunity() {
+  emit("close");
+  router.push({ name: "catalog", query: { tab: "community" } });
+}
 </script>
 
 <style scoped>
@@ -137,112 +209,40 @@ const emit = defineEmits<{
   justify-content: center;
   gap: 0.5rem;
   padding: 2rem;
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 .loading-indicator i {
   font-size: 1.25rem;
 }
 
-.empty-nodes {
-  text-align: center;
-  padding: 3rem;
-  color: var(--text-secondary);
+.modal-title-count {
+  margin-left: var(--spacing-2);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-normal);
+  color: var(--color-text-tertiary);
 }
 
-.empty-nodes i {
-  font-size: 3rem;
-  margin-bottom: 1rem;
-  opacity: 0.5;
+.browser-toolbar {
+  flex-shrink: 0;
+  padding: var(--spacing-2) var(--spacing-4);
+  border-bottom: 1px solid var(--color-border-primary);
 }
 
-.empty-nodes p {
-  margin: 0;
+/* Not `.search-input` — _forms.css defines a global one whose own border and
+   background would double up on the el-input root. */
+.node-search {
+  max-width: 320px;
 }
 
-.empty-hint {
-  font-size: 0.8125rem;
-  margin-top: 0.5rem !important;
-}
-
-.nodes-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-  gap: 1rem;
-}
-
-.node-card {
-  background: var(--card-bg);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  cursor: pointer;
-  transition: all 0.2s;
-  overflow: hidden;
-}
-
-.node-card:hover {
-  border-color: var(--primary-color);
-  box-shadow: var(--shadow-md);
-  transform: translateY(-2px);
-}
-
-.node-card-header {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.75rem 1rem;
-  background: var(--bg-secondary);
-  border-bottom: 1px solid var(--border-color);
-}
-
-.node-card-header i {
-  color: var(--primary-color);
-}
-
-.node-name {
-  font-weight: 600;
-  font-size: 0.9375rem;
-}
-
-.node-card-body {
-  padding: 0.75rem 1rem;
-}
-
-.node-category {
-  display: inline-block;
-  font-size: 0.6875rem;
-  font-weight: 500;
-  text-transform: uppercase;
-  padding: 0.125rem 0.5rem;
-  background: var(--primary-color);
-  color: var(--color-text-inverse);
-  border-radius: 3px;
-  margin-bottom: 0.5rem;
-}
-
-.node-description {
-  margin: 0;
-  font-size: 0.8125rem;
-  color: var(--text-secondary);
-  line-height: 1.4;
-}
-
-.node-card-footer {
-  padding: 0.5rem 1rem;
-  border-top: 1px solid var(--border-color);
-  background: var(--bg-secondary);
-}
-
-.node-file {
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-  font-family: var(--font-family-mono);
+.modal-content--flush {
+  padding: 0;
 }
 
 .node-code-view {
-  border-radius: 6px;
+  border-radius: var(--border-radius-md);
   overflow: hidden;
-  border: 1px solid var(--border-color, #3a3a4a);
+  border: 1px solid var(--color-border-primary);
 }
 
 .modal-header-error {
@@ -260,16 +260,34 @@ const emit = defineEmits<{
 
 .delete-warning {
   color: var(--color-danger-hover);
-  font-size: 0.875rem;
+  font-size: var(--font-size-base);
   margin-top: 0.5rem;
 }
 
-.btn-danger {
-  background: var(--color-danger-hover);
-  color: var(--color-text-inverse);
+.community-link {
+  margin-right: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--color-accent);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
 }
 
-.btn-danger:hover:not(:disabled) {
-  background: var(--color-danger-dark);
+.community-link:hover {
+  text-decoration: underline;
+}
+
+.community-link-arrow {
+  font-size: var(--font-size-xs);
+  transition: transform var(--transition-fast);
+}
+
+.community-link:hover .community-link-arrow {
+  transform: translateX(2px);
 }
 </style>

@@ -27,7 +27,6 @@ from flowfile_core.database.connection import SessionLocal
 from flowfile_core.database.models import CatalogTable
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 def migrate_table(table: CatalogTable, *, dry_run: bool = False) -> bool:
@@ -62,7 +61,6 @@ def migrate_table(table: CatalogTable, *, dry_run: bool = False) -> bool:
         lf: pl.LazyFrame = pl.scan_parquet(old_path)
         lf.sink_delta(target=str(new_dir), mode="error")
         original_row_count = lf.select(pl.len()).collect().item()
-        # Verify
         verify_df = pl.scan_delta(str(new_dir))
         row_count = verify_df.select(pl.len()).collect().item()
         if row_count != original_row_count:
@@ -73,15 +71,12 @@ def migrate_table(table: CatalogTable, *, dry_run: bool = False) -> bool:
             )
             return False
 
-        # Calculate new size
         size_bytes = sum(f.stat().st_size for f in new_dir.rglob("*.parquet"))
 
-        # Update DB record
         table.file_path = str(new_dir)
         table.storage_format = "delta"
         table.size_bytes = size_bytes
 
-        # Delete old parquet
         old_path.unlink()
         logger.info("  [OK] Migrated %s -> %s (%d rows)", old_path, new_dir, row_count)
         return True
@@ -115,6 +110,7 @@ def main(dry_run: bool = False) -> int:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Migrate catalog tables from Parquet to Delta Lake")
     parser.add_argument("--dry-run", action="store_true", help="Preview changes without modifying anything")
     args = parser.parse_args()

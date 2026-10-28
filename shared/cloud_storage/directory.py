@@ -8,8 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import boto3
-from botocore.exceptions import ClientError
+from shared.cloud_storage.storage_options import build_s3_client, tls_verification_disabled
 
 
 def get_first_file_from_cloud_dir(source: str, storage_options: dict[str, Any] | None = None) -> str:
@@ -53,7 +52,7 @@ def get_first_file_from_s3_dir(source: str, storage_options: dict[str, Any] = No
     bucket_name, prefix = _parse_s3_path(source)
     file_extension = _get_file_extension(source)
     base_prefix = _remove_wildcards_from_prefix(prefix)
-    s3_client = _create_s3_client(storage_options)
+    s3_client = build_s3_client(storage_options)
 
     first_file = _get_first_file(s3_client, bucket_name, base_prefix, file_extension)
     return f"s3://{bucket_name}/{first_file['Key']}"
@@ -86,7 +85,9 @@ def get_first_file_from_adls_dir(source: str, storage_options: dict[str, Any] | 
     account_key = opts.get("account_key")
     endpoint = opts.get("azure_storage_endpoint", f"https://{account_name}.blob.core.windows.net")
 
-    client = BlobServiceClient(account_url=endpoint, credential=account_key)
+    client = BlobServiceClient(
+        account_url=endpoint, credential=account_key, connection_verify=not tls_verification_disabled(opts)
+    )
     container_client = client.get_container_client(container_name)
 
     for blob in container_client.list_blobs(name_starts_with=base_prefix):
@@ -143,21 +144,10 @@ def _remove_wildcards_from_prefix(prefix: str) -> str:
     return prefix.split("*")[0]
 
 
-def _create_s3_client(storage_options: dict[str, Any] | None):
-    """Create boto3 S3 client with optional credentials."""
-    if storage_options is None:
-        return boto3.client("s3")
-
-    # Handle both 'aws_region' and 'region_name' keys
-    client_options = storage_options.copy()
-    if "aws_region" in client_options:
-        client_options["region_name"] = client_options.pop("aws_region")
-
-    return boto3.client("s3", **{k: v for k, v in client_options.items() if k != "aws_allow_http"})
-
-
 def _get_first_file(s3_client, bucket_name: str, base_prefix: str, file_extension: str) -> dict[Any, Any]:
     """List objects and return the first file matching the extension."""
+    from botocore.exceptions import ClientError
+
     try:
         paginator = s3_client.get_paginator("list_objects_v2")
         pages = paginator.paginate(Bucket=bucket_name, Prefix=base_prefix)

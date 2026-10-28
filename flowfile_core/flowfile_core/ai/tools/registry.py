@@ -77,6 +77,7 @@ SurfaceLiteral = Literal[
     "settings_autocomplete",
     "lineage",
     "intent_classifier",
+    "cron",
 ]
 
 # Regex that every emitted tool name must match.
@@ -201,11 +202,16 @@ def _node_settings_to_tool_spec(node_type: str, settings_cls: type) -> ToolSpec:
 #   dependency fields on ``NodeSingleInput`` / ``NodeMultiInput``; resolver
 #   canonicalises against ``InsertionContext.upstream_node_ids`` so the LLM
 #   does not need to fill them.
-# * ``cache_results`` / ``pos_x`` / ``pos_y`` / ``is_setup`` / ``description``
-#   / ``node_reference`` / ``user_id`` / ``is_flow_output`` /
-#   ``is_user_defined`` / ``output_field_config`` — NodeBase metadata not
+# * ``cache_results`` / ``pos_x`` / ``pos_y`` / ``group_id`` / ``is_setup``
+#   / ``description`` / ``node_reference`` / ``user_id`` / ``is_flow_output``
+#   / ``is_user_defined`` / ``output_field_config`` — NodeBase metadata not
 #   needed for stage-3 settings authoring. All have safe defaults; positions
-#   and ``user_id`` are filled by other planner machinery.
+#   and ``user_id`` are filled by other planner machinery. ``group_id`` is
+#   visual group membership (organizational only, no execution impact) — the
+#   agent leaves new nodes ungrouped at the ``None`` default. Stripping it
+#   also keeps single-input inner-shape detection working: an unfiltered
+#   NodeBase field would make ``_resolve_inner_input_field`` see two
+#   type-specific fields and fall back to the enveloped spec.
 _PLANNER_INJECTED_SETTINGS_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "flow_id",
@@ -215,6 +221,7 @@ _PLANNER_INJECTED_SETTINGS_FIELDS: Final[frozenset[str]] = frozenset(
         "cache_results",
         "pos_x",
         "pos_y",
+        "group_id",
         "is_setup",
         "description",
         "node_reference",
@@ -261,6 +268,10 @@ def _resolve_inner_input_field(settings_cls: type) -> tuple[str, type] | None:
     * ``NodeManualInput`` → ``("raw_data_format", RawData)``
 
     Multi-field types (``NodeFilter`` has ``filter_input + split_mode``,
+    ``NodeGate`` has ``gate_input + else_output``,
+    ``NodeFormula`` has ``function + functions`` — the legacy single
+    entry and the ordered multi-entry list, both deliberately visible so
+    the planner can emit a chained formula node,
     ``NodeJoin`` has ``join_input + auto_keep_*`` etc.), empty types
     (``NodeRecordCount``, ``NodeWaitFor``), and types whose only
     type-specific field is a primitive (``NodeSample.sample_size: int``)
@@ -555,6 +566,10 @@ SURFACE_PRESETS: Final[dict[str, frozenset[str]]] = {
     # Intent classifier — single-shot judgement; the route passes
     # ``tools=None`` and reads strict JSON. No tool catalog needed.
     "intent_classifier": frozenset(),
+    # Cron NL→expression — single-shot JSON, no tools. The route passes
+    # ``tools=None`` and reads strict JSON; the empty frozenset keeps the
+    # surface lockstep happy.
+    "cron": frozenset(),
 }
 
 
@@ -572,11 +587,6 @@ def _full_catalog() -> list[ToolSpec]:
 _AGENT_SURFACES_THAT_BLOCK_WRITERS: frozenset[str] = frozenset(
     {"agent_complex", "agent_staged", "agent_live"}
 )
-"""Agent surfaces never see add_<writer> tools in their catalog.
-Writers go to external destinations (files, DBs, cloud) and the user
-always adds them manually. ``surface=None`` (the full catalog used by
-tests / introspection) keeps everything; only the agent surfaces are
-filtered."""
 
 
 def build_tool_catalog(*, surface: str | None = None) -> list[ToolSpec]:

@@ -15,9 +15,11 @@ from flowfile_core.catalog.constants import (
     MAX_PREVIEW_LIMIT,
     MAX_VISUALIZATION_ROWS,
 )
+from flowfile_core.catalog.delta_utils import get_live_delta_version
 from flowfile_core.catalog.exceptions import (
     DashboardNotFoundError,
     NamespaceNotFoundError,
+    StaleWriteError,
     TableNotFoundError,
     VisualizationComputeError,
     VisualizationExistsError,
@@ -30,8 +32,8 @@ from flowfile_core.catalog.services.namespaces import NamespaceService
 from flowfile_core.catalog.services.sql import SqlService
 from flowfile_core.catalog.services.tables import TableService
 from flowfile_core.catalog.services.virtual_tables import VirtualTableService
+from flowfile_core.catalog.storage_backend import _is_cloud_uri
 from flowfile_core.catalog.text_utils import (
-    hash_source_versions,
     is_table_reference,
     rewrite_qualified_references,
 )
@@ -54,9 +56,27 @@ from flowfile_core.schemas.catalog_schema import (
     VisualizationUpdate,
     VizSourceDescriptor,
 )
+from shared.storage_config import storage
 
 logger = logging.getLogger(__name__)
 viz_logger = logger.getChild("viz")
+
+
+def _project_sync_visualizations(user_id: int) -> None:
+    """Mirror a viz create/update/delete into the active project's visualizations.yaml (no-op when
+    no project is active; never raises)."""
+    from flowfile_core.project import project_sync
+
+    project_sync.visualizations_changed(user_id)
+
+
+def _project_sync_dashboards(user_id: int) -> None:
+    """Mirror a dashboard create/update/delete into the active project's dashboards.yaml (no-op when
+    no project is active; never raises)."""
+    from flowfile_core.project import project_sync
+
+    project_sync.dashboards_changed(user_id)
+
 
 # polars-gw workflow that returns rows un-aggregated (raw select-all).
 _GW_RAW_SELECT_ALL_PAYLOAD: dict = {"workflow": [{"type": "view", "query": [{"op": "raw", "fields": ["*"]}]}]}
@@ -244,12 +264,27 @@ class VisualizationService:
             created = self.repo.create_visualization(viz)
         except IntegrityError as exc:
             raise VisualizationExistsError(payload.name, payload.catalog_table_id or 0) from exc
+        _project_sync_visualizations(user_id)
         return self._viz_to_out(created)
 
     def update_visualization(self, viz_id: int, payload: VisualizationUpdate, user_id: int) -> VisualizationOut:
         viz = self.repo.get_visualization(viz_id)
         if viz is None:
             raise VisualizationNotFoundError(viz_id=viz_id)
+        if payload.expected_updated_at is not None and viz.updated_at != payload.expected_updated_at:
+            raise StaleWriteError("visualization", viz_id, expected=payload.expected_updated_at, current=viz.updated_at)
+        # Atomic guard (see repo docstring); must precede attribute edits (autoflush would fire onupdate).
+        now = datetime.now(timezone.utc)
+        if not self.repo.stamp_visualization_updated_at(viz_id, payload.expected_updated_at, now):
+            if payload.expected_updated_at is None:
+                raise VisualizationNotFoundError(viz_id=viz_id)
+            fresh = self.repo.get_visualization(viz_id)
+            raise StaleWriteError(
+                "visualization",
+                viz_id,
+                expected=payload.expected_updated_at,
+                current=fresh.updated_at if fresh else payload.expected_updated_at,
+            )
         provided = payload.model_fields_set
         if "name" in provided:
             if payload.name is None:
@@ -275,10 +310,13 @@ class VisualizationService:
             viz.catalog_table_id = payload.catalog_table_id
         if "thumbnail_data_url" in provided:
             viz.thumbnail_data_url = validate_thumbnail(payload.thumbnail_data_url)
+        # Same stamp as the guard; an explicit value suppresses the second-precision onupdate.
+        viz.updated_at = now
         try:
             updated = self.repo.update_visualization(viz)
         except IntegrityError as exc:
             raise VisualizationExistsError(viz.name, viz.catalog_table_id or 0) from exc
+        _project_sync_visualizations(user_id)
         return self._viz_to_out(updated)
 
     def delete_visualization(self, viz_id: int, user_id: int) -> None:
@@ -286,6 +324,7 @@ class VisualizationService:
         if viz is None:
             raise VisualizationNotFoundError(viz_id=viz_id)
         self.repo.delete_visualization(viz_id)
+        _project_sync_visualizations(user_id)
 
     # ---- Dashboards CRUD ------------------------------------------------ #
 
@@ -347,17 +386,34 @@ class VisualizationService:
             name=payload.name,
             description=payload.description,
             layout_json=payload.layout.model_dump_json(),
-            layout_version=payload.layout.grid.version,
+            layout_version=1,
             namespace_id=payload.namespace_id,
             created_by=user_id,
         )
         created = self.repo.create_dashboard(dashboard)
+        _project_sync_dashboards(user_id)
         return self._dashboard_to_out(created)
 
     def update_dashboard(self, dashboard_id: int, payload: DashboardUpdate, user_id: int) -> DashboardOut:
         dashboard = self.repo.get_dashboard(dashboard_id)
         if dashboard is None:
             raise DashboardNotFoundError(dashboard_id=dashboard_id)
+        current_version = dashboard.layout_version or 1
+        if payload.expected_layout_version is not None and payload.expected_layout_version != current_version:
+            raise StaleWriteError(
+                "dashboard", dashboard_id, expected=payload.expected_layout_version, current=current_version
+            )
+        # Atomic guard + counter increment in one conditional UPDATE (see repo docstring).
+        if not self.repo.bump_dashboard_layout_version(dashboard_id, payload.expected_layout_version):
+            if payload.expected_layout_version is None:
+                raise DashboardNotFoundError(dashboard_id=dashboard_id)
+            fresh = self.repo.get_dashboard(dashboard_id)
+            raise StaleWriteError(
+                "dashboard",
+                dashboard_id,
+                expected=payload.expected_layout_version,
+                current=(fresh.layout_version or 1) if fresh else payload.expected_layout_version,
+            )
         provided = payload.model_fields_set
         if "name" in provided:
             if payload.name is None:
@@ -374,9 +430,9 @@ class VisualizationService:
                 raise ValueError("layout cannot be cleared")
             self._validate_filter_datasources(payload.layout)
             dashboard.layout_json = payload.layout.model_dump_json()
-            dashboard.layout_version = payload.layout.grid.version
         dashboard.updated_at = datetime.now(timezone.utc)
         updated = self.repo.update_dashboard(dashboard)
+        _project_sync_dashboards(user_id)
         return self._dashboard_to_out(updated)
 
     def delete_dashboard(self, dashboard_id: int, user_id: int) -> None:
@@ -384,6 +440,7 @@ class VisualizationService:
         if dashboard is None:
             raise DashboardNotFoundError(dashboard_id=dashboard_id)
         self.repo.delete_dashboard(dashboard_id)
+        _project_sync_dashboards(user_id)
 
     # ---- Compute -------------------------------------------------------- #
 
@@ -393,9 +450,21 @@ class VisualizationService:
         return min(requested, MAX_VISUALIZATION_ROWS)
 
     def _session_key_for_table(self, table_id: int) -> str:
+        """Version-addressed session key for a physical table.
+
+        The worker child pins its ``scan_delta`` snapshot at spawn, so the key
+        must rotate whenever the Delta data changes — including out-of-band
+        writes the catalog row never sees. Falls back to the ``updated_at``
+        timestamp for legacy parquet / unreadable tables.
+        """
         table = self.repo.get_table(table_id)
         if table is None:
             raise TableNotFoundError(table_id=table_id)
+        if table.file_path:
+            try:
+                return f"tbl:{table_id}:v{get_live_delta_version(table.file_path)}"
+            except Exception:
+                pass
         ts = int(table.updated_at.timestamp()) if table.updated_at else 0
         return f"tbl:{table_id}:{ts}"
 
@@ -411,6 +480,12 @@ class VisualizationService:
             if table.table_type != "virtual":
                 if not table.file_path:
                     raise ValueError(f"Table {table.id} has no file_path")
+                if _is_cloud_uri(table.file_path):
+                    raise ValueError(
+                        "Visualizing object-storage (cloud) catalog tables is not yet supported; the "
+                        "visualization worker has no per-table storage credentials. Copy the table into a "
+                        "local catalog to visualize it."
+                    )
                 return {
                     "kind": "physical",
                     "session_key": self._session_key_for_table(table.id),
@@ -418,18 +493,19 @@ class VisualizationService:
                 }
 
             if table.sql_query:
-                spec = self._build_sql_worker_source(table.sql_query, user_id=user_id)
-                spec["session_key"] = self._session_key_for_table(table.id)
-                return spec
+                # The spec's own digest is version-aware; the table row's
+                # updated_at never moves when the underlying sources change.
+                return self._build_sql_worker_source(table.sql_query, user_id=user_id)
 
             from flowfile_core.catalog import service as _service_module
 
             lazy_frame = self._resolve_virtual_flow_table_via_facade(table.id, user_id=user_id, run_location="remote")
-            versions_hash = hash_source_versions(table.source_table_versions)
+            # Post-resolution read: resolution may have re-stamped source_table_versions.
+            versions_hash = self._virtual_tables.fresh_versions_hash(table.id)
             result = _service_module.trigger_resolve_virtual_table(table.id, lazy_frame.serialize(), versions_hash)
             return {
                 "kind": "ipc_path",
-                "session_key": f"fvt:{table.id}:{int(result['mtime'])}",
+                "session_key": f"fvt:{table.id}:{result['ipc_path']}:{result['mtime']}",
                 "ipc_path": result["ipc_path"],
                 "mtime": result["mtime"],
             }
@@ -468,8 +544,22 @@ class VisualizationService:
         # session key compact and the worker's SQLContext small.
         referenced_delta = {n: d for n, d in delta_map.items() if is_table_reference(n, rewritten)}
 
+        # Live delta versions rotate the digest when any referenced table's data
+        # changes; an unreadable table hashes as None (rotates again once readable).
+        delta_versions: dict[str, int | None] = {}
+        for name, dir_name in referenced_delta.items():
+            try:
+                delta_versions[name] = get_live_delta_version(storage.catalog_tables_directory / dir_name)
+            except Exception:
+                delta_versions[name] = None
+
         key_material = json.dumps(
-            {"q": rewritten, "d": sorted(referenced_delta.items()), "v": sorted(virtual_refs.items())},
+            {
+                "q": rewritten,
+                "d": sorted(referenced_delta.items()),
+                "dv": sorted(delta_versions.items()),
+                "v": sorted(virtual_refs.items()),
+            },
             sort_keys=True,
         )
         digest = hashlib.sha256(key_material.encode()).hexdigest()
@@ -486,7 +576,8 @@ class VisualizationService:
 
         vid = virtual_map[vname]
         lazy_frame = self._resolve_virtual_flow_table_via_facade(vid, user_id=user_id, run_location="remote")
-        versions_hash = hash_source_versions(self.repo.get_table(vid).source_table_versions)
+        # Post-resolution read: resolution may have re-stamped source_table_versions.
+        versions_hash = self._virtual_tables.fresh_versions_hash(vid)
         result = _service_module.trigger_resolve_virtual_table(vid, lazy_frame.serialize(), versions_hash)
         return result["ipc_path"]
 

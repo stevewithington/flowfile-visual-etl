@@ -2,15 +2,16 @@
   <div class="dashboard-viewer">
     <div class="viewer-toolbar">
       <div class="viewer-toolbar-left">
-        <el-button text @click="onBack">
-          <el-icon><ArrowLeft /></el-icon> Back
-        </el-button>
+        <button class="back-btn" @click="onBack">All dashboards</button>
         <h2 v-if="store.current">{{ store.current.name }}</h2>
         <span v-if="store.current?.namespace_name" class="viewer-ns">{{
           store.current.namespace_name
         }}</span>
       </div>
       <div class="viewer-toolbar-right">
+        <el-button v-if="store.current" :loading="refreshing" @click="onRefresh">
+          <el-icon><Refresh /></el-icon> Refresh
+        </el-button>
         <el-button v-if="store.current" type="primary" @click="onEdit">
           <el-icon><Edit /></el-icon> Edit
         </el-button>
@@ -29,14 +30,19 @@
         mode="view"
         :datasources-in-use="datasourcesInUse"
         :tiles-by-datasource="tilesByDatasource"
+        :viz-tile-ids="vizTileIds"
         :tile-label="tileLabel"
+        :tile-fields="tileFields"
+        :load-tile-fields="loadTileFields"
         :get-column-stats="getColumnStats"
+        :stats-refresh-nonce="statsRefreshNonce"
         @update:filters="onFiltersChange"
       />
       <DashboardCanvas
         :layout="liveLayout"
         mode="view"
         :appearance="appearance"
+        :viz-refresh-nonces="vizRefreshNonces"
         :tile-datasource="tileDatasource"
         @edit-viz="onEditVizFromTile"
       />
@@ -48,13 +54,14 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
-import { ArrowLeft, Edit } from "@element-plus/icons-vue";
+import { Edit, Refresh } from "@element-plus/icons-vue";
 import { useDashboardsStore } from "../../stores/dashboards-store";
 import { useGraphicWalkerAppearance } from "../../composables/useGraphicWalkerAppearance";
 import { useDashboardDatasources } from "../../composables/useDashboardDatasources";
+import { useDashboardRefresh } from "../../composables/useDashboardRefresh";
 import DashboardCanvas from "./DashboardCanvas.vue";
 import DashboardFilterBar from "./DashboardFilterBar.vue";
-import type { DashboardFilter, DashboardLayout } from "../../types";
+import { EMPTY_DASHBOARD_LAYOUT, type DashboardFilter, type DashboardLayout } from "../../types";
 
 const props = defineProps<{ id: string | number }>();
 const router = useRouter();
@@ -67,12 +74,36 @@ const dashboardId = computed(() => Number(props.id));
 const liveFilters = ref<DashboardFilter[]>([]);
 const liveLayout = computed<DashboardLayout>(() => {
   if (!store.current) {
-    return { tiles: [], grid: { cols: 12, row_height: 40, version: 1 }, filters: [] };
+    return { ...EMPTY_DASHBOARD_LAYOUT, tiles: [], filters: [] };
   }
   return { ...store.current.layout, filters: liveFilters.value };
 });
-const { datasourcesInUse, tilesByDatasource, tileDatasource, tileLabel, getColumnStats } =
-  useDashboardDatasources(liveLayout);
+const {
+  datasourcesInUse,
+  tilesByDatasource,
+  vizTileIds,
+  tileDatasource,
+  tileLabel,
+  tileFields,
+  loadTileFields,
+  getColumnStats,
+  refresh,
+} = useDashboardDatasources(liveLayout);
+
+const vizRefreshNonces = ref<Record<number, number>>({});
+const { refreshing, statsRefreshNonce, refreshAll } = useDashboardRefresh({
+  layout: liveLayout,
+  vizRefreshNonces,
+  refreshDatasources: refresh,
+});
+
+const onRefresh = async () => {
+  try {
+    await refreshAll();
+  } catch {
+    ElMessage.error("Failed to refresh dashboard data");
+  }
+};
 
 watch(
   () => store.current?.layout.filters,
@@ -115,19 +146,22 @@ const onEditVizFromTile = (vizId: number | null) => {
 </script>
 
 <style scoped>
+/* Padding stacks on .catalog-detail's so the header lines up with the library page. */
 .dashboard-viewer {
   display: flex;
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  padding: var(--spacing-3) var(--spacing-6) 0;
 }
 .viewer-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--el-border-color-lighter);
-  background: var(--el-bg-color);
+  padding: 0 0 var(--spacing-4);
+}
+.viewer-toolbar .back-btn {
+  margin-bottom: 0;
 }
 .viewer-toolbar-left {
   display: flex;

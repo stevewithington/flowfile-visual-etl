@@ -1,12 +1,9 @@
 // Canvas-related TypeScript interfaces and types
-// Consolidated from features/designer/components/Canvas/types.ts
 
 import type { NodeBase } from "./node.types";
-import type { NodeTemplate } from "./flow.types";
+import type { NodeHandle, NodeTemplate } from "./flow.types";
 
-// ============================================================================
 // Node Copy Types
-// ============================================================================
 
 export interface NodeCopyValue {
   nodeIdToCopyFrom: number;
@@ -21,6 +18,10 @@ export interface NodeCopyValue {
   nodeTemplate?: NodeTemplate;
   relativeX?: number;
   relativeY?: number;
+  // Live handle snapshots so dynamic-handle nodes (run_flow) paste with the
+  // same inputs/outputs the source node had.
+  inputHandles?: NodeHandle[];
+  outputHandles?: NodeHandle[];
 }
 
 export interface NodeCopyInput extends NodeCopyValue {
@@ -29,9 +30,7 @@ export interface NodeCopyInput extends NodeCopyValue {
   flowId: number;
 }
 
-// ============================================================================
 // Multi-Node Copy Types (for copying multiple nodes with connections)
-// ============================================================================
 
 export interface EdgeCopyValue {
   sourceNodeId: number;
@@ -46,9 +45,7 @@ export interface MultiNodeCopyValue {
   flowIdToCopyFrom: number;
 }
 
-// ============================================================================
 // Cursor and Context Menu Types
-// ============================================================================
 
 export interface CursorPosition {
   x: number;
@@ -57,23 +54,19 @@ export interface CursorPosition {
 
 export interface ContextMenuAction {
   actionId: string;
-  targetType: "node" | "edge" | "pane";
+  targetType: "node" | "edge" | "pane" | "selection";
   targetId: string;
   position: CursorPosition;
 }
 
-// ============================================================================
 // Node Promise Types
-// ============================================================================
 
 export interface NodePromise extends NodeBase {
   is_setup?: boolean;
   node_type: string;
 }
 
-// ============================================================================
 // Backend Interface Types
-// ============================================================================
 
 export interface AxiosResponse {
   data: any;

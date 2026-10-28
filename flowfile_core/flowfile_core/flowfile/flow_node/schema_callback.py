@@ -1,3 +1,4 @@
+import contextvars
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -53,7 +54,11 @@ class SingleExecutionFuture(Generic[T]):
         return self._executor
 
     def start(self) -> None:
-        """Start the function execution if not already started."""
+        """Start the function execution if not already started.
+
+        The function runs in a copy of the starting thread's context, so the caller's
+        context-local state (such as notebook build mode) reaches it and no other thread's does.
+        """
         with self._lock:
             if self._has_started:
                 logger.info("Function already started or completed")
@@ -62,7 +67,7 @@ class SingleExecutionFuture(Generic[T]):
             logger.info("Starting single executor function")
             executor: ThreadPoolExecutor = self._ensure_executor()
             generation = self._generation
-            self._future = executor.submit(self._func_wrapper, generation)
+            self._future = executor.submit(contextvars.copy_context().run, self._func_wrapper, generation)
             self._has_started = True
 
     def _func_wrapper(self, generation: int) -> T:
@@ -102,11 +107,14 @@ class SingleExecutionFuture(Generic[T]):
             # Start if not already started
             if not self._has_started:
                 self.start()
+            # Capture under the lock: a concurrent reset() nulls self._future,
+            # which would make this call return None instead of the result.
+            future = self._future
 
         # Wait for completion outside the lock to avoid blocking other threads
-        if self._future:
+        if future:
             try:
-                result: T = self._future.result()
+                result: T = future.result()
                 logger.info("Function completed successfully")
                 return result
             except Exception as e:

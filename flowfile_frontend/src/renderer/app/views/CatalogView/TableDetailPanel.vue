@@ -21,6 +21,10 @@
             >SQL Virtual</span
           >
           <span v-else-if="table.table_type === 'virtual'" class="virtual-badge">Virtual</span>
+          <span v-if="table.scd2" class="scd2-badge" title="Slowly changing dimension (type 2)"
+            >SCD2</span
+          >
+          <SharedBadge :access="table.access" />
         </div>
         <p v-if="table.description" class="description">{{ table.description }}</p>
       </div>
@@ -28,10 +32,23 @@
         <button
           class="action-btn-lg"
           :disabled="!table.file_exists"
-          @click="emit('queryTable', table.name)"
+          @click="emit('queryTable', table.qualified_name ?? table.full_table_name ?? table.name)"
         >
           <i class="fa-solid fa-code"></i>
           Query table
+        </button>
+        <button
+          v-if="table.table_type === 'virtual' && table.sql_query"
+          class="action-btn-lg"
+          :title="
+            canManage(table)
+              ? 'Edit this virtual table\'s SQL; saving updates the table'
+              : 'Open this virtual table\'s SQL as a draft (read-only access)'
+          "
+          @click="emit('editSql', { table, link: canManage(table) })"
+        >
+          <i class="fa-solid fa-pen-to-square"></i>
+          {{ canManage(table) ? "Edit SQL" : "Open SQL" }}
         </button>
         <button
           class="action-btn-lg"
@@ -41,7 +58,18 @@
           <i :class="table.is_favorite ? 'fa-solid fa-star' : 'fa-regular fa-star'"></i>
           {{ table.is_favorite ? "Favorited" : "Favorite" }}
         </button>
+        <TableMaintenance v-if="table.table_type !== 'virtual'" :table="table" />
         <button
+          v-if="canShare(table)"
+          class="action-btn-lg"
+          title="Share table"
+          @click="showShareDialog = true"
+        >
+          <i class="fa-solid fa-share-nodes"></i>
+          Share
+        </button>
+        <button
+          v-if="canManage(table)"
           class="btn btn-danger btn-sm"
           title="Delete table"
           @click="emit('deleteTable', table.id)"
@@ -51,6 +79,21 @@
         </button>
       </div>
     </div>
+
+    <ShareDialog
+      v-model="showShareDialog"
+      resource-type="catalog_table"
+      :resource-id="table.id"
+      :resource-name="table.name"
+      :can-manage-grants="canManageGrants(table)"
+    />
+
+    <TableEditorDialog
+      v-if="showTableEditor"
+      v-model="showTableEditor"
+      :table="table"
+      @saved="emit('editsSaved', $event)"
+    />
 
     <!-- File missing banner (physical tables only) -->
     <div v-if="table.table_type !== 'virtual' && !table.file_exists" class="missing-banner">
@@ -85,6 +128,80 @@
       <div v-if="table.table_type !== 'virtual'" class="meta-card">
         <span class="meta-label">Size</span>
         <span class="meta-value">{{ formatSize(table.size_bytes) }}</span>
+      </div>
+      <div v-if="table.partition_columns && table.partition_columns.length > 0" class="meta-card">
+        <span class="meta-label">Partitioned by</span>
+        <span class="partition-chips">
+          <span v-for="col in table.partition_columns" :key="col" class="partition-chip">
+            {{ col }}
+          </span>
+        </span>
+      </div>
+      <div v-if="table.scd2" class="meta-card">
+        <span class="meta-label">SCD2 tracked by</span>
+        <el-popover placement="top-start" :width="320" trigger="hover" popper-class="scd2-popover">
+          <template #reference>
+            <span class="partition-chips scd2-summary">
+              <span v-for="key in table.scd2.business_keys" :key="key" class="partition-chip">
+                {{ key }}
+              </span>
+            </span>
+          </template>
+          <div class="scd2-popover-body">
+            <div class="scd2-popover-row">
+              <span class="scd2-popover-key">History columns</span>
+              <span class="scd2-popover-value">
+                {{ table.scd2.surrogate_key_column }} / {{ table.scd2.valid_from_column }} /
+                {{ table.scd2.valid_to_column }} / {{ table.scd2.is_current_column }}
+              </span>
+            </div>
+            <div class="scd2-popover-row">
+              <span class="scd2-popover-key">Full snapshot</span>
+              <span class="scd2-popover-value">{{ table.scd2.full_snapshot ? "Yes" : "No" }}</span>
+            </div>
+            <div class="scd2-popover-row">
+              <span class="scd2-popover-key">Compared columns</span>
+              <span class="scd2-popover-value">{{ table.scd2.compare_columns.join(", ") }}</span>
+            </div>
+          </div>
+        </el-popover>
+      </div>
+      <div v-if="table.table_type !== 'virtual'" class="meta-card">
+        <span class="meta-label">Change tracking</span>
+        <el-popover
+          v-if="table.cdc_enabled"
+          placement="top-start"
+          :width="400"
+          trigger="click"
+          popper-class="cdc-popover"
+          @show="loadCdcStatus"
+        >
+          <template #reference>
+            <span class="meta-value meta-link">
+              <i class="fa-solid fa-clock-rotate-left"></i>
+              <span class="meta-link-text">{{ cdcEnabledLabel }}</span>
+            </span>
+          </template>
+          <div class="cdc-popover-body">
+            <div v-if="cdcLoading" class="cdc-popover-empty">Loading cursors…</div>
+            <div v-else-if="cdcCursors.length === 0" class="cdc-popover-empty">
+              Nothing has read changes from this table yet.
+            </div>
+            <div v-for="c in cdcCursors" :key="c.consumer_key" class="cdc-cursor-row">
+              <div class="cdc-cursor-main">
+                <span class="cdc-cursor-name" :title="c.consumer_key">
+                  {{ c.consumer_label ?? c.consumer_key }}
+                </span>
+                <span class="cdc-cursor-meta">
+                  v{{ c.last_version }} · {{ pendingLabel(c.pending_commits) }}
+                </span>
+              </div>
+              <el-button text size="small" @click="resetCursor(c)">Reset</el-button>
+              <el-button text size="small" type="danger" @click="deleteCursor(c)">Delete</el-button>
+            </div>
+          </div>
+        </el-popover>
+        <span v-else class="meta-value meta-muted">Off</span>
       </div>
       <div class="meta-card">
         <span class="meta-label">Created</span>
@@ -121,6 +238,18 @@
           <i class="fa-solid fa-diagram-project"></i>
           <span class="meta-link-text">{{ table.source_registration_name }}</span>
         </span>
+      </div>
+      <div v-if="table.prediction_table_id" class="meta-card">
+        <span class="meta-label">Scored by</span>
+        <span
+          v-if="table.prediction_table_name"
+          class="meta-value meta-static"
+          :title="table.prediction_table_name"
+        >
+          <i class="fa-solid fa-wand-magic-sparkles"></i>
+          <span class="meta-link-text">{{ table.prediction_table_name }}</span>
+        </span>
+        <span v-else class="meta-value meta-muted">Prediction table unavailable</span>
       </div>
       <div v-if="table.table_type === 'virtual' && !table.sql_query" class="meta-card">
         <span class="meta-label">Optimization</span>
@@ -166,9 +295,29 @@
     </div>
 
     <!-- Version History (physical tables only) -->
-    <div v-if="table.table_type !== 'virtual' && hasHistory" class="section">
-      <h3>Version History</h3>
-      <div class="version-table-wrapper">
+    <div v-if="showVersionHistory" class="section">
+      <div class="section-header">
+        <h3>Version History</h3>
+        <div class="section-header-actions">
+          <span
+            v-if="historyStale"
+            class="history-stale-hint"
+            title="Cached more than 5 minutes ago — refresh to fetch the latest"
+            >may be stale</span
+          >
+          <el-button
+            v-if="hasHistory"
+            text
+            size="small"
+            :loading="loadingTableHistory"
+            title="Fetch latest version history"
+            @click="emit('refreshHistory')"
+          >
+            <i v-if="!loadingTableHistory" class="fa-solid fa-rotate-right"></i>
+          </el-button>
+        </div>
+      </div>
+      <div v-if="hasHistory" class="version-table-wrapper">
         <table class="styled-table version-table">
           <thead>
             <tr>
@@ -220,6 +369,7 @@
           </tbody>
         </table>
       </div>
+      <div v-else class="loading-state">Loading version history…</div>
     </div>
 
     <!-- Read by Flows Modal -->
@@ -282,8 +432,31 @@
         <span v-if="preview" class="preview-info">
           Showing {{ preview.rows.length }} of {{ preview.total_rows }} rows
         </span>
+        <button
+          v-if="canEditData"
+          class="btn btn-sm btn-primary edit-data-btn"
+          title="Edit table data (cells, rows, columns) in place"
+          @click="showTableEditor = true"
+        >
+          <i class="fa-solid fa-pen-to-square"></i>
+          Edit data
+        </button>
       </div>
       <div v-if="loadingPreview" class="loading-state">Loading preview...</div>
+      <div v-else-if="previewError" class="preview-error">
+        <i class="fa-solid fa-triangle-exclamation"></i>
+        <div class="preview-error-body">
+          <p class="preview-error-title">Preview unavailable</p>
+          <p class="preview-error-message">{{ previewError }}</p>
+          <button
+            v-if="isViewingHistorical"
+            class="version-banner-link"
+            @click="emit('selectVersion', null)"
+          >
+            Back to latest
+          </button>
+        </div>
+      </div>
       <div v-else-if="preview && preview.rows.length > 0" class="preview-table-wrapper">
         <table class="styled-table preview-table">
           <thead>
@@ -307,6 +480,9 @@
         This is a virtual table, no data preview available. Use the SQL editor or a flow to view the
         data.
       </div>
+      <div v-else-if="table.is_remote_storage && !preview" class="empty-state">
+        <el-button size="small" type="primary" @click="emit('loadPreview')">Load preview</el-button>
+      </div>
       <div v-else class="empty-state">No data to preview.</div>
     </div>
 
@@ -320,18 +496,38 @@
 <script setup lang="ts">
 // TODO(refactor): ~905 LOC, but cohesive. Defer unless touched.
 //   If split: per-section sub-components (PreviewSection, SchemaSection, VersionHistorySection).
-import { ref, computed } from "vue";
-import type { CatalogTable, CatalogTablePreview, DeltaTableHistory } from "../../types";
+import { ref, computed, watch } from "vue";
+import { ElMessage, ElMessageBox } from "element-plus";
+import type {
+  CatalogTable,
+  CatalogTablePreview,
+  CdcCursor,
+  DeltaTableHistory,
+  TableCdcStatus,
+} from "../../types";
+import { CatalogApi } from "../../api/catalog.api";
+import { pendingLabel } from "../../utils/catalogCdc";
 import { formatDate, formatNumber, formatSize } from "./catalog-formatters";
 import VisualizationsTab from "./VisualizationsTab.vue";
+import TableMaintenance from "./TableMaintenance.vue";
+import TableEditorDialog from "./TableEditorDialog.vue";
+import ShareDialog from "../../components/sharing/ShareDialog.vue";
+import SharedBadge from "../../components/sharing/SharedBadge.vue";
+import { useResourceSharing } from "../../composables/useResourceSharing";
 
 const showReadByModal = ref(false);
+const showShareDialog = ref(false);
+const showTableEditor = ref(false);
+const { canShare, canManage, canManageGrants } = useResourceSharing();
 
 const props = defineProps<{
   table: CatalogTable;
   preview: CatalogTablePreview | null;
   loadingPreview: boolean;
+  previewError: string | null;
   tableHistory: DeltaTableHistory | null;
+  loadingTableHistory: boolean;
+  tableHistoryStale: boolean;
   selectedVersion: number | null;
 }>();
 
@@ -342,10 +538,21 @@ const emit = defineEmits([
   "navigateToFlow",
   "selectVersion",
   "queryTable",
+  "editSql",
   "recoverFromRun",
+  "loadPreview",
+  "refreshHistory",
+  "editsSaved",
 ]);
 
 const hasHistory = computed(() => props.tableHistory && props.tableHistory.history.length > 0);
+
+// Show the Version History section when there's history (cached or freshly loaded) or while it loads.
+const showVersionHistory = computed(
+  () => props.table.table_type !== "virtual" && (!!hasHistory.value || props.loadingTableHistory),
+);
+
+const historyStale = computed(() => !!hasHistory.value && props.tableHistoryStale);
 
 const isViewingHistorical = computed(
   () =>
@@ -353,6 +560,86 @@ const isViewingHistorical = computed(
     props.tableHistory !== null &&
     props.selectedVersion !== props.tableHistory.current_version,
 );
+
+// Edit surface: physical non-SCD2 tables with data on disk, manage access required.
+// Legacy Parquet tables pass this gate but are refused server-side with a clear message.
+const canEditData = computed(
+  () =>
+    canManage(props.table) &&
+    props.table.table_type !== "virtual" &&
+    props.table.file_exists &&
+    !props.table.scd2,
+);
+
+const cdcStatus = ref<TableCdcStatus | null>(null);
+const cdcLoading = ref(false);
+
+const cdcCursors = computed(() => cdcStatus.value?.cursors ?? []);
+
+const cdcEnabledLabel = computed(() =>
+  props.table.cdc_enabled_version !== null
+    ? `On · since v${props.table.cdc_enabled_version}`
+    : "On",
+);
+
+watch(
+  () => props.table.id,
+  () => {
+    cdcStatus.value = null;
+  },
+);
+
+async function loadCdcStatus() {
+  cdcLoading.value = true;
+  try {
+    cdcStatus.value = await CatalogApi.getTableCdc(props.table.id);
+  } catch (e: any) {
+    cdcStatus.value = null;
+    ElMessage.error(e?.response?.data?.detail ?? e?.message ?? "Could not load change cursors");
+  } finally {
+    cdcLoading.value = false;
+  }
+}
+
+async function resetCursor(cursor: CdcCursor) {
+  const label = cursor.consumer_label ?? cursor.consumer_key;
+  try {
+    await ElMessageBox.confirm(
+      `Move "${label}" to the table's current version? Changes it has not read yet are skipped.`,
+      "Reset cursor",
+      { confirmButtonText: "Reset", cancelButtonText: "Cancel", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  try {
+    await CatalogApi.resetCdcCursor(props.table.id, cursor.consumer_key, "now");
+    await loadCdcStatus();
+    ElMessage.success("Cursor reset");
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? e?.message ?? "Could not reset the cursor");
+  }
+}
+
+async function deleteCursor(cursor: CdcCursor) {
+  const label = cursor.consumer_label ?? cursor.consumer_key;
+  try {
+    await ElMessageBox.confirm(
+      `Delete "${label}"? Its next run starts over from whatever its reader is configured to start from.`,
+      "Delete cursor",
+      { confirmButtonText: "Delete", cancelButtonText: "Cancel", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  try {
+    await CatalogApi.deleteCdcCursor(props.table.id, cursor.consumer_key);
+    await loadCdcStatus();
+    ElMessage.success("Cursor deleted");
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? e?.message ?? "Could not delete the cursor");
+  }
+}
 
 function formatTimestamp(ts: string | null): string {
   if (!ts) return "--";
@@ -391,6 +678,70 @@ function formatCell(value: any): string {
   return String(value);
 }
 </script>
+
+<style>
+/* Non-scoped: Element Plus teleports popover content outside the component tree. */
+.scd2-popover .scd2-popover-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--spacing-2);
+  margin-top: var(--spacing-1);
+}
+
+.scd2-popover .scd2-popover-row:first-child {
+  margin-top: 0;
+}
+
+.scd2-popover .scd2-popover-key {
+  flex: 0 0 auto;
+  min-width: 120px;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.scd2-popover .scd2-popover-value {
+  font-family: var(--font-family-mono, monospace);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.cdc-popover .cdc-popover-empty {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.cdc-popover .cdc-cursor-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-1) 0;
+  border-bottom: 1px solid var(--color-border-primary);
+}
+
+.cdc-popover .cdc-cursor-row:last-child {
+  border-bottom: none;
+}
+
+.cdc-popover .cdc-cursor-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.cdc-popover .cdc-cursor-name {
+  display: block;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cdc-popover .cdc-cursor-meta {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+</style>
 
 <style scoped>
 .table-detail {
@@ -434,6 +785,21 @@ function formatCell(value: any): string {
 .sql-virtual-badge {
   color: var(--el-color-success, #67c23a);
   background: var(--el-color-success-light-9, rgba(103, 194, 58, 0.1));
+}
+
+.scd2-badge {
+  font-size: var(--font-size-xs, 11px);
+  font-weight: var(--font-weight-semibold, 600);
+  color: var(--el-color-warning, #e6a23c);
+  background: var(--el-color-warning-light-9, rgba(230, 162, 60, 0.1));
+  padding: 2px 8px;
+  border-radius: var(--border-radius-sm, 4px);
+  line-height: 1.4;
+}
+
+.scd2-summary {
+  cursor: default;
+  user-select: none;
 }
 
 .optimized-badge {
@@ -508,6 +874,23 @@ function formatCell(value: any): string {
   border-color: var(--color-warning);
 }
 
+.partition-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-1);
+  margin-top: var(--spacing-1);
+}
+.partition-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px var(--spacing-2);
+  background: var(--color-primary-soft, rgba(59, 130, 246, 0.1));
+  color: var(--color-primary);
+  border-radius: var(--border-radius-sm, 4px);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+}
+
 /* ========== Meta Grid (override minmax for table) ========== */
 .meta-grid {
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
@@ -546,6 +929,21 @@ function formatCell(value: any): string {
 
 .meta-link:hover {
   text-decoration: underline;
+}
+
+/* Same layout as .meta-link without the affordances — this one does not navigate. */
+.meta-static {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-1);
+  font-size: var(--font-size-sm);
+  min-width: 0;
+}
+
+.meta-muted {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-normal, 400);
+  color: var(--color-text-muted);
 }
 
 .meta-card-clickable {
@@ -660,6 +1058,19 @@ function formatCell(value: any): string {
 }
 
 /* ========== Version History ========== */
+.section-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.history-stale-hint {
+  font-size: 0.7rem;
+  font-style: italic;
+  color: var(--color-text-secondary, #9ca3af);
+  opacity: 0.7;
+}
+
 .version-table-wrapper {
   max-height: 240px;
   overflow-y: auto;
@@ -802,8 +1213,8 @@ function formatCell(value: any): string {
   gap: var(--spacing-2);
   padding: var(--spacing-2) var(--spacing-3);
   margin-bottom: var(--spacing-3);
-  background: var(--color-warning-light, rgba(234, 179, 8, 0.1));
-  border: 1px solid var(--color-warning, #eab308);
+  background: color-mix(in srgb, var(--color-warning) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 30%, transparent);
   border-radius: var(--border-radius-md);
   font-size: var(--font-size-sm);
   color: var(--color-text-primary);
@@ -872,6 +1283,43 @@ function formatCell(value: any): string {
   opacity: 0.4;
   cursor: not-allowed;
   pointer-events: none;
+}
+
+/* ========== Preview Error ========== */
+.preview-error {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-3);
+  padding: var(--spacing-3) var(--spacing-4);
+  background: color-mix(in srgb, var(--color-warning) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 30%, transparent);
+  border-radius: var(--border-radius-md);
+  color: var(--color-text-primary);
+}
+
+.preview-error > i {
+  color: var(--color-warning);
+  font-size: var(--font-size-lg);
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.preview-error-title {
+  margin: 0 0 var(--spacing-1);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.preview-error-message {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+.preview-error .version-banner-link {
+  margin-left: 0;
+  margin-top: var(--spacing-2);
 }
 
 /* ========== States ========== */

@@ -14,11 +14,11 @@ from flowfile_core.catalog.constants import (
     SAVED_FLOW_SQL_NODE_X,
     SAVED_FLOW_SQL_NODE_Y,
 )
+from flowfile_core.catalog.exceptions import FlowNotFoundError, TableNotFoundError
 from flowfile_core.catalog.repository import CatalogRepository
-from flowfile_core.catalog.services._resolve import resolve_or_log
 from flowfile_core.catalog.services.flows import FlowRegistrationService
 from flowfile_core.catalog.text_utils import (
-    hash_source_versions,
+    friendly_relation_error,
     is_table_reference,
     rewrite_qualified_references,
 )
@@ -26,6 +26,7 @@ from flowfile_core.flowfile.flow_data_engine.subprocess_operations.subprocess_op
     trigger_resolve_virtual_table,
 )
 from flowfile_core.schemas.catalog_schema import SqlQueryResult
+from shared._version import get_version
 from shared.storage_config import storage
 
 if TYPE_CHECKING:
@@ -68,9 +69,17 @@ class SqlService:
         )
 
     def execute_sql_query(
-        self, query: str, max_rows: int = DEFAULT_SQL_MAX_ROWS, user_id: int | None = None
+        self,
+        query: str,
+        max_rows: int = DEFAULT_SQL_MAX_ROWS,
+        user_id: int | None = None,
+        accessible_table_ids: set[int] | None = None,
     ) -> SqlQueryResult:
-        """Execute a SQL query against all catalog tables (physical + virtual) via the worker."""
+        """Execute a SQL query against catalog tables (physical + virtual) via the worker.
+
+        ``accessible_table_ids`` (multi-user mode) restricts the registered tables
+        to those the user may read.
+        """
         from flowfile_core.flowfile.sources.external_sources.sql_source.sql_source import (
             UnsafeSQLError,
             validate_sql_query,
@@ -82,11 +91,29 @@ class SqlService:
             return SqlQueryResult(error=str(e))
 
         virtual_tables = self._require_virtual_tables()
-        delta_map, virtual_map = virtual_tables.resolve_all_queryable_tables()
+        delta_map, virtual_map = virtual_tables.resolve_all_queryable_tables(accessible_table_ids)
+        queryable = {*delta_map, *virtual_map}
+
+        cloud_aliases = virtual_tables.resolve_cloud_only_table_aliases(accessible_table_ids, exclude=queryable)
+        if cloud_aliases:
+            # Collapse dotted references (any quoting) so detection matches regardless of form.
+            detect_query = rewrite_qualified_references(query, queryable | set(cloud_aliases))
+            referenced = sorted(
+                {display for alias, display in cloud_aliases.items() if is_table_reference(alias, detect_query)}
+            )
+            if referenced:
+                names = ", ".join(f"'{d}'" for d in referenced)
+                return SqlQueryResult(
+                    error=(
+                        f"Table {names} is stored in cloud/object storage, which the SQL editor "
+                        f"does not support yet. Read it from a flow (Cloud storage or Catalog reader node) instead."
+                    )
+                )
+
         if not delta_map and not virtual_map:
             return SqlQueryResult(error="No catalog tables available")
 
-        query = rewrite_qualified_references(query, {*delta_map, *virtual_map})
+        query = rewrite_qualified_references(query, queryable)
         referenced_virtuals = {vname for vname in virtual_map if is_table_reference(vname, query)}
 
         virtual_refs: dict[str, str] = {}
@@ -94,13 +121,21 @@ class SqlService:
         for vname in referenced_virtuals:
             vid = virtual_map[vname]
             if vid not in ipc_path_by_id:
-                ipc_path = resolve_or_log(
-                    lambda vid=vid: self._materialise_virtual_for_sql(vid, user_id),
-                    kind="virtual table for SQL",
-                    identifier=vname,
-                )
-                if ipc_path is None:
-                    continue
+                # The virtual is referenced in the query, so it can't be skipped — a failure
+                # here means the query can't run. Surface a clear reason instead of letting the
+                # worker fail later with a cryptic "relation not found".
+                try:
+                    ipc_path = self._materialise_virtual_for_sql(vid, user_id)
+                except Exception as e:
+                    missing_source = isinstance(e, FileNotFoundError | FlowNotFoundError | TableNotFoundError)
+                    logger.warning(
+                        "Could not resolve virtual table %r for SQL: %s", vname, e, exc_info=not missing_source
+                    )
+                    reason = "its source flow is missing" if missing_source else "its source flow failed to run"
+                    return SqlQueryResult(
+                        error=f"Virtual table '{vname}' could not be resolved — {reason}. "
+                        f"See the server logs for details."
+                    )
                 ipc_path_by_id[vid] = ipc_path
             virtual_refs[vname] = ipc_path_by_id[vid]
 
@@ -110,14 +145,17 @@ class SqlService:
 
         try:
             result = _service_module.trigger_sql_query(query, delta_map, max_rows, virtual_refs=virtual_refs or None)
-            return SqlQueryResult(**result)
         except RuntimeError as e:
-            return SqlQueryResult(error=str(e))
+            return SqlQueryResult(error=friendly_relation_error(str(e), query))
+        if result.get("error"):
+            result["error"] = friendly_relation_error(result["error"], query)
+        return SqlQueryResult(**result)
 
     def _materialise_virtual_for_sql(self, virtual_id: int, user_id: int | None) -> str:
         """Resolve a virtual table to an IPC path for the SQL worker call."""
         lazy_frame = self._resolve_virtual_flow_table_via_facade(virtual_id, user_id=user_id, run_location="remote")
-        versions_hash = hash_source_versions(self.repo.get_table(virtual_id).source_table_versions)
+        # Post-resolution read: resolution may have re-stamped source_table_versions.
+        versions_hash = self._require_virtual_tables().fresh_versions_hash(virtual_id)
         result = trigger_resolve_virtual_table(virtual_id, lazy_frame.serialize(), versions_hash)
         return result["ipc_path"]
 
@@ -129,12 +167,17 @@ class SqlService:
         namespace_id: int | None = None,
         description: str | None = None,
         used_tables: list[str] | None = None,
+        accessible_table_ids: set[int] | None = None,
     ) -> int:
         """Create a registered flow from a SQL query.
 
         Builds a flow JSON with catalog_reader nodes (one per used table)
         connected to a single sql_query node, saves it, and registers it.
         Returns the registration ID.
+
+        ``accessible_table_ids`` (multi-user mode) restricts the embedded reader
+        nodes to tables the caller may read; references to other tables are
+        dropped so the saved flow can't read data the user has no access to.
         """
         from flowfile_core.flowfile.utils import create_unique_id
 
@@ -147,6 +190,8 @@ class SqlService:
         for i, table_name in enumerate(used_tables):
             table = self.repo.get_table_by_name(table_name, namespace_id)
             if table is None:
+                continue
+            if accessible_table_ids is not None and table.id not in accessible_table_ids:
                 continue
             node_id = i + 1
             reader_node_ids.append(node_id)
@@ -183,7 +228,7 @@ class SqlService:
         )
 
         flow_data = {
-            "flowfile_version": "0.6.3",
+            "flowfile_version": get_version(),
             "flowfile_id": flow_id,
             "flowfile_name": name,
             "flowfile_settings": {

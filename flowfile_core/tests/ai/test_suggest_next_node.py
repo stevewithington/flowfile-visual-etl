@@ -48,9 +48,7 @@ from flowfile_core.auth.jwt import get_current_active_user
 from flowfile_core.auth.models import User as PydanticUser
 from flowfile_core.configs import settings as core_settings
 
-# --------------------------------------------------------------------------- #
-# Fakes #
-# --------------------------------------------------------------------------- #
+# Fakes
 
 
 class _FakeColumn:
@@ -77,12 +75,23 @@ def _make_node(
     *,
     predicted_schema: list[Any] | None,
     node_type: str = "manual_input",
+    compute_schema: list[Any] | None = None,
 ) -> Any:
+    """Duck-typed FlowNode stand-in.
+
+    ``predicted_schema`` is the raw cache; ``compute_schema`` (defaults to the
+    same) is what ``get_predicted_schema()`` returns — the suggest path calls
+    the method, not the attribute, so a cold cache with a computable schema
+    (``predicted_schema=None`` but ``compute_schema=[...]``) exercises the
+    on-demand warming path.
+    """
     schema = SimpleNamespace(predicted_schema=predicted_schema)
+    computed = compute_schema if compute_schema is not None else predicted_schema
     return SimpleNamespace(
         node_id=node_id,
         node_type=node_type,
         node_schema=schema,
+        get_predicted_schema=lambda force=False: computed,
     )
 
 
@@ -176,9 +185,7 @@ def _select_settings(*, old_name: str) -> dict[str, Any]:
     }
 
 
-# --------------------------------------------------------------------------- #
-# 1. Surface vocabulary lockstep #
-# --------------------------------------------------------------------------- #
+# 1. Surface vocabulary lockstep
 
 
 def test_ghost_node_surface_in_lockstep() -> None:
@@ -190,7 +197,7 @@ def test_ghost_node_surface_in_lockstep() -> None:
     assert "ghost_node" in ctx_builder.SURFACE_TO_LEVEL
     assert ctx_builder.SURFACE_TO_LEVEL["ghost_node"] == "copilot"
     assert "ghost_node" in tool_registry.SURFACE_PRESETS
-    # Preset is a non-empty frozenset (W30 invariant).
+    # Preset is a non-empty frozenset.
     assert tool_registry.SURFACE_PRESETS["ghost_node"]
     tool_registry._check_preset_coverage()  # must not raise
 
@@ -235,9 +242,7 @@ def test_allowed_node_types_derived_from_preset() -> None:
     assert "python_script" not in _ALLOWED_NODE_TYPES
 
 
-# --------------------------------------------------------------------------- #
-# 2. Schema-grounding: hallucinated columns dropped #
-# --------------------------------------------------------------------------- #
+# 2. Schema-grounding: hallucinated columns dropped
 
 
 @pytest.mark.asyncio
@@ -302,6 +307,71 @@ async def test_drops_candidate_with_invalid_pydantic_settings() -> None:
     assert response.suggestions[0].node_type == "select"
 
 
+def test_ghost_settings_examples_are_valid() -> None:
+    """Every worked example shown to the LLM must validate against its settings
+    class (with the server-injected placeholder ids). A schema change that
+    breaks an example fails here instead of silently teaching the LLM a bad
+    shape that would drop every real suggestion."""
+    from flowfile_core.ai.suggest_next_node import _GHOST_SETTINGS_EXAMPLES
+    from flowfile_core.schemas.schemas import get_settings_class_for_node_type
+
+    assert _GHOST_SETTINGS_EXAMPLES
+    for node_type, example in _GHOST_SETTINGS_EXAMPLES.items():
+        assert node_type in _ALLOWED_NODE_TYPES, node_type
+        settings_cls = get_settings_class_for_node_type(node_type)
+        assert settings_cls is not None, node_type
+        # flow_id/node_id are injected server-side — mirror that here.
+        settings_cls.model_validate({"flow_id": 0, "node_id": 0, **example})
+
+
+def test_settings_examples_injected_into_prompt() -> None:
+    """The system prompt must carry the per-node-type settings shapes so a
+    cheap model isn't guessing the nested structure (the root cause of the
+    'no schema-grounded suggestion' degrade)."""
+    from flowfile_core.ai.suggest_next_node import _build_messages
+
+    system = _build_messages(
+        upstream_columns=["region", "amount"],
+        upstream_node_type="read_csv",
+        intent=None,
+        max_suggestions=3,
+    )[0].content
+    assert "filter_input" in system
+    assert "groupby_input" in system
+    assert "flow_id" in system  # tells the model these are auto-filled
+
+
+@pytest.mark.asyncio
+async def test_accepts_candidate_without_flow_id_node_id() -> None:
+    """Regression: a real LLM omits flow_id/node_id (it can't know them). The
+    executor-seam injection means a correct-shaped candidate still validates
+    and is returned, rather than dropped as no_valid_suggestions."""
+    upstream = _make_node("u1", predicted_schema=_columns("region", "amount"))
+    graph = _FakeGraph({"u1": upstream})
+
+    provider = _FakeProvider(
+        content=_payload(
+            [
+                {
+                    "node_type": "filter",
+                    # No flow_id / node_id — exactly what a real LLM emits.
+                    "settings": {
+                        "filter_input": {
+                            "mode": "basic",
+                            "basic_filter": {"field": "region", "operator": "==", "value": "EU"},
+                        }
+                    },
+                    "label": "Filter by region",
+                },
+            ]
+        )
+    )
+    response = await suggest_next_node(graph, "u1", provider=provider, scheduler=_scheduler())
+    assert response.degraded is False
+    assert len(response.suggestions) == 1
+    assert response.suggestions[0].node_type == "filter"
+
+
 @pytest.mark.asyncio
 async def test_drops_candidate_outside_ghost_node_preset() -> None:
     """Defence-in-depth: even if the LLM ignores the prompt and proposes a
@@ -333,14 +403,43 @@ async def test_drops_candidate_outside_ghost_node_preset() -> None:
     assert response.suggestions[0].node_type == "select"
 
 
-# --------------------------------------------------------------------------- #
-# 3. Degraded / failure paths #
-# --------------------------------------------------------------------------- #
+# 3. Degraded / failure paths
+
+
+@pytest.mark.asyncio
+async def test_warms_cold_schema_cache_on_demand() -> None:
+    """Regression: the raw ``predicted_schema`` cache is cold (``None``) but
+    ``get_predicted_schema()`` can compute it. The suggest path must call the
+    method (like every other AI surface) and produce suggestions rather than
+    degrading early with ``upstream_schema_unknown`` — the bug that made the
+    ghost surface appear to never work."""
+    upstream = _make_node("u1", predicted_schema=None, compute_schema=_columns("region"))
+    graph = _FakeGraph({"u1": upstream})
+
+    provider = _FakeProvider(
+        content=_payload(
+            [
+                {
+                    "node_type": "filter",
+                    "settings": _filter_settings(field="region"),
+                    "label": "Filter by region",
+                },
+            ]
+        )
+    )
+    response = await suggest_next_node(graph, "u1", provider=provider, scheduler=_scheduler())
+    assert response.degraded is False
+    assert len(response.suggestions) == 1
+    assert response.suggestions[0].node_type == "filter"
+    # The LLM must have been consulted — schema was warmed, not degraded early.
+    assert provider.last_call_kwargs != {}
 
 
 @pytest.mark.asyncio
 async def test_degrades_on_cold_upstream() -> None:
-    """Upstream node has ``predicted_schema=None`` — must NOT call the LLM."""
+    """Upstream schema is genuinely unpredictable (both cache and
+    ``get_predicted_schema()`` yield ``None``) — must NOT call the LLM, and
+    must degrade with the machine-code reason the frontend switches on."""
     upstream = _make_node("u1", predicted_schema=None)
     graph = _FakeGraph({"u1": upstream})
 
@@ -348,7 +447,7 @@ async def test_degrades_on_cold_upstream() -> None:
     response = await suggest_next_node(graph, "u1", provider=provider, scheduler=_scheduler())
     assert response.degraded is True
     assert response.suggestions == []
-    assert response.reason
+    assert response.reason == "upstream_schema_unknown"
     # We must NOT have hit the LLM in the cold-flow branch.
     assert provider.last_call_kwargs == {}
 
@@ -359,6 +458,7 @@ async def test_degrades_when_upstream_missing() -> None:
     provider = _FakeProvider(content=_payload([]))
     response = await suggest_next_node(graph, "missing-id", provider=provider, scheduler=_scheduler())
     assert response.degraded is True
+    assert response.reason == "missing_upstream"
     assert provider.last_call_kwargs == {}
 
 
@@ -428,9 +528,7 @@ async def test_degrades_when_all_candidates_filtered() -> None:
     assert response.suggestions == []
 
 
-# --------------------------------------------------------------------------- #
-# 4. Provider call wiring #
-# --------------------------------------------------------------------------- #
+# 4. Provider call wiring
 
 
 @pytest.mark.asyncio
@@ -535,9 +633,7 @@ async def test_markdown_fenced_json_unwrapped() -> None:
     assert len(response.suggestions) == 1
 
 
-# --------------------------------------------------------------------------- #
-# 5. Predicted-schema attachment #
-# --------------------------------------------------------------------------- #
+# 5. Predicted-schema attachment
 
 
 @pytest.mark.asyncio
@@ -577,9 +673,7 @@ async def test_predicted_schema_attached_for_static_node() -> None:
         assert "a" in names
 
 
-# --------------------------------------------------------------------------- #
-# 6. Routes #
-# --------------------------------------------------------------------------- #
+# 6. Routes
 
 
 @pytest.fixture
@@ -593,7 +687,7 @@ def authed_client() -> Iterator[TestClient]:
 
 
 def test_route_404_on_missing_flow(authed_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(suggest_next_node_routes.flow_file_handler, "get_flow", lambda _id: None)
+    monkeypatch.setattr(suggest_next_node_routes.flow_file_handler, "get_flow", lambda _id, _user_id=None: None)
     response = authed_client.post(
         "/ai/suggest_next_node",
         json={"flow_id": 99, "upstream_node_id": "u1"},
@@ -615,7 +709,7 @@ def test_route_409_on_unconfigured_provider(authed_client: TestClient, monkeypat
     monkeypatch.setattr(
         suggest_next_node_routes.flow_file_handler,
         "get_flow",
-        lambda _id: object(),
+        lambda _id, _user_id=None: object(),
     )
 
     def _raise(*_a: Any, **_kw: Any):
@@ -659,7 +753,7 @@ def test_route_happy_path(authed_client: TestClient, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         suggest_next_node_routes.flow_file_handler,
         "get_flow",
-        lambda _id: graph,
+        lambda _id, _user_id=None: graph,
     )
     provider = _FakeProvider(
         content=_payload(
@@ -694,9 +788,7 @@ def test_route_happy_path(authed_client: TestClient, monkeypatch: pytest.MonkeyP
     assert body["suggestions"][0]["label"] == "Filter by region"
 
 
-# --------------------------------------------------------------------------- #
-# 7. Lazy-litellm contract #
-# --------------------------------------------------------------------------- #
+# 7. Lazy-litellm contract
 
 
 def test_lazy_litellm_contract() -> None:

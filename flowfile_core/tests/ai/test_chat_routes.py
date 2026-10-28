@@ -24,7 +24,7 @@ Cases:
   ``sys.modules``. cases:
 
 * ``test_chat_stream_prepends_assist_prompt_for_surface_explain`` — when
-  ``surface="explain"``, the provider sees ``[system (W22 assist), user]``.
+  ``surface="explain"``, the provider sees ``[system (assist prompt), user]``.
 * ``test_chat_stream_prepends_default_prompt_when_surface_missing`` — no
   ``surface`` field → falls back to the default surface (``"explain"`` →
   ``assist`` per's ``SURFACE_TO_LEVEL``).
@@ -137,7 +137,6 @@ def test_chat_stream_emits_provider_chunks(
     assert response.headers["content-type"].startswith("text/event-stream")
 
     body = response.text
-    # Two chunk deltas + a done marker, in order.
     assert 'event: chunk\ndata: {"content_delta": "hello "}' in body
     assert 'event: chunk\ndata: {"content_delta": "world"}' in body
     assert 'event: done\ndata: {"finish_reason": "stop"}' in body
@@ -474,6 +473,7 @@ def registered_flow_for_w28() -> Iterator[FlowGraph]:
     """
     flow = _build_simple_flow_for_chat()
     flow_file_handler._flows[flow.flow_id] = flow
+    flow_file_handler._register_user_session(1, flow.flow_id)
     try:
         yield flow
     finally:
@@ -486,8 +486,8 @@ def test_chat_stream_calls_render_prompt_context_when_flow_id_set(
     registered_flow_for_w28: FlowGraph,
 ) -> None:
     """POST with ``flow_id`` set → backend calls's
-    ``render_prompt_context``; provider receives ``[system (W22 layered
-    prompt), user (W22 user-context block), user (question)]``.
+    ``render_prompt_context``; provider receives ``[system (layered
+    prompt), user (user-context block), user (question)]``.
 
     The user block must reference the actual node names from the
     flow. This is the test that fails if the smoke-test scenario regresses
@@ -505,7 +505,6 @@ def test_chat_stream_calls_render_prompt_context_when_flow_id_set(
     assert response.status_code == 200
 
     captured = patch_get_configured_provider.last_call_kwargs["messages"]
-    # System (W22 layered) + user block + the user's question.
     assert len(captured) == 3
     system_msg, ctx_user_msg, question_msg = captured
 
@@ -546,7 +545,6 @@ def test_chat_stream_without_flow_id_uses_w26_identity_path(
     assert response.status_code == 200
 
     captured = patch_get_configured_provider.last_call_kwargs["messages"]
-    # No flow_id → no user block. Just system + user.
     assert len(captured) == 2
     system_msg, user_msg = captured
     assert system_msg.role == "system"
@@ -614,10 +612,11 @@ def test_chat_stream_mentions_forwarded_to_render_prompt_context(
     patch_get_configured_provider: FakeProvider,
     registered_flow_for_w28: FlowGraph,
 ) -> None:
-    """when the client provides parsed ``mentions`` (W24's output),
-    they reach ``render_prompt_context`` as a single space-joined string
-    for ``_coerce_mentions`` to parse server-side. Multiple mentions
-    keep their order so node-id resolution is deterministic.
+    """when the client provides parsed ``mentions``, they reach
+    ``render_prompt_context`` as parsed ``Mention`` objects (not raw
+    text, which would also render as a fake ``## User request``).
+    Multiple mentions keep their order so node-id resolution is
+    deterministic.
     """
     captured: dict[str, Any] = {}
 
@@ -639,7 +638,8 @@ def test_chat_stream_mentions_forwarded_to_render_prompt_context(
         },
     )
     assert response.status_code == 200
-    assert captured["kwargs"]["mentions"] == "@node:filter_eu @flow"
+    forwarded = captured["kwargs"]["mentions"]
+    assert [(m.kind, m.ref) for m in forwarded] == [("node", "filter_eu"), ("flow", None)]
 
 
 def test_chat_stream_defaults_to_at_flow_when_no_pin_or_mentions(
@@ -673,7 +673,7 @@ def test_chat_stream_defaults_to_at_flow_when_no_pin_or_mentions(
         },
     )
     assert response.status_code == 200
-    assert captured["kwargs"]["mentions"] == "@flow"
+    assert [(m.kind, m.ref) for m in captured["kwargs"]["mentions"]] == [("flow", None)]
 
 
 # ---------- 11b. — prospective schema reaches the chat surface ----------
@@ -734,6 +734,7 @@ def registered_cold_flow_for_w48() -> Iterator[FlowGraph]:
     flow.get_node(2).node_schema.predicted_schema = None
 
     flow_file_handler._flows[flow.flow_id] = flow
+    flow_file_handler._register_user_session(1, flow.flow_id)
     try:
         yield flow
     finally:
@@ -763,7 +764,7 @@ def test_chat_stream_user_block_contains_columns_for_un_run_static_upstream(
     assert response.status_code == 200
 
     captured = patch_get_configured_provider.last_call_kwargs["messages"]
-    assert len(captured) == 3  # system + user + question
+    assert len(captured) == 3
     _system_msg, ctx_user_msg, _question_msg = captured
 
     # The filter must report a known schema — the bug-of-record was the
@@ -789,7 +790,7 @@ def test_chat_stream_user_block_contains_columns_for_un_run_static_upstream(
 def test_lazy_litellm_import_for_chat_routes() -> None:
     """``import flowfile_core.ai.chat_routes`` mustn't drag in litellm.
 
-    Same contract as W11/W12/W13 — the module sits behind the BYOK seam,
+    Same contract as the other AI routers — the module sits behind the BYOK seam,
     not the provider_factory bootstrap, so the heavy SDK stays out of the
     import graph until a real call happens.
 
@@ -816,9 +817,7 @@ def test_lazy_litellm_import_for_chat_routes() -> None:
         sys.modules.update(saved)
 
 
-# ---------------------------------------------------------------------------
 # v2 — POST /ai/chat/preview (debug endpoint)
-# ---------------------------------------------------------------------------
 
 
 def test_chat_preview_returns_assembled_messages_as_json(
@@ -838,7 +837,6 @@ def test_chat_preview_returns_assembled_messages_as_json(
     body = response.json()
     assert body["provider"] == "anthropic"
     assert body["prompt_surface"] == "explain"
-    # Two messages: server-issued system + the client's user turn.
     assert len(body["messages"]) == 2
     assert body["messages"][0]["role"] == "system"
     assert body["messages"][1]["role"] == "user"
@@ -848,7 +846,6 @@ def test_chat_preview_returns_assembled_messages_as_json(
     # (let the user verify the catalog is reaching the LLM).
     assert "## Flowfile node reference" in body["messages"][0]["content"]
     assert "Group by" in body["messages"][0]["content"]
-    # Char counts and token estimate populated.
     assert body["total_chars"] > 0
     assert body["estimated_tokens"] == body["total_chars"] // 4
 
@@ -902,9 +899,7 @@ def test_chat_preview_disabled_returns_503(
     assert response.status_code == 503
 
 
-# --------------------------------------------------------------------------- #
-# chat preamble must never invoke _predicted_data_getter #
-# --------------------------------------------------------------------------- #
+# chat preamble must never invoke _predicted_data_getter
 
 _W65_FLOW_ID = 9965
 
@@ -968,6 +963,7 @@ def _build_random_split_flow_for_w65() -> FlowGraph:
 def registered_random_split_flow_for_w65() -> Iterator[FlowGraph]:
     flow = _build_random_split_flow_for_w65()
     flow_file_handler._flows[flow.flow_id] = flow
+    flow_file_handler._register_user_session(1, flow.flow_id)
     try:
         yield flow
     finally:
@@ -1049,3 +1045,96 @@ def test_chat_stream_passes_samples_mode_off_explicitly(
     )
     assert response.status_code == 200
     assert captured_kwargs.get("samples_mode") == "off", captured_kwargs
+
+
+# ---------- on-device chat: no parroted footer ----------
+
+
+def _stream_and_preview(authed_client: TestClient, fake: FakeProvider, body: dict[str, Any]) -> tuple[list, list]:
+    stream = authed_client.post("/ai/chat/stream", json=body)
+    assert stream.status_code == 200
+    streamed = [(m.role, m.content) for m in fake.last_call_kwargs["messages"]]
+    preview = authed_client.post("/ai/chat/preview", json=body)
+    assert preview.status_code == 200
+    previewed = [(m["role"], m["content"]) for m in preview.json()["messages"]]
+    return streamed, previewed
+
+
+def test_chat_stream_local_chat_mode_has_no_footer_override(
+    authed_client: TestClient,
+    patch_get_configured_provider: FakeProvider,
+    registered_flow_for_w28: FlowGraph,
+) -> None:
+    """On-device + ``chat_mode="chat"``: no trailing system message, no
+    agent-mode wording anywhere in the system prompt, and the on-device
+    suffix in its place. A 3B model repeats the last exact block it
+    sees, and on-device has no agent mode to switch to."""
+    response = authed_client.post(
+        "/ai/chat/stream",
+        json={
+            "provider": "local",
+            "flow_id": _W28_FLOW_ID,
+            "chat_mode": "chat",
+            "messages": [{"role": "user", "content": "add a filter for EU customers"}],
+        },
+    )
+    assert response.status_code == 200
+    messages = _provider_messages(patch_get_configured_provider)
+    assert [m.role for m in messages] == ["system", "user", "user"]
+    system = messages[0].content
+    assert "agent mode" not in system.lower()
+    assert "MODE OVERRIDE" not in system
+    assert "do it" not in system
+    assert "Simple build" in system
+    # The compact reference, not the per-node ``### filter`` sections.
+    assert "- Filter data (Transformations):" in system
+    assert "### filter" not in system
+    # The resolved ``@flow`` default must not render as a fake user request.
+    assert "## User request" not in messages[1].content
+
+
+def test_chat_stream_cloud_chat_mode_keeps_footer_override(
+    authed_client: TestClient,
+    patch_get_configured_provider: FakeProvider,
+    registered_flow_for_w28: FlowGraph,
+) -> None:
+    """Cloud + ``chat_mode="chat"`` keeps today's trailing override (the
+    intent router matches its wording)."""
+    response = authed_client.post(
+        "/ai/chat/stream",
+        json={
+            "provider": "anthropic",
+            "flow_id": _W28_FLOW_ID,
+            "chat_mode": "chat",
+            "messages": [{"role": "user", "content": "add a filter for EU customers"}],
+        },
+    )
+    assert response.status_code == 200
+    messages = _provider_messages(patch_get_configured_provider)
+    assert messages[-1].role == "system"
+    assert "MODE OVERRIDE" in messages[-1].content
+    assert "auto-switch to agent mode" in messages[0].content
+    assert "Simple build" not in messages[0].content
+    assert "## User request" not in messages[1].content
+
+
+@pytest.mark.parametrize("provider", ["local", "anthropic"])
+@pytest.mark.parametrize("with_flow", [True, False])
+def test_chat_preview_matches_stream_messages(
+    authed_client: TestClient,
+    patch_get_configured_provider: FakeProvider,
+    registered_flow_for_w28: FlowGraph,
+    provider: str,
+    with_flow: bool,
+) -> None:
+    """``/chat/preview`` returns exactly what ``/chat/stream`` sends —
+    including the chat-mode override, which the preview used to omit."""
+    body: dict[str, Any] = {
+        "provider": provider,
+        "chat_mode": "chat",
+        "messages": [{"role": "user", "content": "add a sort node"}],
+    }
+    if with_flow:
+        body["flow_id"] = _W28_FLOW_ID
+    streamed, previewed = _stream_and_preview(authed_client, patch_get_configured_provider, body)
+    assert previewed == streamed

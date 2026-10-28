@@ -16,21 +16,17 @@
           :value="modelValue.database_type"
           class="form-control"
           @change="
-            (e: Event) =>
-              updateField(
-                'database_type',
-                (e.target as HTMLSelectElement).value as 'postgresql' | 'mysql' | 'sqlite',
-              )
+            (e: Event) => updateField('database_type', (e.target as HTMLSelectElement).value)
           "
         >
-          <option value="postgresql">PostgreSQL</option>
-          <option value="mysql">MySQL</option>
-          <option value="sqlite">SQLite</option>
+          <option v-for="dialect in dialects" :key="dialect.name" :value="dialect.name">
+            {{ dialect.display_name }}
+          </option>
         </select>
       </div>
 
-      <!-- Connection Details (hidden for SQLite) -->
-      <div v-if="!isSqlite" class="form-group">
+      <!-- Connection Details (hidden for file-based databases) -->
+      <div v-if="!isFileBasedConnection" class="form-group">
         <label for="username">Username</label>
         <input
           id="username"
@@ -42,7 +38,7 @@
         />
       </div>
 
-      <div v-if="!isSqlite" class="form-group">
+      <div v-if="!isFileBasedConnection" class="form-group">
         <label for="password-ref">Password Reference</label>
         <select
           id="password-ref"
@@ -57,7 +53,7 @@
         </select>
       </div>
 
-      <div v-if="!isSqlite" class="form-group">
+      <div v-if="!isFileBasedConnection" class="form-group">
         <label for="host">Host</label>
         <input
           id="host"
@@ -69,7 +65,7 @@
         />
       </div>
 
-      <div v-if="!isSqlite" class="form-row">
+      <div v-if="!isFileBasedConnection" class="form-row">
         <div class="form-group half">
           <label for="port">Port</label>
           <input
@@ -95,7 +91,7 @@
         </div>
       </div>
 
-      <div v-if="isSqlite" class="form-group">
+      <div v-if="isFileBasedConnection" class="form-group">
         <label for="database">File Path</label>
         <input
           id="database"
@@ -115,6 +111,7 @@ import { ref, computed, onMounted } from "vue";
 import { DatabaseConnection } from "../../../baseNode/nodeInput";
 import { SecretsApi } from "../../../../../api";
 import type { Secret } from "../../../../../types";
+import { useDbDialects } from "../../../../../composables/useDbDialects";
 
 const fetchSecretsApi = SecretsApi.getAll;
 
@@ -123,7 +120,9 @@ const props = defineProps<{
   modelValue: DatabaseConnection;
 }>();
 
-const isSqlite = computed(() => props.modelValue.database_type === "sqlite");
+const { dialects, isFileBased } = useDbDialects();
+
+const isFileBasedConnection = computed(() => isFileBased(props.modelValue.database_type));
 
 const emit = defineEmits<{
   (e: "update:modelValue", value: DatabaseConnection): void;
@@ -153,7 +152,6 @@ const fetchSecrets = async () => {
       "Error fetching secrets:",
       error instanceof Error ? error.message : String(error),
     );
-    // Provide empty array as fallback if fetch fails
     availableSecrets.value = [];
   }
 };
@@ -250,7 +248,7 @@ label {
 
 select.form-control {
   appearance: none;
-  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%234a5568' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 0.5rem center;
   background-size: 1em;

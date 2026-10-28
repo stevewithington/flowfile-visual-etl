@@ -2,7 +2,10 @@
 
 Organize, track, and govern your data flows and tables in a central catalog.
 
-The Catalog is your single pane of glass for managing flows, tracking execution history, registering data tables (physical and [virtual](virtual-tables.md)), querying data with [SQL](sql-editor.md), sharing artifacts across flows, and automating pipelines with [schedules](schedules.md).
+The Catalog is a central place to manage flows and track execution history. It registers data tables (physical and [virtual](virtual-tables.md)), queries data with [SQL](sql-editor.md), shares artifacts across flows, automates pipelines with [schedules](schedules.md), and serves flows as [API endpoints](flow-api.md).
+
+!!! info "Limited in Flowfile Lite"
+    The browser-only [Flowfile Lite](../../deployment/lite.md) edition includes only a **lightweight in-browser catalog** (save and reuse CSV tables). The governed catalog described here — Delta-backed storage, version history, virtual tables, lineage, SQL, schedules, and secrets — requires the full desktop/server build.
 
 ![Catalog overview](../../../assets/images/guides/catalog/catalog-overview.png)
 
@@ -13,6 +16,32 @@ The Catalog is your single pane of glass for managing flows, tracking execution 
 ## Opening the Catalog
 
 Click the **Catalog** icon in the left sidebar menu to open the Catalog page.
+
+---
+
+## Start with a populated catalog
+
+A fresh install starts with an empty catalog (only the `General > default` namespace). To explore the catalog with real content, seed the optional **Demo** catalog from the command line:
+
+```bash
+flowfile seed-demo
+```
+
+This one command:
+
+- Creates a `Demo` catalog with two schemas — `sales_analytics` and `market`
+- Writes four Delta tables under `Demo > sales_analytics` — `regions`, `products`, `customers`, and `sales`
+- Registers a **Sales by Region** flow (under `sales_analytics`) and runs it once so its output table is populated
+- Registers a **Daily FX Sync** flow (under `market`), schedules it with a `0 6 * * *` cron, and triggers an immediate first run
+
+`seed-demo` is idempotent — running it again skips tables and flows that already exist. To remove everything under the `Demo` catalog (tables, flows, schedules, and namespaces) in one call:
+
+```bash
+flowfile remove-demo
+```
+
+!!! note "Demo flows are the source of truth"
+    The seeded flows are imported from bundled YAML. Edit those flows in the designer and re-run them — they persist like any other registered flow until you run `flowfile remove-demo`.
 
 ---
 
@@ -60,14 +89,21 @@ A default catalog (`General`) and schema (`default`) are created automatically o
 
 ## Tabs
 
-The sidebar offers four tabs:
+The Catalog view is split into tabs:
 
-| Tab | Description |
-|-----|-------------|
-| **Catalog** | Browse the namespace tree with flows, tables, and artifacts |
-| **Favorites** | Your starred flows and tables for quick access |
-| **Run History** | Chronological list of all flow executions |
-| **Schedules** | Manage automated flow schedules — see [Schedules](schedules.md) |
+| Group | Tab | Description |
+|-------|-----|-------------|
+| Browse | **Catalog** | Browse the namespace tree with flows, tables, and artifacts |
+| Browse | **Favorites** | Your starred flows and tables for quick access |
+| Analyze | **SQL** | Query catalog tables — see [SQL Editor](sql-editor.md) |
+| Analyze | **Notebook** | Notebooks stored next to the data — see [Notebooks](notebooks.md) |
+| Analyze | **Visuals** | Charts and dashboards built on catalog tables — see [Visualizations](visualizations.md) |
+| Operate | **Run History** | Chronological list of all flow executions |
+| Operate | **Schedules** | Manage automated flow schedules — see [Schedules](schedules.md) |
+| Operate | **Alerts** | Send flow-run notifications to Slack, Teams, Discord, or a webhook — see [Alerts & Notifications](alerts.md) |
+| Operate | **APIs** | Publish flows as HTTP endpoints and manage their keys — see [Serve Flows as APIs](flow-api.md) |
+
+**Custom Nodes** and **Community Nodes** are no longer catalog tabs — open them from **Settings → Extensions** in the sidebar. See [Settings](../settings.md).
 
 ---
 
@@ -85,8 +121,12 @@ Register a flow to enable run tracking, artifact lineage, catalog table producti
 
 *Registering a flow file under a catalog schema*
 
-!!! tip "Auto-registration"
-    When you open or import a flow in the designer, it is automatically registered in the default namespace (`General > default`) if it isn't already. You don't need to manually register every flow — just the ones you want to organize into specific namespaces.
+!!! tip "When a flow joins the catalog"
+    A flow appears in the catalog when you **save it into a schema** — via the Save dialog's catalog tab, or **Register Flow** above. Simply opening a `.yaml` in the designer, or starting a flow from a template, leaves it out of the catalog: browsing is read-only.
+
+    Quick-created flows start as unregistered drafts — the file is written to the app's internal folder, but no catalog entry is made. A draft joins the catalog when you run it, or when you save it with **Also register in catalog** checked. Registering is what unlocks run history, schedules and API publishing.
+
+    Accumulated entries under `Unnamed Flows` or `Python Editor` can be cleared in one go: hover the schema in the catalog tree and use the broom action. Flows with published artifacts are kept.
 
 ### Flow Detail Panel
 
@@ -94,7 +134,7 @@ Click a registered flow to see its detail panel:
 
 - **Name** (editable inline) and description
 - **Metrics**: total runs, success rate, last run time, artifact count
-- **Actions**: Open in Designer, Run Flow, Cancel Run, Favorite, Delete
+- **Actions**: Open in Designer, Modify in notebook (opens the flow with the [canvas notebook](../notebook.md) already showing, where edits sync back to the canvas), Copy (the flow file as YAML, the notebook cells as a `# %%` Python script, or the FlowFrame / Polars export, all read from the flow file without opening it), Run Flow, Cancel Run, Favorite, Delete
 - **Recent Runs** table with status, duration, and trigger type
 - **Schedules** section — manage schedules for this flow (see [Schedules](schedules.md))
 - **Produced Artifacts** list
@@ -141,13 +181,13 @@ Click a run to see its full detail:
 
 Register data tables in the catalog for reuse across flows. Catalog tables come in two types:
 
-| Type | Icon | Description |
-|------|------|-------------|
-| **Physical** | <i class="fa-solid fa-table"></i> | Data materialized as a Delta table on disk — fast reads, version history, full schema preservation |
-| **Virtual** | <i class="fa-solid fa-bolt"></i> | No data on disk — executes a producer flow on demand to produce results. See [Virtual Flow Tables](virtual-tables.md) |
+| Type | Description |
+|------|-------------|
+| **Physical** | Data materialized as a Delta table on disk — fast reads, version history, full schema preservation |
+| **Virtual** | No data on disk — executes a producer flow on demand to produce results. See [Virtual Flow Tables](virtual-tables.md) |
 
 !!! tip "Recommended: Register tables via a flow"
-    Use a [Catalog Writer](../nodes/output.md#catalog-writer) node in your flow for the best experience. It supports more source types, ensures correct data interpretation, and enables lineage tracking.
+    Use a [Catalog Writer](../nodes/output.md#catalog-writer) node in your flow: it supports more source types, ensures correct data interpretation, and enables lineage tracking.
 
 ### Registering a Physical Table
 
@@ -205,7 +245,7 @@ The catalog tracks full data lineage — which flows produce and consume each ta
 | **Producer flow** | For [virtual tables](virtual-tables.md): the flow that produces data on demand |
 | **Consumer flows** | Flows that read from this table via Catalog Reader nodes |
 
-This lineage graph enables powerful automation: when a table is updated, any [table trigger schedule](schedules.md#table-trigger) watching it fires automatically, creating reactive data pipelines.
+This lineage graph drives automation: when a table is updated, any [table trigger schedule](schedules.md#table-trigger) watching it fires automatically, creating reactive data pipelines.
 
 ---
 
@@ -227,17 +267,23 @@ When you register a table or write via a [Catalog Writer](../nodes/output.md#cat
 3. Metadata is extracted: row count, column count, file size, and column schema (names + Polars data types)
 4. A database record links the table name, namespace, and file path
 
-**Storage location:**
+**Storage location:** the directory is resolved by `FLOWFILE_USER_DATA_DIR` (or `~/.flowfile` locally).
 
 | Environment | Path |
 |-------------|------|
 | Desktop / local | `~/.flowfile/catalog_tables/` |
-| Docker | `/data/user/catalog_tables/` (mapped via `FLOWFILE_USER_DATA_DIR`) |
+| Docker (code default) | `/data/user/catalog_tables/` |
+| Docker (shipped `docker-compose.yml`) | `/app/user_data/catalog_tables/` — the compose file sets `FLOWFILE_USER_DATA_DIR=/app/user_data` |
 
 **File naming:** Each Delta table directory is named `{table_name}_{uuid}` (e.g., `sales_data_a3f1b2c4/`). The UUID suffix ensures uniqueness even when multiple tables share similar names.
 
 !!! info "Flat storage"
     Namespaces (catalogs and schemas) are a **logical hierarchy** stored in the database — not filesystem directories. All Delta table directories live in a single flat storage directory. Table name uniqueness is enforced per namespace, so two schemas can each have a table called `customers` without conflict.
+
+**SCD2-tracked tables** are Delta tables like any other, plus four generated columns holding the row-level version history: `sk` (surrogate key), `valid_from`, `valid_to`, and `is_current`. See [Slowly Changing Dimensions](slowly-changing-dimensions.md) for what each column means and how history is written and read.
+
+!!! warning "Vacuum reaps Delta versions, never SCD2 rows"
+    Delta *table* version history (above) and SCD2 *row* version history are unrelated mechanisms. `vacuum` removes old Delta commit versions no longer needed for time travel, but every row an SCD2 write has ever inserted stays in the table's current data — vacuum never removes an SCD2 row version, because each one is live data, not a superseded table snapshot.
 
 ### Virtual Tables — No Storage
 
@@ -257,16 +303,33 @@ In the table detail panel, the **History** section shows:
 - **Version list** with timestamps, operation types, and metadata
 - **Preview at version** — select any historical version to see the data as it was at that point
 
-This is especially useful for auditing changes, debugging data quality issues, and understanding how a table evolved over time.
-
 !!! info "Delta versioning is only available for physical tables"
     Virtual tables have no physical storage and therefore no version history. If you need historical snapshots, use a physical table.
+
+### Change tracking
+
+Version history tells you what the whole table looked like at a past version. **Change tracking** tells you which rows changed between two versions: turn it on for a table and a Catalog Reader can read only the inserts, updates and deletes committed since its last run, keeping a cursor per consumer. It is off by default, enable-only, and only records commits made after it is turned on. See [Change Tracking](change-tracking.md).
+
+!!! warning "Vacuum can strand a cursor"
+    A change feed is readable only while the Delta history behind it is still on disk. A vacuum that would drop versions a cursor still needs is refused, with the option to vacuum anyway and reset the affected cursors.
 
 ---
 
 ## SQL Editor
 
 Query catalog tables directly using SQL. See the dedicated [SQL Editor](sql-editor.md) page for full documentation, examples, and the Save as Flow feature.
+
+---
+
+## Notebooks
+
+Notebooks live in the catalog next to the tables they analyze: Python and Markdown cells with code completions, Python executing on [Docker-isolated kernels](../kernels.md), cells reading and writing catalog tables directly through `flowfile_ctx`. See the dedicated [Notebooks](notebooks.md) page.
+
+---
+
+## Serve flows as APIs
+
+Publish a registered flow as an HTTP endpoint so other systems can run it on demand: `GET /api/data/{slug}` runs the flow synchronously and returns the output of its **API Response** node as JSON, authenticated with API keys, with flow parameters surfaced as query parameters. See the dedicated [Serve Flows as APIs](flow-api.md) page for publishing, keys and consumers, parameters, and run-time behavior.
 
 ---
 
@@ -278,15 +341,27 @@ Query catalog tables directly using SQL. See the dedicated [SQL Editor](sql-edit
 
 ## Global Artifacts
 
-Global artifacts are Python objects (ML models, DataFrames, configs) persisted in the catalog and accessible from any flow. They are published from [Kernel code](../kernels.md#global-artifacts-catalog) using `flowfile.publish_global()`.
+Global artifacts are Python objects (ML models, DataFrames, configs) persisted in the catalog and accessible from any flow. They are published from [Kernel code](../kernel-api.md#global-artifacts-catalog) using `flowfile_ctx.publish_global()`.
 
-Click an artifact in the tree to view its versions, metadata, and producing flow.
+Click an artifact in the tree to view its versions, metadata, and producing flow. Each publish adds a version; the tree shows one row per artifact (with a version count when there is more than one), and the detail panel pages through the full version list (25 at a time).
+
+Version management (available to the artifact's owner and anyone with a manage grant):
+
+| Action | Effect |
+|--------|--------|
+| **Restore** | Copies an older version forward as a new highest version, so it becomes what "latest" resolves to. History stays append-only — nothing is overwritten. Not offered on the latest version. |
+| **Delete version** | Permanently removes that version and its stored data. The latest version is protected; delete the artifact itself to remove it entirely. |
+| **Prune versions** | Keeps the newest *N* versions (always including the latest) and deletes the rest. Preview first — the dialog reports how many versions and how much space the prune would free before you commit. |
+
+!!! warning "Deletes are permanent"
+    Version deletes and prunes remove the stored object immediately. There is no trash window or undo.
 
 ---
 
 ## Related Documentation
 
 - [Virtual Flow Tables](virtual-tables.md) — Non-materialized tables with on-demand resolution
+- [Change Tracking](change-tracking.md) — Reading only the rows that changed since the last run
 - [Visualizations](visualizations.md) — Save Graphic Walker charts on top of catalog tables and SQL queries
 - [Schedules](schedules.md) — Automating flow execution with schedules and table triggers
 - [SQL Editor](sql-editor.md) — Ad-hoc SQL queries against catalog tables

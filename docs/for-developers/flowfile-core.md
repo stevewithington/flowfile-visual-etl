@@ -1,16 +1,11 @@
 # Flowfile Core: A Developer's Guide
 
-Welcome! This guide is for developers who want to understand, use, and contribute to `flowfile-core`. We'll dive into the architecture, see how data flows, and learn how to build powerful data pipelines.
+This guide walks `flowfile-core`'s architecture from the outside in — building a small pipeline in Python step by step, then explaining how the graph decides where each node runs.
 
-!!! info "Looking for the API docs?"
-    - **[Python API Reference for users](../users/python-api/index.md)**: If you want to USE Flowfile
-    - **[Design Philosophy](design-philosophy.md)**: If you want to understand WHY Flowfile works this way
-    - **This page**: If you want to understand HOW Flowfile works internally
-
-!!! tip "New to Flowfile?"
-    If you're looking for the high-level Python API, start with the [Python API Overview](../users/python-api/index.md). This guide dives into the internal architecture.
-
-Ready? Let's build something!
+!!! info "Looking for something else?"
+    - **[Python API Reference](../users/python-api/index.md)**: to USE Flowfile
+    - **[Design Philosophy](design-philosophy.md)**: to understand WHY Flowfile works this way
+    - **This page**: to understand HOW Flowfile works internally
 
 ---
 
@@ -21,7 +16,7 @@ At its heart, `flowfile-core` is composed of three main objects:
 
 1.  **`FlowGraph`**: The central orchestrator. It holds your pipeline, manages the nodes, and controls the execution flow.
 2.  **`FlowNode`**: An individual step in your pipeline. It's a wrapper around your settings and logic, making it an executable part of the graph.
-3.  **`FlowDataEngine`**: The data itself, which flows between nodes. It's a smart wrapper around a [Polars LazyFrame](https://pola-rs.github.io/polars/py-polars/html/reference/lazyframe/index.html), carrying both the data and its schema.
+3.  **`FlowDataEngine`**: The data itself, which flows between nodes. It's a wrapper around a [Polars LazyFrame](https://pola-rs.github.io/polars/py-polars/html/reference/lazyframe/index.html), carrying both the data and its schema.
 
 Let's see these in action.
 
@@ -29,7 +24,7 @@ Let's see these in action.
 
 ## 1. The FlowGraph: Your Pipeline Orchestrator
 
-Everything starts with the `FlowGraph`. Think of it as the canvas for your data pipeline.
+Everything starts with the `FlowGraph`. It is the in-memory representation of a pipeline — the same object the canvas edits.
 
 Let's create one:
 
@@ -90,9 +85,7 @@ It runs successfully but does nothing, as expected. The FlowGraph's job is to:
 Let's give it a node to manage.
 
 ## 2. Adding a Node: Where Settings Come to Life
-You don't add raw functions or data directly to the graph. Instead, you provide **settings objects** (which are just Pydantic models). The graph then transforms these settings into executable `FlowNodes`.
-
-Watch this:
+You don't add raw functions or data directly to the graph. Instead, you provide **settings objects** (Pydantic models). The graph turns these settings into executable `FlowNodes`.
 
 ```python
 from flowfile_core.schemas import input_schema
@@ -178,7 +171,7 @@ print(f"Nodes executed: {result.nodes_completed}/{len(graph.nodes)}")
 # Nodes executed: 1/2
 ```
 
-Only one node ran! Why? The graph is smart; it knows the filter node has no input, thus will never succeed running.
+Only one node ran. The graph knows the filter node has no input, so it can never run successfully and is skipped.
 
 <details markdown="1">
 <summary>Why the filter node was skipped</summary>
@@ -244,10 +237,10 @@ for node_result in result.node_step_result:
 #   - Node 2 ran successfully: True
 ```
 
-Success! Both nodes executed. The connection allowed data to flow from the input to the filter.
+Both nodes executed. The connection let data flow from the input to the filter.
 
 ## 4. The FlowDataEngine: The Data Carrier
-When data moves from one node to another, it's bundled up in a FlowDataEngine object. This isn't just raw data; it's an enhanced wrapper around a Polars LazyFrame.
+When data moves from one node to another, it's bundled up in a FlowDataEngine object. This isn't just raw data; it's a wrapper around a Polars LazyFrame.
 
 ```python
 # Let's inspect the data after the run
@@ -276,7 +269,7 @@ The `FlowDataEngine` is the boundary between `flowfile-core` and Polars. It:
 * Tracks metadata like record counts.
 * Manages lazy vs. eager execution.
 
-## 5. The Hash System: Smart Change Detection
+## 5. The Hash System: Change Detection
 How does the graph know when to re-run a node? Every `FlowNode` has a unique hash based on its configuration and its inputs.
 
 ```python
@@ -310,10 +303,10 @@ This hash is calculated from:
 This creates a chain of **dependency**. If you change a node, `flowfile-core` knows that it and all downstream nodes need to be re-run, while upstream nodes can use their cached results. This is crucial for efficiency.
 
 
-## 6. Schema Prediction: See the Future
-One of the most powerful features for interactive UI is **schema prediction**. A node can predict its output schema _without_ processing any data.
+## 6. Schema Prediction
+**Schema prediction** is what makes the interactive UI responsive: a node computes its output schema _without_ processing any data.
 
-Let's add a "formula" node to create a new column.
+Add a "formula" node to create a new column.
 
 ```python
 from flowfile_core.schemas.transform_schema import FunctionInput, FieldInput
@@ -351,7 +344,6 @@ print(f"\nHas the formula node run? {formula_node.node_stats.has_run_with_curren
 Predicted columns for Node 3:
   - name (Type: String)
   - age (Type: Int64)
-  - city (Type: String)
   - age_doubled (Type: Int64)
 ```
 </details>
@@ -379,7 +371,7 @@ Let's recap the entire lifecycle:
 * **Results Flow Through:** The data, wrapped in the `FlowDataEngine`, moves down the pipeline, getting transformed at each step.
 
 
-This architecture provides a powerful combination of flexibility, introspection, and performance, bridging the gap between a visual, no-code interface and a powerful, code-driven engine.
+This architecture combines flexibility, introspection, and performance, bridging a visual no-code interface and a code-driven engine that share one graph.
 
 
 
@@ -396,7 +388,7 @@ The behavior depends on two settings visible in the frontend:
 
 ### Execution Modes from the Frontend
 
-In the UI, users choose between **Development** and **Performance** mode. Here's what each mode does when running remotely:
+Users choose between **Development** and **Performance** mode in the UI. The [Technical Architecture page](architecture.md#execution-modes) is the canonical description of what each mode does; the section here focuses on how the mode maps to an execution *strategy* per node when running remotely.
 
 #### Development Mode (remote)
 
@@ -404,14 +396,16 @@ Development mode is the interactive, debugging-friendly mode. It produces **prev
 
 | Node type | What happens |
 |---|---|
-| **Narrow transforms** (select, sample, union) | Computation runs locally, only a 100-row sample is sent to the remote worker for preview (`LOCAL_WITH_SAMPLING`) |
-| **Wide transforms** (sort, record_count) | Entire computation runs on the remote worker (`REMOTE`) |
-| **Everything else** (filter, join, group_by, input nodes) | Entire computation runs on the remote worker (`REMOTE`) |
+| **Narrow transforms** (select, sample, union, filter) | Computation runs locally, only a 100-row sample is sent to the remote worker for preview (`LOCAL_WITH_SAMPLING`) |
+| **Wide transforms** (sort, record_count, join, group_by) | Entire computation runs on the remote worker (`REMOTE`) |
+| **Other nodes** (input nodes, manual_input) | Entire computation runs on the remote worker (`REMOTE`) |
 | **Any node with `cache_results` enabled** | Always fully remote regardless of transform type (`REMOTE`) |
 
 #### Performance Mode (remote)
 
-Performance mode skips preview data generation and only runs nodes when strictly necessary — output nodes, cache rebuilds, or nodes that have never run. Once a node has run, it is skipped on subsequent executions. No sampling takes place.
+Performance mode skips preview data generation — no sampling takes place, and no intermediate result is stored.
+
+Every node is still visited on every run: the performance-mode branch in `NodeExecutor._decide_execution` returns `should_run=True` unconditionally, ahead of the "has it already run?" check, so nothing is skipped on the basis of a previous execution. What changes is how much work a visit costs. An ordinary transform node only extends the Polars plan; it does not materialize and does not reach the worker. Only output nodes (in Core) and `cache_results` nodes (on the worker) produce a real result.
 
 #### Local Mode
 
@@ -502,26 +496,37 @@ The strategy routing depends on how nodes are classified in the node store:
 | select | narrow | LOCAL_WITH_SAMPLING | skip if already ran |
 | sample | narrow | LOCAL_WITH_SAMPLING | skip if already ran |
 | union | narrow | LOCAL_WITH_SAMPLING | skip if already ran |
+| filter | narrow | LOCAL_WITH_SAMPLING | skip if already ran |
 | sort | wide | REMOTE | skip if already ran |
 | record_count | wide | REMOTE | skip if already ran |
-| filter | other | REMOTE | skip if already ran |
-| join | other | REMOTE | skip if already ran |
-| group_by | other | REMOTE | skip if already ran |
+| join | wide | REMOTE | skip if already ran |
+| group_by | wide | REMOTE | skip if already ran |
 | manual_input | other | REMOTE | skip if already ran |
 
-Narrow transforms are defined with `transform_type="narrow"` in `configs/node_store/nodes.py`.
+Each node's `transform_type` (`narrow` / `wide` / `other`) is set in `configs/node_store/nodes.py`. Only `narrow` transforms take the `LOCAL_WITH_SAMPLING` path; `wide` and `other` go `REMOTE`.
 
 ---
 
 ## The FastAPI Service: Your API Layer
 
-While `FlowGraph`, `FlowNode`, and `FlowDataEngine` power the core pipeline logic, the **FastAPI service** is what makes it accessible from the outside world.
+While `FlowGraph`, `FlowNode`, and `FlowDataEngine` power the core pipeline logic, the **FastAPI service** exposes it over HTTP:
 
-Think of it as the **control panel** for your pipelines:
-
-- **HTTP interface** – Wraps the core Python objects in a REST API so UIs (like Flowfile’s) or other systems can create, run, and inspect flows via standard web requests.
-- **State management** – Keeps track of all active `FlowGraph` sessions. When the UI triggers a change, it’s really calling one of these endpoints, which updates the in-memory graph.
+- **HTTP interface** – Wraps the core Python objects in a REST API so UIs (like Flowfile's) or other systems can create, run, and inspect flows via standard web requests.
+- **State management** – Keeps track of all active `FlowGraph` sessions. When the UI triggers a change, it's really calling one of these endpoints, which updates the in-memory graph.
 - **Security** – Handles authentication and authorization so only the right users can access or modify flows.
-- **Data previews** – When you view a node’s output in the UI, the API calls `.get_resulting_data()` on the corresponding `FlowNode` and returns a sample to the client.
+- **Data previews** – When you view a node's output in the UI, the API calls `.get_resulting_data()` on the corresponding `FlowNode` and returns a sample to the client.
 
-In short: **FastAPI turns the in-memory power of `flowfile-core` into a secure, interactive web service**, enabling rich, real-time applications to be built on top of your pipelines.
+## The canvas notebook package
+
+`flowfile_core/notebook/` turns an open `FlowGraph` into notebook cells and back. Each step is a separate module:
+
+| Module | Role |
+|---|---|
+| `render.py` | `FlowGraph` → the FlowFrame export in the `ff.*` dialect, split into cells at its statements (a cell carries every node id of its statement), placeholders as `ff.canvas_node(...)`, and a `code_fingerprint` of settings (minus layout), edges and parameters that the notebook panel uses to skip layout-only changes and push uses as its precondition. A formula whose translation would need a `lambda` or the clock stays formula text, so every rendered cell can be interpreted. |
+| `runner.py` | `NotebookRunner`, the clean runner `main.py` installs at startup (`install_notebook_runner`). It refuses a request over its size bounds, then, as the requesting user and holding `flowfile_frame.notebook.RUN_LOCK` on the request thread, enters a sync on the canvas snapshot, runs the frame's `clean_run` with a fresh `CellInterpreter` and ends the mode. |
+| `interpret.py`, `allowlist.py` | The interpreter and its rules. `CellInterpreter` parses each cell with `ast.parse` and walks a small subset of statements and expressions; nothing a cell holds reaches `exec`, `eval` or `compile`. Every attribute read, call and subscript is looked up in `allowlist.py` by the exact type of the value it applies to and the attribute name; anything else fails on its line with "this needs a kernel". `allowlist.py` is pure data: a verdict for every `ff` name, the allowed attributes per receiver kind, the imports and generated `_` names the export uses, and the size bounds. |
+| `prechecks.py` | The canvas's path and connection rules (cloud paths; cloud, database and Kafka connections), applied when a cell places a source or writer, without opening a connection or decrypting a secret. |
+| `relabel.py`, `reconcile.py`, `compare.py` | Pure functions: map a clean run's node ids onto the canvas's by per-cell provenance, then compute the minimal list of editor operations between the live graph and the clean run. |
+| `push.py`, `bridge.py` | The push pipeline behind `POST /editor/notebook/push/` and its preview `POST /notebook/plan`: fingerprint check (409), clean run through the installed runner, refusals, reconcile. A push that names a `trigger` (`push` or `run`) applies nothing and answers `applied: false` with its warnings, deletions and parameter changes when `needs_confirmation` says that action reviews first; the client confirms and pushes again without it. A failed cell or a refusal answers 422 with `{message, cell_id, line, kind}`, where `kind` is `needs_kernel`, `refused` or `error`. |
+
+The routes live in `routes/notebook.py` (`/notebook/*`) plus `POST /editor/notebook/push/` and `POST /editor/notebook/run_lineage/` in `routes/routes.py`. Only those two are `editor/` routes, the two that change or run the canvas. Where `sharing.sharing_enabled()` (docker and package mode) plan and push require an admin (`routes/notebook.py::require_notebook_sync`); rendering and running do not. Core runs no notebook process: cell code is never executed as Python by core, which `tests/notebook/test_contract.py` checks over the whole corpus while it ratchets the `exec`/`eval`/`compile` call sites. The frame side is `flowfile_frame/notebook.py` (build mode and the sync) and `flowfile_frame/notebook_cells.py` (seed, snapshot session, execute through an executor, display, clean run); `exec_cell`, the executor that runs a cell as Python, is never passed by core.

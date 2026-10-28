@@ -16,7 +16,7 @@ Cases:
 * ``test_record_event_with_external_session`` — caller's session controls
   the transaction; rolling back yields zero rows.
 * ``test_record_event_logs_structured_line`` — the audit logger emits a
-  human-readable line for the existing logger pipeline (plan §6.5).
+  human-readable line for the existing logger pipeline.
 * ``test_query_events_filters`` — ``flow_id`` / ``user_id`` / ``session_id``
   / ``tool_name`` filters compose; default order is DESC by ``created_at``.
 * ``test_query_events_limit`` — ``limit`` caps the result set.
@@ -160,7 +160,6 @@ def test_record_event_truncates_oversize_args(local_user_id: int) -> None:
     assert row.tool_args is not None
     assert "__truncated__" in row.tool_args
     assert "__original_size__" in row.tool_args
-    # The persisted blob is much smaller than the original.
     assert len(row.tool_args.encode("utf-8")) < MAX_ARGS_BYTES * 2
 
 

@@ -10,16 +10,12 @@ import pytest
 from flowfile_core.schemas import input_schema, transform_schema
 
 
-# =============================================================================
 # Helpers
-# =============================================================================
 
 BASE_KWARGS = dict(flow_id=1, node_id=1)
 
 
-# =============================================================================
 # NodeBase (default)
-# =============================================================================
 
 class TestNodeBaseDescription:
     def test_default_returns_empty_string(self):
@@ -27,9 +23,7 @@ class TestNodeBaseDescription:
         assert node.get_default_description() == ""
 
 
-# =============================================================================
 # NodeFilter
-# =============================================================================
 
 class TestNodeFilterDescription:
     def test_basic_filter(self):
@@ -111,9 +105,7 @@ class TestNodeFilterDescription:
         assert node.get_default_description() == ""
 
 
-# =============================================================================
 # NodeJoin
-# =============================================================================
 
 class TestNodeJoinDescription:
     def test_inner_join_single_key(self):
@@ -157,9 +149,7 @@ class TestNodeJoinDescription:
         assert desc == "full join on a, b = c"
 
 
-# =============================================================================
 # NodeFuzzyMatch
-# =============================================================================
 
 class TestNodeFuzzyMatchDescription:
     def test_fuzzy_match_description(self):
@@ -177,9 +167,7 @@ class TestNodeFuzzyMatchDescription:
         assert node.get_default_description() == "Fuzzy left join on name ~ company_name"
 
 
-# =============================================================================
 # NodeFormula
-# =============================================================================
 
 class TestNodeFormulaDescription:
     def test_formula_description(self):
@@ -209,10 +197,115 @@ class TestNodeFormulaDescription:
         assert len(desc) <= 70  # name + " = " + truncated
         assert "..." in desc
 
+    def test_formula_multiple_entries(self):
+        node = input_schema.NodeFormula(
+            **BASE_KWARGS,
+            functions=[
+                transform_schema.FunctionInput(
+                    field=transform_schema.FieldInput(name=name), function=expression
+                )
+                for name, expression in [
+                    ("FullName", '[First] + " " + [Last]'),
+                    ("Domain", "right([Email], 8)"),
+                    ("IsInternal", '[Domain] = "acme.com"'),
+                    ("Tenure", "year(today())"),
+                    ("Segment", '"x"'),
+                ]
+            ],
+        )
+        assert node.get_default_description() == (
+            'FullName = [First] + " " + [Last]; Domain = right([Email], 8); +3 more'
+        )
 
-# =============================================================================
+    def test_formula_two_entries_has_no_more_suffix(self):
+        node = input_schema.NodeFormula(
+            **BASE_KWARGS,
+            functions=[
+                transform_schema.FunctionInput(
+                    field=transform_schema.FieldInput(name="a"), function="1"
+                ),
+                transform_schema.FunctionInput(
+                    field=transform_schema.FieldInput(name="b"), function="2"
+                ),
+            ],
+        )
+        assert node.get_default_description() == "a = 1; b = 2"
+
+
+# NodeMultiFieldFormula
+
+class TestNodeMultiFieldFormulaDescription:
+    @staticmethod
+    def _node(**kwargs) -> input_schema.NodeMultiFieldFormula:
+        return input_schema.NodeMultiFieldFormula(
+            **BASE_KWARGS,
+            multi_field_formula_input=transform_schema.MultiFieldFormulaInput(**kwargs),
+        )
+
+    def test_default_is_empty(self):
+        node = input_schema.NodeMultiFieldFormula(**BASE_KWARGS)
+        assert node.get_default_description() == ""
+
+    def test_blank_formula_is_empty(self):
+        assert self._node(formula="").get_default_description() == ""
+
+    def test_whitespace_only_formula_is_empty(self):
+        assert self._node(formula="   ").get_default_description() == ""
+
+    def test_all_columns_scope(self):
+        node = self._node(formula="[_CurrentField_] * 2", selection_mode="all")
+        assert node.get_default_description() == "[_CurrentField_] * 2 on all columns"
+
+    def test_list_scope_counts_selected_columns(self):
+        node = self._node(
+            formula="uppercase([_CurrentField_])",
+            selection_mode="list",
+            selected_columns=["a", "b", "c"],
+        )
+        assert node.get_default_description() == "uppercase([_CurrentField_]) on 3 column(s)"
+
+    def test_data_type_scope_names_the_group(self):
+        node = self._node(
+            formula="trim([_CurrentField_])",
+            selection_mode="data_type",
+            selected_data_type="String",
+        )
+        assert node.get_default_description() == "trim([_CurrentField_]) on String columns"
+
+    def test_data_type_scope_without_a_type(self):
+        node = self._node(formula="[_CurrentField_]", selection_mode="data_type")
+        assert node.get_default_description() == "[_CurrentField_] on (none) columns"
+
+    def test_new_mode_appends_the_output_pattern(self):
+        node = self._node(
+            formula="[_CurrentField_]",
+            selection_mode="all",
+            output_mode="new",
+            output_prefix="new_",
+            output_suffix="_pct",
+        )
+        assert node.get_default_description() == "[_CurrentField_] on all columns → new_*_pct"
+
+    def test_new_mode_with_only_a_suffix(self):
+        node = self._node(
+            formula="[_CurrentField_]",
+            selection_mode="list",
+            selected_columns=["jan"],
+            output_mode="new",
+            output_suffix=" % Total",
+        )
+        assert node.get_default_description() == "[_CurrentField_] on 1 column(s) → * % Total"
+
+    def test_replace_mode_has_no_output_pattern(self):
+        node = self._node(formula="[_CurrentField_]", selection_mode="all", output_prefix="ignored_")
+        assert node.get_default_description() == "[_CurrentField_] on all columns"
+
+    def test_long_expression_truncated(self):
+        node = self._node(formula="x" * 100, selection_mode="all")
+        assert node.get_default_description() == "x" * 57 + "... on all columns"
+
+
 # NodeGroupBy
-# =============================================================================
 
 class TestNodeGroupByDescription:
     def test_groupby_description(self):
@@ -233,9 +326,7 @@ class TestNodeGroupByDescription:
         assert node.get_default_description() == ""
 
 
-# =============================================================================
 # NodeSort
-# =============================================================================
 
 class TestNodeSortDescription:
     def test_sort_description(self):
@@ -253,9 +344,7 @@ class TestNodeSortDescription:
         assert node.get_default_description() == ""
 
 
-# =============================================================================
 # NodeSelect
-# =============================================================================
 
 class TestNodeSelectDescription:
     def test_select_with_renames(self):
@@ -283,9 +372,7 @@ class TestNodeSelectDescription:
         assert node.get_default_description() == ""
 
 
-# =============================================================================
 # NodeRead
-# =============================================================================
 
 class TestNodeReadDescription:
     def test_read_csv(self):
@@ -314,9 +401,7 @@ class TestNodeReadDescription:
         assert "(parquet)" in desc
 
 
-# =============================================================================
 # NodeOutput
-# =============================================================================
 
 class TestNodeOutputDescription:
     def test_output_csv(self):
@@ -332,9 +417,7 @@ class TestNodeOutputDescription:
         assert node.get_default_description() == "output.csv (csv)"
 
 
-# =============================================================================
 # NodeManualInput
-# =============================================================================
 
 class TestNodeManualInputDescription:
     def test_manual_input_with_data(self):
@@ -359,19 +442,23 @@ class TestNodeManualInputDescription:
         assert node.get_default_description() == ""
 
 
-# =============================================================================
 # NodeSample
-# =============================================================================
 
 class TestNodeSampleDescription:
     def test_sample_description(self):
         node = input_schema.NodeSample(**BASE_KWARGS, sample_size=500)
-        assert node.get_default_description() == "Sample 500 rows"
+        assert node.get_default_description() == "First 500 rows"
+
+    def test_random_sample_description(self):
+        node = input_schema.NodeSample(**BASE_KWARGS, sample_method="random", sample_size=500)
+        assert node.get_default_description() == "Random 500 rows"
+
+    def test_random_fraction_description(self):
+        node = input_schema.NodeSample(**BASE_KWARGS, sample_method="random_fraction", fraction=12.5)
+        assert node.get_default_description() == "Random 12.5% of rows"
 
 
-# =============================================================================
 # NodePivot
-# =============================================================================
 
 class TestNodePivotDescription:
     def test_pivot_description(self):
@@ -391,9 +478,7 @@ class TestNodePivotDescription:
         assert node.get_default_description() == ""
 
 
-# =============================================================================
 # NodeUnpivot
-# =============================================================================
 
 class TestNodeUnpivotDescription:
     def test_unpivot_with_columns(self):
@@ -417,9 +502,7 @@ class TestNodeUnpivotDescription:
         assert node.get_default_description() == "Unpivot numeric columns"
 
 
-# =============================================================================
 # NodeUnion
-# =============================================================================
 
 class TestNodeUnionDescription:
     def test_union_relaxed(self):
@@ -434,9 +517,7 @@ class TestNodeUnionDescription:
         assert node.get_default_description() == "Union (selective)"
 
 
-# =============================================================================
 # NodeUnique
-# =============================================================================
 
 class TestNodeUniqueDescription:
     def test_unique_with_columns(self):
@@ -454,9 +535,7 @@ class TestNodeUniqueDescription:
         assert node.get_default_description() == "Unique rows (keep any)"
 
 
-# =============================================================================
 # NodeGraphSolver
-# =============================================================================
 
 class TestNodeGraphSolverDescription:
     def test_graph_solver_description(self):
@@ -469,9 +548,29 @@ class TestNodeGraphSolverDescription:
         assert node.get_default_description() == "source -> target as 'component_id'"
 
 
-# =============================================================================
+# NodeExplodeHierarchy
+
+class TestNodeExplodeHierarchyDescription:
+    def test_with_quantity(self):
+        node = input_schema.NodeExplodeHierarchy(
+            **BASE_KWARGS,
+            explode_hierarchy_input=transform_schema.ExplodeHierarchyInput(
+                parent_column="assembly", child_column="component", quantity_column="qty"
+            ),
+        )
+        assert node.get_default_description() == "assembly -> component (totals, qty)"
+
+    def test_without_quantity(self):
+        node = input_schema.NodeExplodeHierarchy(
+            **BASE_KWARGS,
+            explode_hierarchy_input=transform_schema.ExplodeHierarchyInput(
+                parent_column="parent_account", child_column="account", output_detail="levels"
+            ),
+        )
+        assert node.get_default_description() == "parent_account -> account (levels)"
+
+
 # NodeRecordId
-# =============================================================================
 
 class TestNodeRecordIdDescription:
     def test_record_id_description(self):
@@ -495,9 +594,7 @@ class TestNodeRecordIdDescription:
         assert "category" in desc
 
 
-# =============================================================================
 # NodePolarsCode
-# =============================================================================
 
 class TestNodePolarsCodeDescription:
     def test_polars_code_description(self):
@@ -518,10 +615,24 @@ class TestNodePolarsCodeDescription:
         )
         assert node.get_default_description() == "df.filter("
 
+    @pytest.mark.parametrize(
+        "code, expected",
+        [
+            ("def f(a, /, b, *rest, k=1, **kw):\n    return a", "f(a, b, *rest, k, **kw)"),
+            ("def f(a, *, how='inner'):\n    return a", "f(a, *, how)"),
+            ('def f(a):\n    """Keep the big ones."""\n    return a', "Keep the big ones."),
+        ],
+        ids=["every_parameter_kind", "bare_star", "docstring"],
+    )
+    def test_polars_code_function_description(self, code, expected):
+        node = input_schema.NodePolarsCode(
+            **BASE_KWARGS,
+            polars_code_input=transform_schema.PolarsCodeInput(polars_code=code),
+        )
+        assert node.get_default_description() == expected
 
-# =============================================================================
+
 # NodeCrossJoin
-# =============================================================================
 
 class TestNodeCrossJoinDescription:
     def test_cross_join_description(self):
@@ -534,9 +645,7 @@ class TestNodeCrossJoinDescription:
         assert node.get_default_description() == "Cross join"
 
 
-# =============================================================================
 # NodeTextToRows
-# =============================================================================
 
 class TestNodeTextToRowsDescription:
     def test_text_to_rows_description(self):
@@ -551,9 +660,7 @@ class TestNodeTextToRowsDescription:
         assert node.get_default_description() == "Split tags by ','"
 
 
-# =============================================================================
 # NodeDatabaseReader
-# =============================================================================
 
 class TestNodeDatabaseReaderDescription:
     def test_read_table(self):
@@ -581,9 +688,7 @@ class TestNodeDatabaseReaderDescription:
         assert desc.startswith("Query: SELECT * FROM users")
 
 
-# =============================================================================
 # NodeDatabaseWriter
-# =============================================================================
 
 class TestNodeDatabaseWriterDescription:
     def test_write_table(self):
@@ -598,9 +703,7 @@ class TestNodeDatabaseWriterDescription:
         assert node.get_default_description() == "Write to output_table (append)"
 
 
-# =============================================================================
 # NodeExternalSource
-# =============================================================================
 
 class TestNodeExternalSourceDescription:
     def test_external_source_description(self):
@@ -612,9 +715,7 @@ class TestNodeExternalSourceDescription:
         assert node.get_default_description() == "sample_users"
 
 
-# =============================================================================
 # User description takes priority (integration check)
-# =============================================================================
 
 class TestUserDescriptionPriority:
     def test_user_description_is_preserved(self):
@@ -629,7 +730,5 @@ class TestUserDescriptionPriority:
                 ),
             ),
         )
-        # User description is stored in the field
         assert node.description == "My custom filter description"
-        # Auto-generated description is still available
         assert node.get_default_description() == "age > 30"

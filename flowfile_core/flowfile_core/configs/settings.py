@@ -26,6 +26,13 @@ FEATURE_FLAG_AI: MutableBool = MutableBool(
     os.environ.get("FEATURE_FLAG_AI", "1").strip().lower() in ("true", "1", "yes", "on")
 )
 
+# Gates the notebook code-intelligence (Jedi) bridge to the kernel. Mutable so the admin
+# endpoint can flip it live; when off, the `/lsp/*` surfaces degrade to empty 200 (never 503)
+# so the editor silently falls back to its client-side completion sources.
+FLOWFILE_LSP_ENABLED: MutableBool = MutableBool(
+    os.environ.get("FLOWFILE_LSP_ENABLED", "1").strip().lower() in ("true", "1", "yes", "on")
+)
+
 # When True, every LLM call appends a JSONL line to `{FLOWFILE_STORAGE_DIR}/ai_prompts/{YYYY-MM-DD}.jsonl` for debugging.
 FLOWFILE_AI_LOG_PROMPTS: MutableBool = MutableBool(
     os.environ.get("FLOWFILE_AI_LOG_PROMPTS", "0").strip().lower() in ("true", "1", "yes", "on")
@@ -36,12 +43,114 @@ FLOWFILE_AI_LOG_PROMPTS_SCRUB: MutableBool = MutableBool(
     os.environ.get("FLOWFILE_AI_LOG_PROMPTS_SCRUB", "0").strip().lower() in ("true", "1", "yes", "on")
 )
 
+# Ops opt-in for the `/project` git-tracking router in docker mode. The router is meant for
+# single-user/package use; in docker it 404s by default unless an operator deliberately enables
+# multi-tenant projects (the per-owner confinement in project/service.py then keeps tenants isolated).
+FLOWFILE_ENABLE_PROJECTS: MutableBool = MutableBool(
+    os.environ.get("FLOWFILE_ENABLE_PROJECTS", "0").strip().lower() in ("true", "1", "yes", "on")
+)
+
+# Re-check a custom node's file mtime/hash in ensure_class so on-disk edits reload without /rescan.
+FLOWFILE_CUSTOM_NODE_HOT_RELOAD: MutableBool = MutableBool(
+    os.environ.get("FLOWFILE_CUSTOM_NODE_HOT_RELOAD", "1").strip().lower() in ("true", "1", "yes", "on")
+)
+
+def get_catalog_storage_uri() -> str | None:
+    """Object-storage root for catalog table data, e.g. ``s3://bucket/catalog``.
+
+    Read per call (not cached at import) so it is honored when set at runtime / in tests.
+    ``None`` ⇒ catalog tables materialize on the local filesystem exactly as before.
+    """
+    return os.environ.get("FLOWFILE_CATALOG_STORAGE_URI") or None
+
+
+def get_catalog_storage_connection() -> str | None:
+    """Name of the ``CloudStorageConnection`` supplying credentials for the catalog backend.
+
+    Only consulted when ``get_catalog_storage_uri()`` is set; required in that case.
+    """
+    return os.environ.get("FLOWFILE_CATALOG_STORAGE_CONNECTION") or None
+
+
+COMMUNITY_DEFAULT_REPO = "edwardvaneechoud/flowfile-community-nodes"
+
+
+def get_community_index_url() -> str:
+    """Location of the community registry ``index.json``.
+
+    An ``https://`` URL in normal use; a local filesystem path switches the client
+    into fixture mode (index + artifacts read from disk — used by tests and for
+    trying the UI before the community repo exists). Read per call.
+    """
+    return (
+        os.environ.get("FLOWFILE_COMMUNITY_INDEX_URL")
+        or f"https://raw.githubusercontent.com/{COMMUNITY_DEFAULT_REPO}/main/index.json"
+    )
+
+
+def get_community_popularity_url() -> str:
+    """Sibling ``popularity.json``; derived from the index location unless overridden."""
+    override = os.environ.get("FLOWFILE_COMMUNITY_POPULARITY_URL")
+    if override:
+        return override
+    index_url = get_community_index_url()
+    base, _, _ = index_url.rpartition("/")
+    return f"{base}/popularity.json" if base else "popularity.json"
+
+
+def get_community_artifact_base() -> str:
+    """URL template for artifact downloads, with ``{commit}`` and ``{path}`` placeholders.
+
+    Defaults to jsDelivr pinned at the index's commit (immutable, edge-cached);
+    sha256 pins are verified after download regardless of the CDN.
+    """
+    return (
+        os.environ.get("FLOWFILE_COMMUNITY_ARTIFACT_BASE")
+        or f"https://cdn.jsdelivr.net/gh/{COMMUNITY_DEFAULT_REPO}@{{commit}}/{{path}}"
+    )
+
+
+def get_community_artifact_fallback() -> str:
+    """Fallback artifact template when the primary CDN fails (same commit-pinned bytes)."""
+    return (
+        os.environ.get("FLOWFILE_COMMUNITY_ARTIFACT_FALLBACK")
+        or f"https://raw.githubusercontent.com/{COMMUNITY_DEFAULT_REPO}/{{commit}}/{{path}}"
+    )
+
+
+def get_community_cache_ttl() -> int:
+    try:
+        return int(os.environ.get("FLOWFILE_COMMUNITY_CACHE_TTL", "3600"))
+    except ValueError:
+        return 3600
+
+
+# OAuth App client id for GitHub device-flow publishing ("Flowfile Community
+# Publishing", public by design; no secret exists). Empty ⇒ device flow disabled
+# (PAT paste + bundle download still work).
+COMMUNITY_GITHUB_CLIENT_ID_DEFAULT = "Ov23liiN1Z7z70Reg0zI"
+
+
+def get_community_github_client_id() -> str:
+    """Client id of the GitHub OAuth App used for device-flow publishing.
+
+    Empty ⇒ device flow disabled; the PAT-paste path and bundle download still work
+    (fixture mode never touches GitHub). Resolution: ``FLOWFILE_COMMUNITY_GITHUB_CLIENT_ID``
+    env var (an explicitly empty value force-disables — tests rely on this), then the
+    local ``.env`` file, then ``COMMUNITY_GITHUB_CLIENT_ID_DEFAULT`` (baked for releases).
+    Read per call; the ``.env`` file is snapshotted at import by Starlette ``Config``.
+    """
+    env_value = os.environ.get("FLOWFILE_COMMUNITY_GITHUB_CLIENT_ID")
+    if env_value is not None:
+        return env_value
+    return config("FLOWFILE_COMMUNITY_GITHUB_CLIENT_ID", cast=str, default="") or COMMUNITY_GITHUB_CLIENT_ID_DEFAULT
+
 
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Flowfile Backend Server")
     parser.add_argument("--host", type=str, default=DEFAULT_SERVER_HOST, help="Host to bind to")
-    parser.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT, help="Port to bind to")
+    parser.add_argument("--port", type=int, help="Port to bind to")
     parser.add_argument(
         "--worker-port",
         type=int,
@@ -54,7 +163,6 @@ def parse_args():
 
 def get_temp_dir() -> str:
     """Get the appropriate temp directory path based on environment"""
-    # Check for Docker environment variable first
     docker_temp = os.getenv("TEMP_DIR")
     if docker_temp:
         return docker_temp
@@ -69,13 +177,11 @@ def get_default_worker_url(worker_port=None):
     Args:
         worker_port: Optional port override (used when passed as command line arg)
     """
-    # Check for Docker environment first
     worker_host = os.getenv("WORKER_HOST", None)
 
     if worker_port is None:
         worker_port = os.getenv("FLOWFILE_WORKER_PORT", DEFAULT_WORKER_PORT)
 
-    # Convert to int if it's a string
     worker_port = int(worker_port) if isinstance(worker_port, str) else worker_port
 
     if worker_host:
@@ -92,13 +198,13 @@ def get_default_worker_url(worker_port=None):
 args = parse_args()
 
 SERVER_HOST = args.host if args.host is not None else DEFAULT_SERVER_HOST
-SERVER_PORT = args.port if args.port is not None else DEFAULT_SERVER_PORT
+SERVER_PORT = args.port if args.port is not None else int(os.getenv("CORE_PORT", DEFAULT_SERVER_PORT))
 WORKER_PORT = (
     args.worker_port if args.worker_port is not None else int(os.getenv("FLOWFILE_WORKER_PORT", DEFAULT_WORKER_PORT))
 )
 WORKER_HOST = os.getenv("WORKER_HOST", "0.0.0.0" if platform.system() != "Windows" else "127.0.0.1")
 
-config = Config(".env")
+config = Config(".env" if os.path.isfile(".env") else None)
 DEBUG: bool = config("DEBUG", cast=bool, default=False)
 FILE_LOCATION = config("FILE_LOCATION", cast=str, default=".\\files\\")
 AVAILABLE_RAM = config("AVAILABLE_RAM", cast=int, default=8)

@@ -22,6 +22,7 @@ Example
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
 from flowfile_core.catalog import (
@@ -30,21 +31,25 @@ from flowfile_core.catalog import (
     SQLAlchemyCatalogRepository,
 )
 from flowfile_core.database.connection import get_db_context
+from flowfile_frame import _metadata
+from flowfile_frame._identity import current_user_id
+from flowfile_frame._metadata import Namespace
+from flowfile_frame.notebook import refuse
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
-    from flowfile_core.database.models import CatalogNamespace
     from flowfile_core.flowfile.flow_graph import FlowGraph
     from flowfile_core.schemas.catalog_schema import CatalogTableOut
     from flowfile_frame.flow_frame import FlowFrame
+    from flowfile_frame.run_flow import FlowRef
 
-WriteMode: TypeAlias = Literal["overwrite", "error", "append", "upsert", "update", "delete", "virtual"]
+WriteMode: TypeAlias = Literal["overwrite", "error", "append", "upsert", "update", "delete", "scd2", "virtual"]
 
 
 def _get_current_user_id() -> int:
-    """User id used for ownership in single-user mode (matches catalog.py)."""
-    return 1
+    """User id used for ownership (matches catalog.py); see ``_identity.current_user_id``."""
+    return current_user_id()
 
 
 def _get_service(db: Session) -> CatalogService:
@@ -112,7 +117,7 @@ class CatalogReference:
         object.__setattr__(self, "id", ns.id)
 
     @classmethod
-    def _from_namespace(cls, ns: CatalogNamespace) -> CatalogReference:
+    def _from_namespace(cls, ns: Namespace) -> CatalogReference:
         instance = object.__new__(cls)
         object.__setattr__(instance, "name", ns.name)
         object.__setattr__(instance, "id", ns.id)
@@ -162,11 +167,19 @@ class CatalogReference:
         """
         return SchemaReference(self, name, auto_create=auto_create, description=description)
 
+    def get_schema(
+        self,
+        name: str,
+        *,
+        auto_create: bool = False,
+        description: str | None = None,
+    ) -> SchemaReference:
+        """Alias of :meth:`schema`, named like ``flowfile_ctx.get_catalog(...).get_schema(...)``."""
+        return self.schema(name, auto_create=auto_create, description=description)
+
     def list_schemas(self) -> list[SchemaReference]:
         """Return all schemas (level-1 namespaces) under this catalog."""
-        with get_db_context() as db:
-            namespaces = _get_service(db).list_namespaces(parent_id=self.id)
-            return [SchemaReference._from_namespace(self, ns) for ns in namespaces]
+        return [SchemaReference._from_namespace(self, ns) for ns in _metadata.namespaces(self.id)]
 
     def list_tables(self) -> list[CatalogTableOut]:
         """Return tables across every schema in this catalog (flat list).
@@ -174,14 +187,10 @@ class CatalogReference:
         Each row's ``namespace_id`` identifies which schema it belongs to.
         Use :meth:`SchemaReference.list_tables` for a single-schema view.
         """
-        with get_db_context() as db:
-            service = _get_service(db)
-            schemas = service.list_namespaces(parent_id=self.id)
-            user_id = _get_current_user_id()
-            tables: list[CatalogTableOut] = []
-            for schema in schemas:
-                tables.extend(service.list_tables(namespace_id=schema.id, user_id=user_id))
-            return tables
+        tables: list[CatalogTableOut] = []
+        for schema in _metadata.namespaces(self.id):
+            tables.extend(_metadata.tables(schema.id))
+        return tables
 
 
 class SchemaReference:
@@ -242,7 +251,7 @@ class SchemaReference:
         object.__setattr__(self, "id", ns.id)
 
     @classmethod
-    def _from_namespace(cls, catalog: CatalogReference, ns: CatalogNamespace) -> SchemaReference:
+    def _from_namespace(cls, catalog: CatalogReference, ns: Namespace) -> SchemaReference:
         instance = object.__new__(cls)
         object.__setattr__(instance, "catalog", catalog)
         object.__setattr__(instance, "name", ns.name)
@@ -276,17 +285,52 @@ class SchemaReference:
 
     def list_tables(self) -> list[CatalogTableOut]:
         """Return tables registered in this schema."""
-        with get_db_context() as db:
-            return _get_service(db).list_tables(
-                namespace_id=self.id,
-                user_id=_get_current_user_id(),
-            )
+        return _metadata.tables(self.id)
+
+    def get_flow(self, name: str) -> FlowRef:
+        """Return the flow registered under ``name`` in this schema.
+
+        Raises ``NativeNodeError`` when there is none or the name is registered twice, chained from
+        :class:`flowfile_core.catalog.FlowNotFoundError` or :class:`flowfile_core.catalog.AmbiguousFlowError`.
+        Equivalent to ``flowfile_frame.flow_ref(self, name)``.
+        """
+        from flowfile_frame.run_flow import flow_ref
+
+        return flow_ref(self, name)
+
+    def list_flows(self) -> list[FlowRef]:
+        """Return the flows registered in this schema, by name."""
+        from flowfile_frame.run_flow import _list_flow_refs
+
+        return _list_flow_refs(self)
+
+    def register_flow(
+        self,
+        flow_or_frame: FlowGraph | FlowFrame,
+        *,
+        name: str,
+        overwrite: bool = False,
+    ) -> FlowRef:
+        """Save a flow and register it in this schema under ``name``.
+
+        Equivalent to ``flowfile_frame.register_flow(flow_or_frame, name=name, schema=self)``.
+        """
+        from flowfile_frame.run_flow import register_flow
+
+        return register_flow(flow_or_frame, name=name, schema=self, overwrite=overwrite)
 
     def read_table(
         self,
         name: str,
         *,
         delta_version: int | None = None,
+        scd2_view: Literal["active", "all", "active_at"] | None = None,
+        scd2_as_of: str | datetime | None = None,
+        changes_since: int | str | datetime | None = None,
+        changes_consumer: str | None = None,
+        changes_start: Literal["now", "beginning"] = "now",
+        include_change_preimage: bool = False,
+        description: str | None = None,
         flow_graph: FlowGraph | None = None,
     ) -> FlowFrame:
         """Read a table from this schema as a :class:`FlowFrame`.
@@ -300,6 +344,45 @@ class SchemaReference:
             name,
             schema=self,
             delta_version=delta_version,
+            scd2_view=scd2_view,
+            scd2_as_of=scd2_as_of,
+            changes_since=changes_since,
+            changes_consumer=changes_consumer,
+            changes_start=changes_start,
+            include_change_preimage=include_change_preimage,
+            description=description,
+            flow_graph=flow_graph,
+        )
+
+    def read_catalog_table(
+        self,
+        name: str,
+        *,
+        delta_version: int | None = None,
+        scd2_view: Literal["active", "all", "active_at"] | None = None,
+        scd2_as_of: str | datetime | None = None,
+        changes_since: int | str | datetime | None = None,
+        changes_consumer: str | None = None,
+        changes_start: Literal["now", "beginning"] = "now",
+        include_change_preimage: bool = False,
+        description: str | None = None,
+        flow_graph: FlowGraph | None = None,
+    ) -> FlowFrame:
+        """Read a table from this schema as a :class:`FlowFrame`; an alias of :meth:`read_table`.
+
+        Named after ``flowfile_frame.read_catalog_table``, like ``flowfile_ctx``'s
+        ``SchemaRef.read_catalog_table``.
+        """
+        return self.read_table(
+            name,
+            delta_version=delta_version,
+            scd2_view=scd2_view,
+            scd2_as_of=scd2_as_of,
+            changes_since=changes_since,
+            changes_consumer=changes_consumer,
+            changes_start=changes_start,
+            include_change_preimage=include_change_preimage,
+            description=description,
             flow_graph=flow_graph,
         )
 
@@ -310,23 +393,59 @@ class SchemaReference:
         *,
         write_mode: WriteMode = "overwrite",
         merge_keys: list[str] | None = None,
+        partition_by: list[str] | None = None,
+        scd2_compare_columns: list[str] | None = None,
+        scd2_full_snapshot: bool = False,
+        scd2_surrogate_key_column: str = "sk",
+        scd2_valid_from_column: str = "valid_from",
+        scd2_valid_to_column: str = "valid_to",
+        scd2_is_current_column: str = "is_current",
+        scd2_partition_on_current: bool = True,
+        scd2_output_mode: Literal["input", "changed", "current"] = "input",
+        track_changes: bool = False,
         description: str | None = None,
-    ) -> None:
-        """Write a :class:`FlowFrame` to a table in this schema."""
-        df.write_catalog_table(
+    ) -> FlowFrame:
+        """Write a :class:`FlowFrame` to a table in this schema.
+
+        Returns the written frame; an ``scd2`` write carries the four generated columns, selected
+        by *scd2_output_mode* (see :meth:`FlowFrame.write_catalog_table`).
+        """
+        return df.write_catalog_table(
             table_name=name,
             schema=self,
             write_mode=write_mode,
             merge_keys=merge_keys,
+            partition_by=partition_by,
+            scd2_compare_columns=scd2_compare_columns,
+            scd2_full_snapshot=scd2_full_snapshot,
+            scd2_surrogate_key_column=scd2_surrogate_key_column,
+            scd2_valid_from_column=scd2_valid_from_column,
+            scd2_valid_to_column=scd2_valid_to_column,
+            scd2_is_current_column=scd2_is_current_column,
+            scd2_partition_on_current=scd2_partition_on_current,
+            scd2_output_mode=scd2_output_mode,
+            track_changes=track_changes,
             description=description,
         )
 
 
+def get_catalog(name: str) -> CatalogReference:
+    """Return the existing catalog ``name``, like ``CatalogReference(name)``.
+
+    Named like ``flowfile_ctx.get_catalog`` so ``get_catalog(...).get_schema(...).get_flow(...)``
+    reads the same in a script and in a kernel.
+
+    Raises
+    ------
+    flowfile_core.catalog.NamespaceNotFoundError
+        The catalog does not exist.
+    """
+    return CatalogReference(name)
+
+
 def list_catalogs() -> list[CatalogReference]:
     """Return every catalog (level-0 namespace) in the backend."""
-    with get_db_context() as db:
-        namespaces = _get_service(db).list_namespaces(parent_id=None)
-        return [CatalogReference._from_namespace(ns) for ns in namespaces]
+    return [CatalogReference._from_namespace(ns) for ns in _metadata.namespaces(None)]
 
 
 def default_schema() -> SchemaReference:
@@ -337,21 +456,18 @@ def default_schema() -> SchemaReference:
     LookupError
         If the default schema has not been initialized.
     """
-    with get_db_context() as db:
-        service = _get_service(db)
-        default_id = service.get_default_namespace_id()
-        if default_id is None:
-            raise LookupError(
-                "Default schema 'General/default' is not initialized. "
-                "Create it by running the catalog seeding routine, or pass an explicit "
-                "CatalogReference / SchemaReference."
-            )
-        schema_ns = service.get_namespace(default_id)
-        if schema_ns.parent_id is None:
-            raise LookupError("Default namespace has no parent catalog (data integrity issue).")
-        catalog_ns = service.get_namespace(schema_ns.parent_id)
-        catalog = CatalogReference._from_namespace(catalog_ns)
-        return SchemaReference._from_namespace(catalog, schema_ns)
+    default_id = _metadata.default_namespace_id()
+    schema_ns = _metadata.namespace(default_id) if default_id is not None else None
+    if schema_ns is None:
+        raise LookupError(
+            "Default schema 'General/default' is not initialized. "
+            "Create it by running the catalog seeding routine, or pass an explicit "
+            "CatalogReference / SchemaReference."
+        )
+    catalog_ns = _metadata.namespace(schema_ns.parent_id) if schema_ns.parent_id is not None else None
+    if catalog_ns is None:
+        raise LookupError("Default namespace has no parent catalog (data integrity issue).")
+    return SchemaReference._from_namespace(CatalogReference._from_namespace(catalog_ns), schema_ns)
 
 
 def _resolve_namespace_id(
@@ -375,29 +491,29 @@ def _resolve_catalog(
     *,
     auto_create: bool,
     description: str | None,
-) -> CatalogNamespace:
+) -> Namespace:
     from flowfile_core.catalog import NamespaceNotFoundError
 
+    existing = _metadata.namespace_by_name(name, None)
+    if existing is not None:
+        return existing
+    if not auto_create:
+        raise NamespaceNotFoundError(name=name)
+    refuse(f"Creating the catalog {name!r} (auto_create=True)", "writes to the catalog")
     with get_db_context() as db:
         service = _get_service(db)
-        repo = service.repo
-        existing = repo.get_namespace_by_name(name, parent_id=None)
-        if existing is not None:
-            return existing
-        if not auto_create:
-            raise NamespaceNotFoundError(name=name)
         try:
-            return service.create_namespace(
+            created = service.create_namespace(
                 name=name,
                 owner_id=_get_current_user_id(),
                 parent_id=None,
                 description=description,
             )
         except NamespaceExistsError:
-            existing = repo.get_namespace_by_name(name, parent_id=None)
-            if existing is None:
+            created = service.repo.get_namespace_by_name(name, parent_id=None)
+            if created is None:
                 raise
-            return existing
+        return Namespace.from_row(created)
 
 
 def _resolve_schema(
@@ -406,26 +522,26 @@ def _resolve_schema(
     *,
     auto_create: bool,
     description: str | None,
-) -> CatalogNamespace:
+) -> Namespace:
     from flowfile_core.catalog import NamespaceNotFoundError
 
+    existing = _metadata.namespace_by_name(name, catalog.id)
+    if existing is not None:
+        return existing
+    if not auto_create:
+        raise NamespaceNotFoundError(name=f"{catalog.name}.{name}")
+    refuse(f"Creating the schema {catalog.name}.{name} (auto_create=True)", "writes to the catalog")
     with get_db_context() as db:
         service = _get_service(db)
-        repo = service.repo
-        existing = repo.get_namespace_by_name(name, parent_id=catalog.id)
-        if existing is not None:
-            return existing
-        if not auto_create:
-            raise NamespaceNotFoundError(name=f"{catalog.name}.{name}")
         try:
-            return service.create_namespace(
+            created = service.create_namespace(
                 name=name,
                 owner_id=_get_current_user_id(),
                 parent_id=catalog.id,
                 description=description,
             )
         except NamespaceExistsError:
-            existing = repo.get_namespace_by_name(name, parent_id=catalog.id)
-            if existing is None:
+            created = service.repo.get_namespace_by_name(name, parent_id=catalog.id)
+            if created is None:
                 raise
-            return existing
+        return Namespace.from_row(created)

@@ -41,7 +41,6 @@ def _start_core_server() -> bool:
     """
     global _core_server_thread, _core_server_instance
 
-    # Check if already running
     try:
         with httpx.Client(timeout=2.0) as client:
             resp = client.get(f"http://localhost:{CORE_TEST_PORT}/health/status")
@@ -70,7 +69,6 @@ def _start_core_server() -> bool:
     _core_server_thread = threading.Thread(target=run_server, daemon=True)
     _core_server_thread.start()
 
-    # Wait for server to become healthy
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         try:
@@ -101,8 +99,8 @@ def _stop_core_server() -> None:
         logger.info("Core API server stopped")
 
 
-def _build_kernel_image() -> bool:
-    """Build the flowfile-kernel Docker image from kernel_runtime/."""
+def _build_kernel_image(image_tag: str) -> bool:
+    """Build the flowfile-kernel Docker image from kernel_runtime/ with the given tag."""
     dockerfile = _REPO_ROOT / "kernel_runtime" / "Dockerfile"
     context = _REPO_ROOT / "kernel_runtime"
 
@@ -111,23 +109,22 @@ def _build_kernel_image() -> bool:
 
     if not dockerfile.exists():
         logger.error("Dockerfile not found at %s", dockerfile)
-        # List contents of kernel_runtime directory if it exists
         if context.exists():
             logger.error("Contents of %s: %s", context, list(context.iterdir()))
         else:
             logger.error("Context directory %s does not exist", context)
         return False
 
-    logger.info("Building Docker image '%s' ...", KERNEL_IMAGE)
+    logger.info("Building Docker image '%s' ...", image_tag)
     try:
         result = subprocess.run(
-            ["docker", "build", "-t", KERNEL_IMAGE, "-f", str(dockerfile), str(context)],
+            ["docker", "build", "-t", image_tag, "-f", str(dockerfile), str(context)],
             check=True,
             capture_output=True,
             text=True,
             timeout=300,
         )
-        logger.info("Docker image '%s' built successfully", KERNEL_IMAGE)
+        logger.info("Docker image '%s' built successfully", image_tag)
         logger.debug("Build stdout: %s", result.stdout)
         return True
     except subprocess.CalledProcessError as exc:
@@ -174,7 +171,7 @@ def managed_kernel(
 
         # Tests requiring Core API (global artifacts)
         with managed_kernel(start_core=True) as (manager, kernel_id):
-            # kernel can now call flowfile.publish_global() etc.
+            # kernel can now call flowfile_ctx.publish_global() etc.
             result = await manager.execute(kernel_id, request)
     """
     from flowfile_core.kernel.manager import KernelManager
@@ -184,27 +181,24 @@ def managed_kernel(
     kernel_id = KERNEL_TEST_ID_WITH_CORE if start_core else KERNEL_TEST_ID
     container_name = f"flowfile-kernel-{kernel_id}"
 
-    # Track what we need to clean up
     core_started_by_us = False
     original_token = None
+    original_cached_token = None
     original_core_url = None
     original_shared_dir = None
+    original_kernel_image = os.environ.get("FLOWFILE_KERNEL_IMAGE")
 
-    # 1 — Create temp shared volume FIRST (needed for storage config)
-    shared_dir = tempfile.mkdtemp(prefix="kernel_test_shared_")
-
-    # Configure storage to use this shared directory (must be done before Core starts)
-    # This ensures Core and kernel use the same paths for artifact staging
+    # 1 — Reuse the session-pinned shared dir; a fresh one here would desync the running worker.
     original_shared_dir = os.environ.get("FLOWFILE_SHARED_DIR")
+    shared_dir = original_shared_dir or str(Path(tempfile.mkdtemp(prefix="kernel_test_shared_")).resolve())
     os.environ["FLOWFILE_SHARED_DIR"] = shared_dir
-    logger.info("Set FLOWFILE_SHARED_DIR=%s for artifact staging", shared_dir)
+    logger.info("Using FLOWFILE_SHARED_DIR=%s for the kernel shared volume", shared_dir)
 
     # Reset storage singletons so they pick up the new path
     from shared.storage_config import FlowfileStorage
     import shared.storage_config as storage_module
     storage_module.storage = FlowfileStorage()
 
-    # Reset artifact storage backend singleton
     from flowfile_core.artifacts import reset_storage_backend
     reset_storage_backend()
 
@@ -212,8 +206,14 @@ def managed_kernel(
     if start_core:
         # Save original values to restore later
         original_token = os.environ.get("FLOWFILE_INTERNAL_TOKEN")
-        internal_token = secrets.token_hex(32)
+        # Reuse an existing token: a session worker may already have latched it.
+        internal_token = os.environ.get("FLOWFILE_INTERNAL_TOKEN") or secrets.token_hex(32)
         os.environ["FLOWFILE_INTERNAL_TOKEN"] = internal_token
+        # The module cache may already be warm from an earlier test, which would
+        # silently ignore the fresh token above.
+        import flowfile_core.auth.jwt as jwt_module
+        original_cached_token = jwt_module._internal_token
+        jwt_module._internal_token = None
         logger.info("Set FLOWFILE_INTERNAL_TOKEN for kernel ↔ Core auth")
 
         # Set FLOWFILE_CORE_URL so kernel can reach Core
@@ -225,9 +225,17 @@ def managed_kernel(
             raise RuntimeError("Could not start Core API server for integration tests")
         core_started_by_us = True
 
-    # 3 — Build image
-    if not _build_kernel_image():
-        raise RuntimeError("Could not build flowfile-kernel Docker image")
+    # 3 — Resolve kernel image. If a workflow pre-built one and pointed core at
+    # it via FLOWFILE_KERNEL_IMAGE, trust that and skip the build (saves ~30 s).
+    # Otherwise build with the default test tag and tell core to use it.
+    preset_image = (original_kernel_image or "").strip()
+    if preset_image:
+        logger.info("Using pre-set kernel image: %s", preset_image)
+    else:
+        if not _build_kernel_image(KERNEL_IMAGE):
+            raise RuntimeError("Could not build flowfile-kernel Docker image")
+        os.environ["FLOWFILE_KERNEL_IMAGE"] = KERNEL_IMAGE
+        logger.info("Built kernel image and registered FLOWFILE_KERNEL_IMAGE=%s", KERNEL_IMAGE)
 
     # 4 — Ensure stale container is removed
     _remove_container(container_name)
@@ -278,10 +286,11 @@ def managed_kernel(
         # Belt-and-suspenders: force-remove the container
         _remove_container(container_name)
 
-        # Clean up shared dir
-        import shutil
+        # Only remove a dir we minted; a session-pinned one outlives us
+        if original_shared_dir is None:
+            import shutil
 
-        shutil.rmtree(shared_dir, ignore_errors=True)
+            shutil.rmtree(shared_dir, ignore_errors=True)
 
         # Stop Core server if we started it
         if core_started_by_us:
@@ -292,6 +301,11 @@ def managed_kernel(
             os.environ["FLOWFILE_SHARED_DIR"] = original_shared_dir
         else:
             os.environ.pop("FLOWFILE_SHARED_DIR", None)
+
+        if original_kernel_image is not None:
+            os.environ["FLOWFILE_KERNEL_IMAGE"] = original_kernel_image
+        else:
+            os.environ.pop("FLOWFILE_KERNEL_IMAGE", None)
 
         # Reset storage singletons to pick up original paths
         from shared.storage_config import FlowfileStorage
@@ -305,6 +319,8 @@ def managed_kernel(
                 os.environ["FLOWFILE_INTERNAL_TOKEN"] = original_token
             else:
                 os.environ.pop("FLOWFILE_INTERNAL_TOKEN", None)
+            import flowfile_core.auth.jwt as jwt_module
+            jwt_module._internal_token = original_cached_token
             if original_core_url is not None:
                 os.environ["FLOWFILE_CORE_URL"] = original_core_url
             else:

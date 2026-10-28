@@ -1,18 +1,49 @@
 // Dashboards — TS mirror of flowfile_core/schemas/catalog_schema.py
-// (DashboardTile / DashboardGrid / DashboardFilter / DashboardLayout / Dashboard).
 
-export type DashboardTileType = "viz" | "text";
+import type { AccessInfo } from "./sharing.types";
+
+export type DashboardTileType = "viz" | "text" | "separator" | "kpi";
+export type SeparatorOrientation = "horizontal" | "vertical";
+export type KpiAgg = "sum" | "mean" | "median" | "min" | "max" | "count" | "distinctCount";
+export type KpiComparison = "none" | "target" | "previous_period";
+export type KpiValueSize = "auto" | "sm" | "md" | "lg" | "xl";
+
+export interface DashboardKpi {
+  /** null with agg "count" = row count. */
+  field: string | null;
+  agg: KpiAgg;
+  label?: string | null;
+  prefix?: string | null;
+  suffix?: string | null;
+  /** null = auto. */
+  decimals?: number | null;
+  compact?: boolean;
+  comparison?: KpiComparison;
+  target?: number | null;
+  higher_is_better?: boolean;
+  /** Fixed number size; "auto" fits the tile. */
+  value_size?: KpiValueSize;
+}
 
 export interface DashboardTile {
   /** Client-generated UUID, stable across saves so component state survives. */
   id: string;
   type: DashboardTileType;
-  /** Required when type === "viz". */
+  /** Required when type === "viz"; the KPI's source when type === "kpi". */
   viz_id: number | null;
   /** Which entry of CatalogVisualization.spec[] to render. */
   chart_index: number;
   /** Markdown source when type === "text". */
   text_md?: string | null;
+  /** CSS colors for text tiles. */
+  bg_color?: string | null;
+  text_color?: string | null;
+  /** Separator styling (type === "separator"); absent means a 1px default-colour horizontal line. */
+  orientation?: SeparatorOrientation | null;
+  thickness?: number | null;
+  line_color?: string | null;
+  /** Headline-number config when type === "kpi"; the source is viz_id. */
+  kpi?: DashboardKpi | null;
   x: number;
   y: number;
   w: number;
@@ -42,7 +73,15 @@ export interface DashboardFilter {
    * populated from that table's schema_columns. Null = legacy / untied.
    */
   datasource_id: number | null;
+  /**
+   * "datasource" (default, also when absent on legacy layouts) applies only
+   * to tiles reading from `datasource_id`; "all" applies to every targeted
+   * tile whose data has a column named `field_name` of a compatible type.
+   */
+  scope?: DashboardFilterScope;
 }
+
+export type DashboardFilterScope = "datasource" | "all";
 
 export interface DashboardLayout {
   tiles: DashboardTile[];
@@ -61,6 +100,7 @@ export interface Dashboard {
   created_by: number | null;
   created_at: string;
   updated_at: string;
+  access?: AccessInfo | null;
 }
 
 export interface DashboardCreatePayload {
@@ -75,10 +115,21 @@ export interface DashboardUpdatePayload {
   description?: string | null;
   namespace_id?: number | null;
   layout?: DashboardLayout;
+  /** CAS guard: server 409s with detail.error "stale_write" when layout_version has moved on. */
+  expected_layout_version?: number;
 }
+
+/** Current grid resolution. v1 layouts used 12 columns; see gridVersion.ts for the upgrade. */
+export const DASHBOARD_GRID_COLS = 48;
+export const DASHBOARD_GRID_VERSION = 2;
+export const DASHBOARD_GRID_ROW_HEIGHT = 40;
 
 export const EMPTY_DASHBOARD_LAYOUT: DashboardLayout = {
   tiles: [],
-  grid: { cols: 12, row_height: 40, version: 1 },
+  grid: {
+    cols: DASHBOARD_GRID_COLS,
+    row_height: DASHBOARD_GRID_ROW_HEIGHT,
+    version: DASHBOARD_GRID_VERSION,
+  },
   filters: [],
 };

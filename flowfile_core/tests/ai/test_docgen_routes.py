@@ -54,9 +54,7 @@ from flowfile_core.configs import settings as core_settings
 from flowfile_core.flowfile.flow_graph import FlowGraph, add_connection
 from flowfile_core.schemas import input_schema, schemas, transform_schema
 
-# --------------------------------------------------------------------------- #
-# Shared fixtures #
-# --------------------------------------------------------------------------- #
+# Shared fixtures
 
 
 @pytest.fixture
@@ -110,9 +108,7 @@ def patch_get_configured_provider(monkeypatch: pytest.MonkeyPatch) -> Iterator[F
     yield fake
 
 
-# --------------------------------------------------------------------------- #
-# Flow fixtures #
-# --------------------------------------------------------------------------- #
+# Flow fixtures
 
 
 _FLOW_ID = 9950  # avoid clashing with any flow another test left around
@@ -179,6 +175,7 @@ def registered_flow() -> Iterator[FlowGraph]:
 
     flow = _build_linear_flow()
     flow_file_handler._flows[flow.flow_id] = flow
+    flow_file_handler._register_user_session(1, flow.flow_id)
     try:
         yield flow
     finally:
@@ -192,6 +189,7 @@ def registered_unnamed_flow() -> Iterator[FlowGraph]:
 
     flow = _build_linear_flow(name="")
     flow_file_handler._flows[flow.flow_id] = flow
+    flow_file_handler._register_user_session(1, flow.flow_id)
     try:
         yield flow
     finally:
@@ -202,15 +200,14 @@ def registered_unnamed_flow() -> Iterator[FlowGraph]:
 def registered_empty_flow() -> Iterator[FlowGraph]:
     flow = _build_empty_flow()
     flow_file_handler._flows[flow.flow_id] = flow
+    flow_file_handler._register_user_session(1, flow.flow_id)
     try:
         yield flow
     finally:
         flow_file_handler._flows.pop(flow.flow_id, None)
 
 
-# --------------------------------------------------------------------------- #
-# 1. Happy path #
-# --------------------------------------------------------------------------- #
+# 1. Happy path
 
 
 def test_generate_documentation_emits_provider_chunks(
@@ -241,22 +238,17 @@ def test_generate_documentation_emits_provider_chunks(
     assert system_msg.content.strip(), "system prompt must not be empty"
 
     assert user_msg.role == "user"
-    #'s render_prompt_context surfaces "## Subgraph" for the deterministic body.
     assert "## Subgraph" in user_msg.content
-    # The documentation block is appended verbatim.
     assert "## Documentation request" in user_msg.content
     assert "Flow name: `w50_test`" in user_msg.content
     assert "# Flow: w50_test" in user_msg.content
     assert "read-only assist" in user_msg.content
     assert "Do not wrap in code fences" in user_msg.content
 
-    # Read-only contract: tools=None.
     assert patch_get_configured_provider.last_call_kwargs.get("tools") is None
 
 
-# --------------------------------------------------------------------------- #
-# 2. All nodes are pinned #
-# --------------------------------------------------------------------------- #
+# 2. All nodes are pinned
 
 
 def test_generate_documentation_pins_all_nodes(
@@ -289,9 +281,7 @@ def test_generate_documentation_pins_all_nodes(
     assert captured_kwargs["surface"] == "docgen"
 
 
-# --------------------------------------------------------------------------- #
-# 3. Flow name in prompt #
-# --------------------------------------------------------------------------- #
+# 3. Flow name in prompt
 
 
 def test_generate_documentation_uses_flow_name_in_prompt(
@@ -306,13 +296,10 @@ def test_generate_documentation_uses_flow_name_in_prompt(
     assert response.status_code == 200
     user_msg = patch_get_configured_provider.last_call_kwargs["messages"][1]
     assert "Flow name: `w50_test`" in user_msg.content
-    # The synthesised h1 hint also carries the name.
     assert "# Flow: w50_test" in user_msg.content
 
 
-# --------------------------------------------------------------------------- #
-# 4. Fallback when flow name is empty #
-# --------------------------------------------------------------------------- #
+# 4. Fallback when flow name is empty
 
 
 def test_generate_documentation_falls_back_when_flow_name_empty(
@@ -331,9 +318,7 @@ def test_generate_documentation_falls_back_when_flow_name_empty(
     assert f"# Flow: {fallback}" in user_msg.content
 
 
-# --------------------------------------------------------------------------- #
-# 5. Flow not found → 422 #
-# --------------------------------------------------------------------------- #
+# 5. Flow not found → 422
 
 
 def test_generate_documentation_flow_not_found_returns_422(
@@ -348,9 +333,7 @@ def test_generate_documentation_flow_not_found_returns_422(
     assert "flow" in response.json()["detail"].lower()
 
 
-# --------------------------------------------------------------------------- #
-# 6. Empty flow → 422 #
-# --------------------------------------------------------------------------- #
+# 6. Empty flow → 422
 
 
 def test_generate_documentation_empty_flow_returns_422(
@@ -366,9 +349,7 @@ def test_generate_documentation_empty_flow_returns_422(
     assert "no nodes" in response.json()["detail"].lower()
 
 
-# --------------------------------------------------------------------------- #
-# 7. Unknown provider → 404 #
-# --------------------------------------------------------------------------- #
+# 7. Unknown provider → 404
 
 
 def test_generate_documentation_unknown_provider_returns_404(
@@ -383,9 +364,7 @@ def test_generate_documentation_unknown_provider_returns_404(
     assert "imaginary" in response.json()["detail"]
 
 
-# --------------------------------------------------------------------------- #
-# 8. Provider not configured → 409 #
-# --------------------------------------------------------------------------- #
+# 8. Provider not configured → 409
 
 
 def test_generate_documentation_unconfigured_returns_409(
@@ -406,9 +385,7 @@ def test_generate_documentation_unconfigured_returns_409(
     assert "anthropic" in response.json()["detail"]
 
 
-# --------------------------------------------------------------------------- #
-# 9. Feature flag off → 503 #
-# --------------------------------------------------------------------------- #
+# 9. Feature flag off → 503
 
 
 def test_generate_documentation_disabled_returns_503(
@@ -433,9 +410,7 @@ def test_generate_documentation_disabled_returns_503(
     assert "AI features are disabled" in response.json()["detail"]
 
 
-# --------------------------------------------------------------------------- #
-# 10-11. Request validation #
-# --------------------------------------------------------------------------- #
+# 10-11. Request validation
 
 
 @pytest.mark.parametrize(
@@ -455,9 +430,7 @@ def test_generate_documentation_validates_required_fields(
     assert any(missing_field in str(item) for item in detail)
 
 
-# --------------------------------------------------------------------------- #
-# 12. samples_mode forwarded to #
-# --------------------------------------------------------------------------- #
+# 12. samples_mode forwarded to
 
 
 def test_generate_documentation_samples_mode_forwarded(
@@ -487,15 +460,13 @@ def test_generate_documentation_samples_mode_forwarded(
     assert captured_kwargs["samples_mode"] == "regex"
 
 
-# --------------------------------------------------------------------------- #
-# 13. Lazy-litellm contract #
-# --------------------------------------------------------------------------- #
+# 13. Lazy-litellm contract
 
 
 def test_lazy_litellm_import_for_docgen_routes() -> None:
     """``import flowfile_core.ai.docgen_routes`` mustn't pull litellm.
 
-    Same contract as W11/W12/W13/W20/W23 — the module sits behind the
+    Same contract as the other AI routers — the module sits behind the
     BYOK seam, not the ``provider_factory`` bootstrap, so the heavy SDK
     stays out of the import graph until a real call happens.
 
@@ -520,3 +491,34 @@ def test_lazy_litellm_import_for_docgen_routes() -> None:
             ), "flowfile_core.ai.docgen_routes pulled litellm into sys.modules at import time"
     finally:
         sys.modules.update(saved)
+
+
+
+# ---------- on-device prompt ----------
+
+
+@pytest.mark.parametrize("provider", ["local", "anthropic"])
+def test_generate_documentation_local_provider_takes_on_device_prompt(
+    authed_client: TestClient,
+    patch_get_configured_provider: FakeProvider,
+    registered_flow: FlowGraph,
+    provider: str,
+) -> None:
+    """``provider="local"`` renders the on-device assist suffix (no
+    agent-mode footer a small model would parrot, one-line node
+    reference); every other provider keeps the cloud prompt verbatim."""
+    response = authed_client.post(
+        "/ai/generate_documentation",
+        json={"flow_id": _FLOW_ID, "provider": provider},
+    )
+    assert response.status_code == 200
+    system = patch_get_configured_provider.last_call_kwargs["messages"][0].content
+    if provider == "local":
+        assert "agent mode" not in system.lower()
+        assert "Simple build" in system
+        assert "- Filter data (Transformations):" in system
+        assert "### filter" not in system
+    else:
+        assert "auto-switch to agent mode" in system
+        assert "### filter" in system
+        assert "Simple build" not in system

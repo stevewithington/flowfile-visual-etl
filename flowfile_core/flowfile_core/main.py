@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 from __future__ import annotations
 
 import asyncio
@@ -5,17 +6,25 @@ import logging
 import os
 import signal
 import sys
+import threading
 from contextlib import asynccontextmanager
-from pathlib import Path
+
+# Headless run child: dispatch before the router imports and the storage sweep below.
+if __name__ == "__main__" and "--run-flow" in sys.argv:
+    from flowfile_core.run_flow_cli import main as _run_flow_main
+
+    sys.exit(_run_flow_main(sys.argv))
 
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from flowfile_core import change_feed
+from flowfile_core import telemetry as core_telemetry
 from flowfile_core.ai import router as ai_router
 from flowfile_core.ai.admin_routes import router as ai_admin_router
 from flowfile_core.artifacts import router as artifacts_router
-from flowfile_core.configs.flow_logger import clear_all_flow_logs
+from flowfile_core.configs.access_log import install_access_log_redaction
 from flowfile_core.configs.settings import (
     SERVER_HOST,
     SERVER_PORT,
@@ -23,25 +32,49 @@ from flowfile_core.configs.settings import (
     WORKER_PORT,
     WORKER_URL,
 )
+from flowfile_core.events import publish
 from flowfile_core.kernel import router as kernel_router
+from flowfile_core.lsp.admin_routes import router as lsp_admin_router
+from flowfile_core.lsp.routes import router as lsp_router
 from flowfile_core.ml import router as ml_router
+from flowfile_core.notebook.runner import install_notebook_runner
+from flowfile_core.routes.api_consumers import router as api_consumers_router
 from flowfile_core.routes.auth import router as auth_router
 from flowfile_core.routes.catalog import router as catalog_router
 from flowfile_core.routes.cloud_connections import router as cloud_connections_router
+from flowfile_core.routes.cloud_delta import router as cloud_delta_router
+from flowfile_core.routes.community_github import router as community_github_router
+from flowfile_core.routes.community_nodes import router as community_nodes_router
+from flowfile_core.routes.converters import router as converters_router
+from flowfile_core.routes.custom_node_mounts import router as custom_node_mounts_router
 from flowfile_core.routes.file_manager import router as file_manager_router
+from flowfile_core.routes.flow_api import data_router as flow_api_data_router
+from flowfile_core.routes.flow_api import management_router as flow_api_management_router
 from flowfile_core.routes.ga_connections import router as ga_connections_router
 from flowfile_core.routes.kafka import router as kafka_router
 from flowfile_core.routes.logs import router as logs_router
+from flowfile_core.routes.node_requests import router as node_requests_router
+from flowfile_core.routes.notebook import router as notebook_router
+from flowfile_core.routes.notifications import router as notifications_router
+from flowfile_core.routes.project import router as project_router
 from flowfile_core.routes.public import router as public_router
 from flowfile_core.routes.routes import router
 from flowfile_core.routes.secrets import router as secrets_router
+from flowfile_core.routes.shares import router as shares_router
+from flowfile_core.routes.storage_browser import router as storage_browser_router
+from flowfile_core.routes.system_backups import router as system_backups_router
+from flowfile_core.routes.system_worker import router as system_worker_router
+from flowfile_core.routes.telemetry import router as telemetry_router
 from flowfile_core.routes.user_defined_components import router as user_defined_components_router
+from flowfile_core.routes.user_groups import router as user_groups_router
 from flowfile_core.scheduler import FlowScheduler, get_scheduler, set_scheduler
+from shared.parent_watcher import start_parent_death_watcher
+from shared.run_completion import reap_orphaned_runs
+from shared.run_logs import cleanup_old_logs
 from shared.storage_config import storage
 
 storage.cleanup_directories()
 
-# Set default mode to electron if not already set (allows Docker mode override)
 if "FLOWFILE_MODE" not in os.environ:
     os.environ["FLOWFILE_MODE"] = "electron"
 
@@ -61,6 +94,33 @@ async def shutdown_handler(app: FastAPI):
 
     print("Starting core application...")
 
+    # Mint the kernel<->core token before anything can spawn a CLI child: an
+    # unstamped env makes the child mint its own and 401 on kernel callbacks.
+    try:
+        from flowfile_core.auth.jwt import get_internal_token
+
+        get_internal_token()
+    except ValueError as exc:
+        logging.getLogger(__name__).warning("Internal service token unavailable: %s", exc)
+
+    # Runs whose process died with the last app instance would otherwise stay "active"
+    # forever and block every relaunch. Best-effort; must never fail startup.
+    try:
+        reaped = reap_orphaned_runs()
+        if reaped:
+            print(f"Reaped {reaped} orphaned flow run(s)")
+    except Exception:
+        logging.getLogger(__name__).exception("Startup orphaned-run reap failed")
+
+    try:
+        removed = cleanup_old_logs()
+        if removed:
+            print(f"Removed {removed} expired log file(s)")
+    except Exception:
+        logging.getLogger(__name__).exception("Startup log retention sweep failed")
+
+    publish("app_started")
+
     # Only auto-start scheduler if explicitly opted in via env var
     if os.environ.get("FLOWFILE_SCHEDULER_ENABLED", "").lower() in ("true", "1", "yes"):
         scheduler = FlowScheduler()
@@ -68,10 +128,16 @@ async def shutdown_handler(app: FastAPI):
         set_scheduler(scheduler)
         print("Flow scheduler started")
 
+    # Warm the kernel manager off the request path: its first construction makes
+    # slow Docker daemon calls that would otherwise land on the first /kernels/.
+    if os.environ.get("FLOWFILE_KERNEL_WARMUP", "1").lower() in ("true", "1", "yes"):
+        threading.Thread(target=_warm_kernel_manager, name="kernel-manager-warmup", daemon=True).start()
+
     try:
         yield
     finally:
         print("Shutting down core application...")
+        change_feed.close_all()
 
         # Stop scheduler
         scheduler = get_scheduler()
@@ -82,22 +148,43 @@ async def shutdown_handler(app: FastAPI):
 
         print("Cleaning up core service resources...")
         _shutdown_kernels()
-        clear_all_flow_logs()
+        _shutdown_local_model()
         await asyncio.sleep(0.1)  # Give a moment for cleanup
+
+
+def _warm_kernel_manager():
+    """Best-effort kernel-manager construction; Docker-absent machines skip quietly."""
+    try:
+        from flowfile_core.kernel import get_kernel_manager
+
+        get_kernel_manager()
+        print("Kernel manager warmed up")
+    except Exception as exc:
+        print(f"Kernel manager warm-up skipped: {exc}")
 
 
 def _shutdown_kernels():
     """Stop all running kernel containers during shutdown."""
     try:
-        from flowfile_core.kernel import get_kernel_manager
+        from flowfile_core.kernel import get_kernel_manager_if_initialized
 
-        manager = get_kernel_manager()
-        manager.shutdown_all()
+        manager = get_kernel_manager_if_initialized()
+        if manager is not None:
+            manager.shutdown_all()
     except Exception as exc:
         print(f"Error shutting down kernels: {exc}")
 
 
-# Initialize FastAPI with metadata
+def _shutdown_local_model():
+    """Stop the optional local LLM server (if running) during shutdown."""
+    try:
+        from flowfile_core.ai.local_model import manager as local_model_manager
+
+        local_model_manager.stop()
+    except Exception as exc:
+        print(f"Error stopping local model: {exc}")
+
+
 app = FastAPI(
     title="Flowfile Backend",
     version="0.1",
@@ -105,13 +192,18 @@ app = FastAPI(
     lifespan=shutdown_handler,
 )
 
-# Configure CORS
+# The Tauri 2 desktop shell loads the renderer from a custom protocol — the
+# exact origin differs per OS (`tauri://localhost` on macOS/iOS, `http://tauri.localhost`
+# on Linux, `https://tauri.localhost` on Windows/Android). A regex covers all
+# of them without us having to enumerate. The explicit list below stays for
+# the web/Docker/dev flows that hit the backend over plain HTTP.
 origins = [
     "http://localhost",
     "http://localhost:5173",
     "http://localhost:3000",
     "http://localhost:8080",
     "http://localhost:8081",
+    "http://localhost:8082",
     "http://localhost:4173",
     "http://localhost:4174",
     "http://localhost:63578",
@@ -121,30 +213,56 @@ origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"^(tauri|http|https)://(tauri\.localhost|localhost(:\d+)?)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(change_feed.ClientOriginMiddleware)
 
 app.include_router(public_router)
 app.include_router(router)
 app.include_router(catalog_router)
+# Flow-as-API: public key-authenticated data endpoint + JWT management endpoints.
+app.include_router(flow_api_data_router)
+app.include_router(flow_api_management_router)
+app.include_router(api_consumers_router)
 app.include_router(artifacts_router)
 app.include_router(ml_router)
 app.include_router(logs_router, tags=["logs"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
+# Group-based sharing (multi-user mode only; both routers 404 in electron mode).
+app.include_router(user_groups_router, prefix="/user-groups", tags=["user-groups"])
+app.include_router(shares_router, prefix="/shares", tags=["shares"])
 app.include_router(secrets_router, prefix="/secrets", tags=["secrets"])
+app.include_router(notifications_router, prefix="/notifications", tags=["notifications"])
+app.include_router(project_router, prefix="/project", tags=["project"])
 app.include_router(cloud_connections_router, prefix="/cloud_connections", tags=["cloud_connections"])
+app.include_router(storage_browser_router, prefix="/storage_browser", tags=["storage_browser"])
+app.include_router(cloud_delta_router, prefix="/cloud_storage/delta", tags=["cloud_delta"])
 app.include_router(ga_connections_router, prefix="/ga_connections", tags=["ga_connections"])
 app.include_router(kafka_router)
 app.include_router(user_defined_components_router, prefix="/user_defined_components", tags=["user_defined_components"])
+app.include_router(custom_node_mounts_router, prefix="/custom-node-mounts", tags=["custom_node_mounts"])
+app.include_router(community_nodes_router, prefix="/community_nodes", tags=["community_nodes"])
+app.include_router(community_github_router, prefix="/community_nodes/github", tags=["community_nodes"])
 app.include_router(kernel_router, tags=["kernels"])
+app.include_router(lsp_router, tags=["lsp"])
 app.include_router(file_manager_router, prefix="/file_manager", tags=["file_manager"])
+app.include_router(converters_router, prefix="/converters", tags=["converters"])
+app.include_router(node_requests_router, prefix="/node_requests", tags=["node_requests"])
+app.include_router(notebook_router, prefix="/notebook", tags=["notebook"])
+install_notebook_runner()
+app.include_router(telemetry_router)
 app.include_router(ai_router, prefix="/ai", tags=["ai"])
-# AI feature-flag admin endpoint. Mounted on /system (NOT /ai) so admins
-# can flip the AI gate from the UI without first satisfying the gate they're
-# trying to flip.
+# Feature-flag admin endpoints. Mounted on /system (NOT /ai or /lsp) so admins can flip
+# a gate from the UI without first satisfying the gate they're trying to flip.
 app.include_router(ai_admin_router, prefix="/system", tags=["system"])
+app.include_router(lsp_admin_router, prefix="/system", tags=["system"])
+app.include_router(system_worker_router, prefix="/system", tags=["system"])
+app.include_router(system_backups_router, prefix="/system", tags=["system"])
+
+core_telemetry.install(app)
 
 
 @app.post("/shutdown")
@@ -155,7 +273,6 @@ async def shutdown(background_tasks: BackgroundTasks):
     to terminate cleanly. A background task is used to trigger the shutdown
     after the HTTP response has been sent.
     """
-    # Use a background task to trigger the shutdown after the response is sent
     background_tasks.add_task(trigger_shutdown)
     return {"message": "Server is shutting down"}
 
@@ -168,14 +285,30 @@ async def trigger_shutdown():
     """
     await asyncio.sleep(1)
     if server_instance:
-        server_instance.should_exit = True
+        _stop_server(server_instance)
+
+
+def _stop_server(server: uvicorn.Server) -> None:
+    """Ask uvicorn to exit. Open event streams are closed first: uvicorn waits for every
+    connection before it runs the lifespan shutdown, and a stream would otherwise hold it."""
+    change_feed.close_all()
+    server.should_exit = True
+
+
+class _Server(uvicorn.Server):
+    """uvicorn handles SIGINT/SIGTERM itself while serving (``capture_signals``), so the streams
+    are closed from its handler; ``signal_handler`` below only sees a signal outside ``serve``."""
+
+    def handle_exit(self, sig, frame) -> None:
+        change_feed.close_all()
+        super().handle_exit(sig, frame)
 
 
 def signal_handler(signum, frame):
     """Handles OS signals like SIGINT (Ctrl+C) and SIGTERM for graceful shutdown."""
     print(f"Received signal {signum}")
     if server_instance:
-        server_instance.should_exit = True
+        _stop_server(server_instance)
 
 
 def run(host: str = None, port: int = None):
@@ -190,7 +323,6 @@ def run(host: str = None, port: int = None):
     """
     global server_instance
 
-    # Use values from settings if not explicitly provided
     if host is None:
         host = SERVER_HOST
     if port is None:
@@ -198,7 +330,6 @@ def run(host: str = None, port: int = None):
     print(f"Starting server on {host}:{port}")
     print(f"Worker configured at {WORKER_URL} (host: {WORKER_HOST}, port: {WORKER_PORT})")
 
-    # Setup signal handlers
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -208,8 +339,12 @@ def run(host: str = None, port: int = None):
         port=port,
         loop="asyncio",
     )
-    server = uvicorn.Server(config)
-    server_instance = server  # Store server instance globally
+    install_access_log_redaction()
+    server = _Server(config)
+    server_instance = server
+
+    # In desktop-sidecar mode, exit if the Tauri shell dies without reaping us.
+    start_parent_death_watcher(lambda: _stop_server(server))
 
     print("Starting core server...")
     print("Core server started")
@@ -223,142 +358,5 @@ def run(host: str = None, port: int = None):
         print("Server has shut down.")
 
 
-_cli_logger = logging.getLogger("flowfile.run_flow_cli")
-
-
-def _run_flow_cli(flow_path: str, run_id: int) -> int:
-    """Execute a flow in-process (used by PyInstaller builds via ``--run-flow``).
-
-    Replicates the logic from ``flowfile/__main__.py:run_flow()`` without
-    importing from the top-level ``flowfile`` package (which is not bundled
-    in the PyInstaller binary).
-    """
-    # Configure logging early so all messages are captured in the subprocess log file
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-    _cli_logger.debug("_run_flow_cli started: flow_path=%s, run_id=%s", flow_path, run_id)
-    _cli_logger.debug("sys.executable=%s, frozen=%s", sys.executable, getattr(sys, "frozen", False))
-
-    from flowfile_core.configs.settings import OFFLOAD_TO_WORKER
-
-    OFFLOAD_TO_WORKER.set(False)
-
-    from flowfile_core.flowfile.manage.io_flowfile import open_flow
-
-    path = Path(flow_path)
-    if not path.exists():
-        _cli_logger.error("File not found: %s", flow_path)
-        _complete_run(run_id, success=False, nodes_completed=0)
-        return 1
-
-    if path.suffix.lower() not in (".yaml", ".yml", ".json"):
-        _cli_logger.error("Unsupported file format: %s", path.suffix)
-        _complete_run(run_id, success=False, nodes_completed=0)
-        return 1
-
-    _cli_logger.debug("Loading flow from: %s", flow_path)
-    try:
-        from flowfile_core.auth.utils import get_local_user_id
-        from shared.run_completion import get_run_user_id
-
-        user_id = get_run_user_id(run_id) if run_id is not None else None
-        if user_id is None:
-            user_id = get_local_user_id()
-        flow = open_flow(path, user_id=user_id)
-    except Exception as e:
-        _cli_logger.exception("Error loading flow: %s", e)
-        _complete_run(run_id, success=False, nodes_completed=0)
-        return 1
-
-    flow.execution_location = "local"
-
-    # Remove explore_data nodes — they're UI-only and require a worker service
-    explore_data_nodes = [n.node_id for n in flow.nodes if n.node_type == "explore_data"]
-    for node_id in explore_data_nodes:
-        flow.delete_node(node_id)
-    if explore_data_nodes:
-        _cli_logger.debug("Skipped %d explore_data node(s) (UI-only)", len(explore_data_nodes))
-
-    flow_name = flow.flow_settings.name or f"Flow {flow.flow_id}"
-    _cli_logger.debug("Running flow: %s (id=%s), nodes: %d", flow_name, flow.flow_id, len(flow.nodes))
-
-    try:
-        result = flow.run_graph()
-    except Exception as e:
-        _cli_logger.exception("Error running flow: %s", e)
-        _complete_run(run_id, success=False, nodes_completed=0)
-        return 1
-
-    if result is None:
-        _cli_logger.error("Flow execution returned no result")
-        _complete_run(run_id, success=False, nodes_completed=0)
-        return 1
-
-    _cli_logger.debug(
-        "Flow execution finished: success=%s, nodes_completed=%s/%s",
-        result.success,
-        result.nodes_completed,
-        result.number_of_nodes,
-    )
-
-    _complete_run(
-        run_id,
-        success=result.success,
-        nodes_completed=result.nodes_completed,
-        number_of_nodes=result.number_of_nodes,
-    )
-
-    if result.success:
-        duration = ""
-        if result.start_time and result.end_time:
-            duration = f" in {(result.end_time - result.start_time).total_seconds():.2f}s"
-        _cli_logger.debug("Flow completed successfully%s", duration)
-        return 0
-    else:
-        _cli_logger.error("Flow execution failed")
-        for node_result in result.node_step_result:
-            if not node_result.success and node_result.error:
-                node_name = node_result.node_name or f"Node {node_result.node_id}"
-                _cli_logger.error("  - %s: %s", node_name, node_result.error)
-        return 1
-
-
-def _complete_run(run_id: int, success: bool, nodes_completed: int, number_of_nodes: int = 0) -> None:
-    """Report results back to a pre-created run record."""
-    _cli_logger.debug(
-        "Completing run %d: success=%s, nodes_completed=%d, number_of_nodes=%d",
-        run_id,
-        success,
-        nodes_completed,
-        number_of_nodes,
-    )
-    try:
-        from shared.run_completion import complete_run
-
-        complete_run(
-            run_id=run_id,
-            success=success,
-            nodes_completed=nodes_completed,
-            number_of_nodes=number_of_nodes,
-        )
-    except Exception as e:
-        _cli_logger.exception("Failed to update run record %d: %s", run_id, e)
-
-
 if __name__ == "__main__":
-    if "--run-flow" in sys.argv:
-        idx = sys.argv.index("--run-flow")
-        _flow_path = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else None
-        _run_id = None
-        if "--run-id" in sys.argv:
-            rid_idx = sys.argv.index("--run-id")
-            _run_id = int(sys.argv[rid_idx + 1]) if rid_idx + 1 < len(sys.argv) else None
-        if not _flow_path:
-            print("Usage: flowfile_core --run-flow <path> --run-id <id>", file=sys.stderr)
-            sys.exit(1)
-        if _run_id is None:
-            print("Error: --run-id is required", file=sys.stderr)
-            sys.exit(1)
-        sys.exit(_run_flow_cli(_flow_path, _run_id))
-    else:
-        run()
+    run()

@@ -1,9 +1,12 @@
 import re
 from itertools import chain
 
+from shared.dtype_utils import convert_to_string, standardize_col_dtype
+
+__all__ = ["convert_to_string", "standardize_col_dtype"]
+
 
 def camel_case_to_snake_case(text: str) -> str:
-    # Use a regular expression to find capital letters and replace them with _ followed by the lowercase letter
     transformed_text = re.sub(r"(?<!^)(?=[A-Z])", "_", text).lower()
     return transformed_text
 
@@ -28,20 +31,3 @@ def ensure_similarity_dicts(datas: list[dict], respect_order: bool = True):
             new_record[col] = val
         output.append(new_record)
     return output
-
-
-def convert_to_string(v):
-    try:
-        return str(v)
-    except Exception:
-        return None
-
-
-def standardize_col_dtype(vals):
-    types = set(type(val) for val in vals)
-    if len(types) == 1:
-        return vals
-    elif int in types and float in types:
-        return vals
-    else:
-        return [convert_to_string(v) for v in vals]

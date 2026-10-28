@@ -1,3 +1,4 @@
+import re
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict
@@ -9,6 +10,7 @@ from pl_fuzzy_frame_match.models import FuzzyMapping
 from polars import selectors
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from flowfile_core.flowfile.param_types import FlowParameter, coerce_param_value
 from flowfile_core.schemas.yaml_types import (
     BasicFilterYaml,
     CrossJoinInputYaml,
@@ -114,9 +116,12 @@ def get_func_type_mapping(func: str):
         return "Utf8"
 
 
+STRING_CONCAT_DELIMITER = ","
+
+
 def string_concat(*column: str):
     """A simple wrapper to concatenate string columns in Polars."""
-    return pl.col(column).cast(pl.Utf8).str.concat(delimiter=",")
+    return pl.col(column).cast(pl.Utf8).str.join(STRING_CONCAT_DELIMITER)
 
 
 SideLit = Literal["left", "right"]
@@ -201,10 +206,10 @@ class SelectInput(BaseModel):
             result["new_name"] = self.new_name
         if not self.keep:
             result["keep"] = self.keep
-        # Always include data_type if it's set, not just when data_type_change is True
-        # This ensures undo/redo snapshots preserve the data_type field
+        # data_type travels even without a cast; data_type_change says whether it is one (older files infer it).
         if self.data_type:
             result["data_type"] = self.data_type
+            result["data_type_change"] = self.data_type_change
         return result
 
     @classmethod
@@ -213,15 +218,15 @@ class SelectInput(BaseModel):
         old_name = data["old_name"]
         new_name = data.get("new_name", old_name)
         data_type = data.get("data_type")
-        # is_altered should be True if either name was changed OR data_type was explicitly set
-        # This ensures updateNodeSelect in the frontend won't overwrite user-specified data_type
-        is_altered = (old_name != new_name) or (data_type is not None)
+        data_type_change = data.get("data_type_change", data_type is not None)
+        # is_altered marks a user rename or cast so updateNodeSelect in the frontend won't overwrite it
+        is_altered = (old_name != new_name) or data_type_change
         return cls(
             old_name=old_name,
             new_name=new_name,
             keep=data.get("keep", True),
             data_type=data_type,
-            data_type_change=data_type is not None,
+            data_type_change=data_type_change,
             is_altered=is_altered,
         )
 
@@ -241,9 +246,15 @@ class SelectInput(BaseModel):
 
     @model_validator(mode="after")
     def set_default_new_name(self):
-        """If new_name is None, default it to old_name. Also set is_altered if needed."""
+        """Default a missing or blank new_name to old_name; is_altered then only reflects a type change.
+
+        A cleared rename box arrives as "" while the drawer shows old_name as its placeholder (#815).
+        """
         if self.new_name is None:
             self.new_name = self.old_name
+        elif not self.new_name.strip():
+            self.new_name = self.old_name
+            self.is_altered = self.data_type_change
         if self.old_name != self.new_name:
             self.is_altered = True
         if self.data_type_change:
@@ -284,7 +295,7 @@ class FunctionInput(BaseModel):
     """Defines a formula to be applied, including the output field information."""
 
     field: FieldInput
-    function: str
+    function: str = Field(json_schema_extra={"expression": True})
 
     def __init__(self, field: FieldInput = None, function: str = None, **data):
         if field is not None:
@@ -392,7 +403,7 @@ class FilterInput(BaseModel):
 
     mode: FilterModeLiteral = "basic"
     basic_filter: BasicFilter | None = None
-    advanced_filter: str = ""
+    advanced_filter: str = Field(default="", json_schema_extra={"expression": True})
 
     # Keep old field name for backward compatibility
     filter_type: str | None = None
@@ -533,15 +544,12 @@ class CrossJoinInput(BaseModel):
     def parse_inputs(cls, data: Any) -> Any:
         """Parse flexible input formats before validation."""
         if isinstance(data, dict):
-            # Parse join_mapping
             if "join_mapping" in data:
                 data["join_mapping"] = cls._parse_join_mapping(data["join_mapping"])
 
-            # Parse left_select
             if "left_select" in data:
                 data["left_select"] = cls._parse_select(data["left_select"])
 
-            # Parse right_select
             if "right_select" in data:
                 data["right_select"] = cls._parse_select(data["right_select"])
 
@@ -550,7 +558,6 @@ class CrossJoinInput(BaseModel):
     @staticmethod
     def _parse_join_mapping(join_mapping: Any) -> list[JoinMap]:
         """Parse various join_mapping formats."""
-        # Already a list of JoinMaps
         if isinstance(join_mapping, list):
             result = []
             for jm in join_mapping:
@@ -566,7 +573,6 @@ class CrossJoinInput(BaseModel):
                     raise ValueError(f"Invalid join mapping item: {jm}")
             return result
 
-        # Single JoinMap
         if isinstance(join_mapping, JoinMap):
             return [join_mapping]
 
@@ -583,11 +589,9 @@ class CrossJoinInput(BaseModel):
     @staticmethod
     def _parse_select(select: Any) -> JoinInputs:
         """Parse various select input formats."""
-        # Already JoinInputs
         if isinstance(select, JoinInputs):
             return select
 
-        # List of SelectInput objects
         if isinstance(select, list):
             if all(isinstance(s, SelectInput) for s in select):
                 return JoinInputs(renames=select)
@@ -646,15 +650,12 @@ class JoinInput(BaseModel):
     def parse_inputs(cls, data: Any) -> Any:
         """Parse flexible input formats before validation."""
         if isinstance(data, dict):
-            # Parse join_mapping
             if "join_mapping" in data:
                 data["join_mapping"] = cls._parse_join_mapping(data["join_mapping"])
 
-            # Parse left_select
             if "left_select" in data:
                 data["left_select"] = cls._parse_select(data["left_select"])
 
-            # Parse right_select
             if "right_select" in data:
                 data["right_select"] = cls._parse_select(data["right_select"])
 
@@ -663,7 +664,6 @@ class JoinInput(BaseModel):
     @staticmethod
     def _parse_join_mapping(join_mapping: Any) -> list[JoinMap]:
         """Parse various join_mapping formats."""
-        # Already a list of JoinMaps
         if isinstance(join_mapping, list):
             result = []
             for jm in join_mapping:
@@ -679,7 +679,6 @@ class JoinInput(BaseModel):
                     raise ValueError(f"Invalid join mapping item: {jm}")
             return result
 
-        # Single JoinMap
         if isinstance(join_mapping, JoinMap):
             return [join_mapping]
 
@@ -696,11 +695,9 @@ class JoinInput(BaseModel):
     @staticmethod
     def _parse_select(select: Any) -> JoinInputs:
         """Parse various select input formats."""
-        # Already JoinInputs
         if isinstance(select, JoinInputs):
             return select
 
-        # List of SelectInput objects
         if isinstance(select, list):
             if all(isinstance(s, SelectInput) for s in select):
                 return JoinInputs(renames=select)
@@ -798,11 +795,9 @@ class FuzzyMatchInput(BaseModel):
     @staticmethod
     def _parse_select(select: Any) -> JoinInputs:
         """Parse various select input formats."""
-        # Already JoinInputs
         if isinstance(select, JoinInputs):
             return select
 
-        # List of SelectInput objects
         if isinstance(select, list):
             if all(isinstance(s, SelectInput) for s in select):
                 return JoinInputs(renames=select)
@@ -825,11 +820,9 @@ class FuzzyMatchInput(BaseModel):
     def parse_inputs(cls, data: Any) -> Any:
         """Parse flexible input formats before validation."""
         if isinstance(data, dict):
-            # Parse left_select
             if "left_select" in data:
                 data["left_select"] = cls._parse_select(data["left_select"])
 
-            # Parse right_select
             if "right_select" in data:
                 data["right_select"] = cls._parse_select(data["right_select"])
 
@@ -883,18 +876,15 @@ class AggColl(BaseModel):
     @model_validator(mode="after")
     def set_defaults(self):
         """Set default new_name and output_type based on agg function."""
-        # Set new_name
         if self.new_name is None:
             if self.agg != "groupby":
                 self.new_name = self.old_name + "_" + self.agg
             else:
                 self.new_name = self.old_name
 
-        # Set output_type
         if self.output_type is None:
             self.output_type = get_func_type_mapping(self.agg)
 
-        # Ensure old_name is a string
         self.old_name = str(self.old_name)
 
         return self
@@ -970,11 +960,25 @@ class PivotInput(BaseModel):
         return pl.struct([pl.col(c) for c in self.aggregations]).alias("vals")
 
 
+def is_descending(how: str | None) -> bool:
+    """Whether a sort-direction string means descending.
+
+    Accepts both the programmatic ``"asc"``/``"desc"`` form (flowfile_frame) and the
+    visual editor's ``"Ascending"``/``"Descending"`` form (case-insensitive).
+    """
+    return (how or "").lower() in ("desc", "descending")
+
+
 class SortByInput(BaseModel):
     """Defines a single sort condition on a column, including the direction."""
 
     column: str
     how: str | None = "asc"
+
+    @property
+    def descending(self) -> bool:
+        """Resolve ``how`` to the boolean Polars expects, accepting both conventions."""
+        return is_descending(self.how)
 
 
 class RecordIdInput(BaseModel):
@@ -984,6 +988,132 @@ class RecordIdInput(BaseModel):
     offset: int = 1
     group_by: bool | None = False
     group_by_columns: list[str] | None = Field(default_factory=list)
+
+
+WindowFunctionName = Literal[
+    "rolling_sum",
+    "rolling_mean",
+    "rolling_min",
+    "rolling_max",
+    "rolling_std",
+    "cum_sum",
+    "cum_count",
+    "cum_min",
+    "cum_max",
+    "rank",
+    "tile",
+    "mean",
+    "sum",
+    "min",
+    "max",
+    "count",
+    "std",
+    "median",
+]
+
+RankMethod = Literal["ordinal", "dense", "min", "max", "average"]
+
+RollingEdgeBehavior = Literal["require_full", "partial", "fill_zero"]
+
+_ROLLING_FUNCTIONS = {"rolling_sum", "rolling_mean", "rolling_min", "rolling_max", "rolling_std"}
+_CUMULATIVE_FUNCTIONS = {"cum_sum", "cum_count", "cum_min", "cum_max"}
+AGGREGATE_WINDOW_FUNCTIONS = frozenset({"mean", "sum", "min", "max", "count", "std", "median"})
+"""Partition-wide aggregates broadcast to every row (SQL ``AVG(x) OVER (PARTITION BY g)``)."""
+
+
+def _is_rolling(func: str) -> bool:
+    return func in _ROLLING_FUNCTIONS
+
+
+def _is_cumulative(func: str) -> bool:
+    return func in _CUMULATIVE_FUNCTIONS
+
+
+def is_aggregate_window_function(func: str) -> bool:
+    return func in AGGREGATE_WINDOW_FUNCTIONS
+
+
+def get_window_output_type(func: str, input_type: str | None = None) -> str | None:
+    """Infers the output data type of window functions."""
+    if func in {"rolling_mean", "rolling_std", "mean", "std", "median"}:
+        return "Float64"
+    if func in {"rolling_sum", "rolling_min", "rolling_max", "cum_sum", "cum_min", "cum_max", "sum", "min", "max"}:
+        return input_type
+    if func in {"cum_count", "tile"}:
+        return "Int64"
+    if func in {"rank", "count"}:
+        return "UInt32"
+    return input_type
+
+
+class WindowFunctionInput(BaseModel):
+    """A single window-function operation producing one new column.
+
+    `column` is the source column for rolling, cumulative, rank and
+    partition-aggregate functions. The aggregates (``mean``, ``sum``, ``min``,
+    ``max``, ``count``, ``std``, ``median``) take no window and broadcast one
+    value per partition to every row of it. For `tile`, `column` is ignored
+    (ordering comes from the outer ``WindowFunctionsInput.order_by``).
+    """
+
+    column: str | None = None
+    function: WindowFunctionName
+    new_column_name: str
+    window_size: int | None = None
+    min_periods: int | None = None
+    edge_behavior: RollingEdgeBehavior | None = "require_full"
+    number_of_groups: int | None = None
+    rank_method: RankMethod | None = "ordinal"
+    output_type: str | None = None
+
+    @model_validator(mode="after")
+    def _validate(self) -> "WindowFunctionInput":
+        if _is_rolling(self.function):
+            if self.window_size is None or self.window_size < 1:
+                raise ValueError(f"{self.function!r} requires a positive window_size")
+            if self.column is None:
+                raise ValueError(f"{self.function!r} requires a source column")
+        elif _is_cumulative(self.function) or self.function == "rank" or is_aggregate_window_function(self.function):
+            if self.column is None:
+                raise ValueError(f"{self.function!r} requires a source column")
+        elif self.function == "tile":
+            if self.number_of_groups is None or self.number_of_groups < 1:
+                raise ValueError("'tile' requires a positive number_of_groups")
+        if self.output_type is None:
+            self.output_type = get_window_output_type(self.function)
+        return self
+
+
+class WindowFunctionsInput(BaseModel):
+    """Defines the settings for a window-functions node.
+
+    Attributes
+    ----------
+    partition_by : list[str]
+        Optional list of columns to partition by (equivalent to ``.over(...)``).
+    order_by : list[SortByInput]
+        Ordering within each partition. Required for rolling and tile
+        functions; optional (but usually wanted) for cumulative functions.
+    window_functions : list[WindowFunctionInput]
+        Ordered list of per-column window operations to apply. Each produces
+        one new column; all are applied in a single ``with_columns`` call.
+    """
+
+    partition_by: list[str] = Field(default_factory=list)
+    order_by: list[SortByInput] = Field(default_factory=list)
+    window_functions: list[WindowFunctionInput] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate(self) -> "WindowFunctionsInput":
+        needs_order = any(_is_rolling(w.function) or w.function == "tile" for w in self.window_functions)
+        if needs_order and not self.order_by:
+            raise ValueError("Rolling and tile functions require at least one order_by column")
+        seen: set[str] = set()
+        for w in self.window_functions:
+            if w.new_column_name in seen:
+                raise ValueError(f"Duplicate new_column_name: {w.new_column_name!r}")
+            seen.add(w.new_column_name)
+        return self
 
 
 class TextToRowsInput(BaseModel):
@@ -1026,6 +1156,98 @@ class UnionInput(BaseModel):
     mode: Literal["selective", "relaxed"] = "relaxed"
 
 
+GateOperator = Literal["equals", "not_equals", "in", "not_in", "is_true", "is_false", "is_set"]
+
+
+class GateInput(BaseModel):
+    """Defines a gate node's condition.
+
+    Two condition sources:
+
+    * ``parameter`` (default) — a structured rule over a flow parameter
+      (operator + value). Data-independent: decided before the run starts and
+      exported as a plain ``if`` over the pipeline's parameter arguments.
+    * ``formula`` — a flowfile formula (the Filter node's expression language)
+      applied as a row predicate when the gate executes: the gate opens iff
+      **at least one row matches**. The predicate runs against the optional
+      second "control" input when one is connected, otherwise against the data
+      input itself, so a branch can gate on its own data or on a signal
+      computed anywhere else in the graph. ``${param}`` references resolve
+      like in any other node setting.
+
+    The gate passes its data input through when the condition holds; when it
+    does not, every node downstream of the gate is deliberately skipped
+    (reported as skipped, not failed). ``value`` is stored as a string — like
+    parameter defaults — and coerced with the referenced parameter's declared
+    type at evaluation time; for ``in`` / ``not_in`` it is a comma-separated
+    list. For an if/else, enable ``NodeGate.else_output`` — one condition,
+    two exits (then/else) — instead of maintaining two complementary gates.
+
+    Legacy settings (the pre-formula shape) are migrated on load: the removed
+    ``control_input`` source becomes ``formula``, and a parameter gate saved
+    with the removed ``invert`` flag gets its operator flipped to the
+    complement so its meaning is preserved.
+    """
+
+    condition_source: Literal["parameter", "formula"] = "parameter"
+    parameter: str = ""
+    operator: GateOperator = "equals"
+    value: str = ""
+    formula: str = Field(default="", json_schema_extra={"expression": True})
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_shape(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if data.get("condition_source") == "control_input":
+            data = {**data, "condition_source": "formula"}
+        if data.get("invert") and data.get("condition_source", "parameter") == "parameter":
+            complements = {
+                "equals": "not_equals",
+                "not_equals": "equals",
+                "in": "not_in",
+                "not_in": "in",
+                "is_true": "is_false",
+                "is_false": "is_true",
+            }
+            flipped = complements.get(data.get("operator", "equals"))
+            if flipped is not None:
+                data = {**data, "operator": flipped}
+        return data
+
+    def evaluate(self, parameters: dict[str, FlowParameter]) -> bool:
+        """Evaluate the parameter-mode condition against the flow's parameters.
+
+        Raises ValueError when the referenced parameter does not exist or the
+        configured value cannot be coerced to the parameter's type — a broken
+        condition must fail the gate node loudly, never silently pick a branch.
+        """
+        param = parameters.get(self.parameter)
+        if param is None:
+            raise ValueError(f"Gate references unknown flow parameter '{self.parameter}'")
+        return self._evaluate_operator(param)
+
+    def _evaluate_operator(self, param: FlowParameter) -> bool:
+        if self.operator == "is_set":
+            return param.default_value.strip() != ""
+        if self.operator in ("is_true", "is_false"):
+            truthy = coerce_param_value("boolean", param.default_value)
+            return truthy if self.operator == "is_true" else not truthy
+        current = param.typed_default()
+        if self.operator in ("equals", "not_equals"):
+            expected = coerce_param_value(param.type, self.value, param.enum_values)
+            matches = current == expected
+            return matches if self.operator == "equals" else not matches
+        expected_values = []
+        for raw_item in self.value.split(","):
+            raw_item = raw_item.strip()
+            if raw_item:
+                expected_values.append(coerce_param_value(param.type, raw_item, param.enum_values))
+        matches = current in expected_values
+        return matches if self.operator == "in" else not matches
+
+
 class UniqueInput(BaseModel):
     """Defines settings for a uniqueness operation, specifying columns and which row to keep."""
 
@@ -1039,6 +1261,42 @@ class GraphSolverInput(BaseModel):
     col_from: str
     col_to: str
     output_column_name: str | None = "graph_group"
+
+
+HierarchyOutputDetail = Literal["totals", "levels", "paths"]
+MAX_HIERARCHY_DEPTH = 2**32 - 1
+
+
+class ExplodeHierarchyInput(BaseModel):
+    """Settings for exploding a parent -> child edge list into its transitive closure.
+
+    The output replaces the input table: one row per (ancestor, descendant) for ``totals``,
+    per (ancestor, descendant, level) for ``levels`` and per path for ``paths``. Quantities
+    multiply along a path and add up across paths; without a quantity column every edge counts 1.
+    ``max_depth`` is capped at ``MAX_HIERARCHY_DEPTH`` because polars-grouper reads it as a u32.
+    """
+
+    parent_column: str
+    child_column: str
+    quantity_column: str | None = None
+    output_detail: HierarchyOutputDetail = "totals"
+    top_level_only: bool = False
+    include_self: bool = False
+    max_depth: int | None = Field(default=None, ge=0, le=MAX_HIERARCHY_DEPTH)
+
+    def check_edge_columns(self) -> None:
+        """Raise ``ValueError`` unless parent and child are two different, non-empty columns.
+
+        Not a model validator: a freshly dropped node is saved with empty columns and must
+        still load. Building the plan calls this, so a bad pair fails the explode node itself
+        instead of surfacing later as a one-node cycle.
+        """
+        if not self.parent_column or not self.child_column:
+            raise ValueError("Explode hierarchy needs both a parent column and a child column")
+        if self.parent_column == self.child_column:
+            raise ValueError(
+                f"Explode hierarchy needs two different columns for parent and child, got '{self.parent_column}' twice"
+            )
 
 
 RenameMode = Literal["prefix", "suffix", "formula", "first_row"]
@@ -1065,11 +1323,157 @@ class DynamicRenameInput(BaseModel):
     rename_mode: RenameMode = "prefix"
     prefix: str = ""
     suffix: str = ""
-    formula: str = ""
+    formula: str = Field(default="", json_schema_extra={"expression": True})
 
     selection_mode: ColumnSelectionMode = "all"
     selected_columns: list[str] = Field(default_factory=list)
     selected_data_type: ReadableDataTypeGroup | None = None
+
+
+MultiFieldOutputMode = Literal["replace", "new"]
+
+MULTI_FIELD_CURRENT_FIELD = "_CurrentField_"
+MULTI_FIELD_CURRENT_FIELD_NAME = "_CurrentFieldName_"
+MULTI_FIELD_CURRENT_FIELD_TYPE = "_CurrentFieldType_"
+MULTI_FIELD_PLACEHOLDERS = (
+    MULTI_FIELD_CURRENT_FIELD,
+    MULTI_FIELD_CURRENT_FIELD_NAME,
+    MULTI_FIELD_CURRENT_FIELD_TYPE,
+)
+
+_MULTI_FIELD_CURRENT_FIELD_RE = re.compile(rf"\[{MULTI_FIELD_CURRENT_FIELD}\]", re.IGNORECASE)
+_MULTI_FIELD_CURRENT_FIELD_NAME_RE = re.compile(rf"\[{MULTI_FIELD_CURRENT_FIELD_NAME}\]", re.IGNORECASE)
+_MULTI_FIELD_CURRENT_FIELD_TYPE_RE = re.compile(rf"\[{MULTI_FIELD_CURRENT_FIELD_TYPE}\]", re.IGNORECASE)
+
+
+def bind_multi_field_formula(formula: str, column_name: str, data_type: str) -> str:
+    """Bind the three per-column placeholders of a multi-field formula to one column.
+
+    `[_CurrentField_]` becomes a column reference, `[_CurrentFieldName_]` a string literal
+    of the column's name and `[_CurrentFieldType_]` a string literal of the column's Polars
+    dtype base token (the part before any parameter list, so `Datetime(time_unit='us')`
+    binds as `Datetime`). Matching is case-insensitive, mirroring Alteryx.
+
+    The substitutions go through callables so a backslash inside a column name is inserted
+    literally instead of being read as a `re.sub` escape.
+
+    Args:
+        formula: The user's flowfile-formula text, still carrying placeholders.
+        column_name: Name of the column the formula is being bound to.
+        data_type: The column's Polars dtype as a string.
+
+    Returns:
+        The formula with every placeholder bound to this column.
+
+    Raises:
+        ValueError: If the column name contains a double quote and therefore cannot be written
+            as a string literal for `[_CurrentFieldName_]`. Single-quoting it would parse in
+            Python but not in polars-expr-transformer, whose `standardize_quotes` re-quotes the
+            literal without escaping, so such a name has no usable literal form at all.
+    """
+    bound = _MULTI_FIELD_CURRENT_FIELD_RE.sub(lambda _m: f"[{column_name}]", formula)
+    if _MULTI_FIELD_CURRENT_FIELD_NAME_RE.search(bound):
+        if '"' in column_name:
+            raise ValueError(f"Multi-field formula: column '{column_name}' cannot be written as a string literal")
+        literal = f'"{column_name}"'
+        bound = _MULTI_FIELD_CURRENT_FIELD_NAME_RE.sub(lambda _m: literal, bound)
+    type_token = (data_type or "").split("(", 1)[0]
+    return _MULTI_FIELD_CURRENT_FIELD_TYPE_RE.sub(lambda _m: f'"{type_token}"', bound)
+
+
+class MultiFieldFormulaInput(BaseModel):
+    """Defines settings for a multi-field formula operation.
+
+    Applies ONE flowfile-formula expression to MANY columns at once, rather than needing a
+    separate formula node per column. Inside the formula three placeholders bind to the
+    column currently being processed: `[_CurrentField_]` (its value), `[_CurrentFieldName_]`
+    (its name as a string literal) and `[_CurrentFieldType_]` (its Polars dtype base token
+    as a string literal).
+
+    Selection follows the same rules as `DynamicRenameInput`: all columns, a listed subset
+    (listed names that no longer exist are silently skipped, so stale UI state does not
+    break execution), or every column of one data-type group.
+
+    In `"replace"` output mode each result overwrites its source column, keeping the column
+    order. In `"new"` mode the results are written to `f"{output_prefix}{name}{output_suffix}"`
+    columns appended after the existing ones, and at least one affix is required. When
+    `output_data_type` is set to anything other than `"Auto"` the result is cast to that type.
+
+    Zero selected columns is a no-op: the frame passes through unchanged.
+    """
+
+    formula: str = Field(default="", json_schema_extra={"expression": True})
+
+    selection_mode: ColumnSelectionMode = "all"
+    selected_columns: list[str] = Field(default_factory=list)
+    selected_data_type: ReadableDataTypeGroup | None = None
+
+    output_mode: MultiFieldOutputMode = "replace"
+    output_prefix: str = ""
+    output_suffix: str = ""
+    output_data_type: DataType | Literal["Auto"] | DataTypeStr | None = AUTO_DATA_TYPE
+
+
+CleansingCaseMode = Literal["none", "uppercase", "lowercase", "titlecase"]
+CleansingSelectionMode = Literal["all", "list"]
+
+# Single source of truth for the data-cleansing character classes. The code generator
+# interpolates these very constants into exported scripts, so the patterns must never be
+# re-typed anywhere else.
+CLEANSING_LETTERS_REGEX = r"\p{L}"
+CLEANSING_NUMBERS_REGEX = r"\d"
+# The four contiguous ASCII ranges that make up exactly `string.punctuation`.
+CLEANSING_PUNCTUATION_REGEX = r"[!-/:-@\[-`{-~]"
+CLEANSING_WHITESPACE_RUN_REGEX = r"\s+"
+CLEANSING_WHITESPACE_REGEX = r"\s"
+
+
+class DataCleansingInput(BaseModel):
+    """Defines settings for a data-cleansing operation.
+
+    Bundles the common "fix the obvious data quality problems" rules into one node:
+    dropping entirely-null rows and columns, replacing nulls with a neutral value,
+    stripping unwanted characters, and normalising casing.
+
+    Two rules are frame-wide and deliberately ignore the column selection, matching
+    Alteryx's Data Cleansing tool: `remove_null_rows` drops a row only when *every*
+    column is null, and `remove_null_columns` drops a column only when it is null in
+    *every* row. An empty string is not a null, so it keeps its row/column alive.
+
+    Every other rule applies only to the columns picked by `selection_mode` /
+    `selected_columns`, and only to columns of the matching data-type group: the
+    null-to-blank and character/case rules touch String columns, `replace_nulls_with_zero`
+    touches Numeric columns, and every other dtype passes through untouched. Selected
+    columns that no longer exist are silently ignored, mirroring `DynamicRenameInput`.
+
+    Within one string column the rules run in a fixed order: fill nulls, remove letters,
+    numbers and punctuation, then clean up whitespace (so gaps left by character removal
+    are collapsed too), then apply the casing rule. `remove_all_whitespace` supersedes
+    `normalize_whitespace` and `trim_whitespace`.
+
+    Data-type groups come from `FlowfileColumn.data_type_group`, which puts `Categorical`,
+    `Enum` and the all-null `Null` dtype in "Other" rather than "String" — so no rule fires
+    on them, including `replace_nulls_with_blank` on a column polars typed as `Null`.
+    """
+
+    remove_null_rows: bool = False
+    remove_null_columns: bool = False
+
+    selection_mode: CleansingSelectionMode = "all"
+    selected_columns: list[str] = Field(default_factory=list)
+
+    replace_nulls_with_blank: bool = True
+    replace_nulls_with_zero: bool = True
+
+    trim_whitespace: bool = True
+    normalize_whitespace: bool = False
+    remove_all_whitespace: bool = False
+
+    remove_letters: bool = False
+    remove_numbers: bool = False
+    remove_punctuation: bool = False
+
+    case_mode: CleansingCaseMode = "none"
 
 
 class PolarsCodeInput(BaseModel):
@@ -1079,7 +1483,15 @@ class PolarsCodeInput(BaseModel):
 
 
 class SqlQueryInput(BaseModel):
-    """A container for a SQL query to execute against connected data sources."""
+    """A container for a SQL query to execute against connected data sources.
+
+    Note: ``sql_code`` is *not* validated at schema-construction time. Construction
+    is a passive shape-check; the unsafe-SQL gate lives at the executor seam in
+    ``execute_sql_query`` (and is also enforced by the underlying
+    ``validate_sql_query`` utility callers can use directly). Validating here too
+    would block legitimate non-AI callers from drafting/testing SQL before
+    execution.
+    """
 
     sql_code: str
 
@@ -1106,7 +1518,11 @@ class SelectInputsManager:
 
     def get_select_cols(self, include_join_key: bool = True) -> list[str]:
         """Gets a list of original column names to select from the source DataFrame."""
-        return [v.old_name for v in self.select_inputs.renames if v.keep or (v.join_key and include_join_key)]
+        return [
+            v.old_name
+            for v in self.select_inputs.renames
+            if v.is_available and (v.keep or (v.join_key and include_join_key))
+        ]
 
     def has_drop_cols(self) -> bool:
         """Checks if any column is marked to be dropped from the selection."""
@@ -1363,7 +1779,6 @@ class JoinInputManager(JoinSelectManagerMixin):
         how: JoinKeyStrategy = "inner",
     ) -> "JoinInputManager":
         """Factory method to create JoinInput from various input formats."""
-        # Use JoinInput's own create method for parsing
         join_input = JoinInput(join_mapping=join_mapping, left_select=left_select, right_select=right_select, how=how)
 
         manager = cls(join_input)

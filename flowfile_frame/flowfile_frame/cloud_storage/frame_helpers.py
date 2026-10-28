@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 
 from polars._typing import CsvEncoding
@@ -23,6 +24,9 @@ def read_from_cloud_storage(
     has_header: bool = True,
     encoding: str = "utf8",
     delta_version: int | None = None,
+    changes_since: int | str | datetime | None = None,
+    include_change_preimage: bool = False,
+    description: str | None = None,
     output_field_config: input_schema.OutputFieldConfig | None = None,
 ) -> FlowFrame:
     """Read data from cloud storage.
@@ -40,6 +44,11 @@ def read_from_cloud_storage(
         has_header: Whether CSV has headers (only used for CSV format).
         encoding: CSV encoding (only used for CSV format).
         delta_version: Delta table version for time-travel (only used for Delta format).
+        changes_since: Read the Delta table's change feed instead of its current rows
+            (only used for Delta format). See :func:`flowfile_frame.scan_delta`.
+        include_change_preimage: Keep ``update_preimage`` rows in the change feed
+            (only used for Delta format).
+        description: Optional description for the node.
         output_field_config: Optional schema validation/transformation config.
             Set ``enabled=True`` and supply ``fields`` to enforce the expected
             output schema (matches the canvas-side ``output_field_config``
@@ -55,6 +64,9 @@ def read_from_cloud_storage(
         scan_parquet_from_cloud_storage,
     )
 
+    if (changes_since is not None or include_change_preimage) and file_format != "delta":
+        raise ValueError("changes_since is only supported for the 'delta' file format")
+
     if file_format == "csv":
         frame = scan_csv_from_cloud_storage(
             source,
@@ -63,6 +75,7 @@ def read_from_cloud_storage(
             delimiter=delimiter,
             has_header=has_header,
             encoding=encoding,
+            description=description,
             output_field_config=output_field_config,
         )
     elif file_format == "parquet":
@@ -70,6 +83,7 @@ def read_from_cloud_storage(
             source,
             connection_name=connection_name,
             scan_mode=scan_mode,
+            description=description,
             output_field_config=output_field_config,
         )
     elif file_format == "json":
@@ -77,6 +91,7 @@ def read_from_cloud_storage(
             source,
             connection_name=connection_name,
             scan_mode=scan_mode,
+            description=description,
             output_field_config=output_field_config,
         )
     elif file_format == "delta":
@@ -84,6 +99,9 @@ def read_from_cloud_storage(
             source,
             connection_name=connection_name,
             version=delta_version,
+            changes_since=changes_since,
+            include_change_preimage=include_change_preimage,
+            description=description,
             output_field_config=output_field_config,
         )
     else:
@@ -101,7 +119,10 @@ def write_to_cloud_storage(
     delimiter: str = ";",
     encoding: CsvEncoding = "utf8",
     compression: Literal["snappy", "gzip", "brotli", "lz4", "zstd"] = "snappy",
-    write_mode: Literal["overwrite", "append"] = "overwrite",
+    write_mode: Literal["overwrite", "append", "error", "upsert", "update", "delete"] = "overwrite",
+    partition_by: list[str] | None = None,
+    merge_keys: list[str] | None = None,
+    track_changes: bool = False,
 ) -> None:
     """Write data to cloud storage.
 
@@ -116,8 +137,20 @@ def write_to_cloud_storage(
         delimiter: CSV delimiter (only used for CSV format).
         encoding: CSV encoding (only used for CSV format).
         compression: Parquet compression (only used for Parquet format).
-        write_mode: 'overwrite' or 'append' (only used for Delta format).
+        write_mode: How to handle existing data (only used for Delta format): 'overwrite',
+            'append', 'error' (fail if the table exists), or 'upsert' / 'update' / 'delete'
+            (merge on ``merge_keys``).
+        partition_by: Delta partition columns, applied at table creation
+            (only used for Delta format).
+        merge_keys: Column names for merge operations, required for upsert/update/delete
+            (only used for Delta format).
+        track_changes: Turn the table's change feed on (only used for Delta format).
+            Enable-only; not allowed with ``write_mode="overwrite"``.
     """
+    if partition_by and file_format != "delta":
+        raise ValueError("partition_by is only supported for the 'delta' file format")
+    if (merge_keys or track_changes) and file_format != "delta":
+        raise ValueError("merge_keys and track_changes are only supported for the 'delta' file format")
 
     if file_format == "csv":
         df.write_csv_to_cloud_storage(
@@ -135,7 +168,14 @@ def write_to_cloud_storage(
     elif file_format == "json":
         df.write_json_to_cloud_storage(path=path, connection_name=connection_name)
     elif file_format == "delta":
-        df.write_delta(path=path, connection_name=connection_name, write_mode=write_mode)
+        df.write_delta(
+            path=path,
+            connection_name=connection_name,
+            write_mode=write_mode,
+            partition_by=partition_by,
+            merge_keys=merge_keys,
+            track_changes=track_changes,
+        )
     else:
         raise ValueError(f"Unsupported file format: {file_format}")
 
@@ -146,11 +186,14 @@ def add_write_ff_to_cloud_storage(
     depends_on_node_id: int,
     *,
     connection_name: str | None = None,
-    write_mode: Literal["overwrite", "append"] = "overwrite",
+    write_mode: Literal["overwrite", "append", "error", "upsert", "update", "delete"] = "overwrite",
     file_format: Literal["csv", "parquet", "json", "delta"] = "parquet",
     csv_delimiter: str = ";",
     csv_encoding: CsvEncoding = "utf8",
     parquet_compression: Literal["snappy", "gzip", "brotli", "lz4", "zstd"] = "snappy",
+    partition_by: list[str] | None = None,
+    merge_keys: list[str] | None = None,
+    track_changes: bool = False,
     description: str | None = None,
 ) -> int:
     node_id = generate_node_id()
@@ -166,6 +209,9 @@ def add_write_ff_to_cloud_storage(
             csv_delimiter=csv_delimiter,
             csv_encoding=csv_encoding,
             parquet_compression=parquet_compression,
+            partition_by=partition_by,
+            merge_keys=merge_keys or [],
+            track_changes=track_changes,
         ),
         user_id=get_current_user_id(),
         depending_on_id=depends_on_node_id,
